@@ -2213,7 +2213,7 @@ impl App {
         // 运行时挂载：api 条目吸收同 prefix 的 web（配对 → 无 spa）；独立 web 原样。
         // 最长前缀排序归 serve::app()。
         let runtime_mounts = build_runtime_mounts(resolved, tables);
-        let router = serve::app(
+        let router = serve::app_with_exec(
             runtime_mounts,
             actor,
             timeout,
@@ -2236,6 +2236,8 @@ impl App {
             cert_valid_until,
             // 插件自省清单经 stable 单源读取（与 StableState.plugins 同源）。
             Arc::new(stable.plugins.clone()),
+            // REQ-11 G2：挂断联动登记表（与 StableState.exec_sessions 同一 Arc）。
+            Some(stable.exec_sessions.clone()),
             cfg.server.cors.clone(),
         )
         .merge(ws_router);

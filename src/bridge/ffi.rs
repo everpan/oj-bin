@@ -513,6 +513,68 @@ impl DataAccessor for FfiDataAccessor {
     ///   收到 Notify 后 drop 生成器）→ 先 `stream_cancel`（真取消，插件协作式）再
     ///   close。两路都 fire-and-forget（future.rs 契约：宿主 drop 句柄=放弃结果，
     ///   插件任务照常跑完），杜绝 aborted 查询泄漏插件侧游标条目。
+    /// REQ-11 G1/G2：插件轴可取消查询——宿主侧零 ABI 实现：复用既有 vtable
+    /// `stream_open/next/cancel/close`（PG/MySQL 声明 `stream cancel` 能力）。
+    /// 取消 = drop 行流：`StreamCursorGuard` fire-and-forget `stream_cancel`
+    /// （插件真杀服务端语句/关专用连接）。无流能力的旧插件走 stream_query 内部的
+    /// fetch_all 兜底（cancel 尽力而为，同弃 FfiFuture 的诚实口径）。
+    /// exec 的可取消版插件轴不可达（affected 计数无流式载体）——默认委托，ABI 13 车。
+    async fn query_cancelable(
+        &self,
+        sql: &str,
+        params: &[serde_json::Value],
+        meter: &mut super::db_quota::ByteMeter,
+        shared: &super::db::PoolExecShared,
+    ) -> BridgeResult<Vec<Row>> {
+        use std::sync::atomic::Ordering;
+        if shared.cancel_requested.load(Ordering::SeqCst) {
+            return Err(super::db_error::cancelled_error(&shared.alias).into());
+        }
+        let mut s = self.stream_query(sql, params).await?;
+        super::accessor_sqlx::push_event(shared, "sent", None);
+        let mut out = Vec::new();
+        let mut first = true;
+        use futures::StreamExt;
+        loop {
+            tokio::select! {
+                row = s.next() => {
+                    match row {
+                        None => break,
+                        Some(Ok(v)) => {
+                            if first {
+                                super::accessor_sqlx::push_event(shared, "fetching", None);
+                                first = false;
+                            }
+                            if meter.feed(&v) == super::db_quota::Feed::Stop {
+                                break;
+                            }
+                            out.push(v);
+                        }
+                        Some(Err(e)) => {
+                            return Err(Box::new(BridgeError {
+                                category: DbErrorCategory::Internal,
+                                retryable: false,
+                                session_disposition:
+                                    SessionDisposition::Close,
+                                message: e,
+                                data: Default::default(),
+                            }));
+                        }
+                    }
+                }
+                _ = shared.notify.notified() => {
+                    // fire_cancel 先置标志后广播——保守再校验。
+                    if shared.cancel_requested.load(Ordering::SeqCst) {
+                        drop(s); // guard drop → stream_cancel 真杀服务端语句
+                        return Err(super::db_error::cancelled_error(&shared.alias).into());
+                    }
+                }
+            }
+        }
+        super::accessor_sqlx::push_event(shared, "done", Some(out.len() as u64));
+        Ok(out)
+    }
+
     async fn stream_query(
         &self,
         sql: &str,

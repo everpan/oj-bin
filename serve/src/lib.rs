@@ -116,6 +116,9 @@ pub struct AppState {
     pub certificate_valid_until: Arc<RwLock<Option<std::time::SystemTime>>>,
     /// 已装配插件自描述清单（`{base}/plugins` 数据源；装配层注入）。
     pub plugins: Arc<Vec<PluginInfo>>,
+    /// REQ-11 G2：进程级执行登记表（与 StableState.exec_sessions 同一 Arc）。
+    /// None = 无登记表（挂断联动不挂；池执行仍可由 db.cancel 取消）。
+    pub exec_registry: Option<Arc<only_js::bridge::db_exec::ExecRegistry>>,
 }
 
 /// 静态增强（v0.1.25 起：动态 meta 与 HTML 缓存头；SPA 回落已下沉 per-挂载 `spa`）。
@@ -248,6 +251,35 @@ pub fn app(
     // CORS（v0.1.35）：段存在即启用；None = 不挂层（行为完全不变）。
     cors: Option<CorsCfg>,
 ) -> Router {
+    app_with_exec(
+        mounts,
+        actor,
+        timeout,
+        static_opts,
+        pipeline,
+        certificate_status,
+        certificate_valid_until,
+        plugins,
+        None,
+        cors,
+    )
+}
+
+/// [`app`] 的 REQ-11 G2 变体：注入进程级执行登记表（与 StableState.exec_sessions
+/// 同一 Arc），挂断联动（DisconnectGuard）据此触达在飞池执行。None = 不挂 guard。
+#[allow(clippy::too_many_arguments)]
+pub fn app_with_exec(
+    mounts: Vec<RuntimeMount>,
+    actor: JsActor,
+    timeout: Option<std::time::Duration>,
+    static_opts: StaticOpts,
+    pipeline: Pipeline,
+    certificate_status: Arc<RwLock<CertificateStatus>>,
+    certificate_valid_until: Arc<RwLock<Option<std::time::SystemTime>>>,
+    plugins: Arc<Vec<PluginInfo>>,
+    exec_registry: Option<Arc<only_js::bridge::db_exec::ExecRegistry>>,
+    cors: Option<CorsCfg>,
+) -> Router {
     let mut router = Router::new();
     for m in mounts
         .iter()
@@ -314,6 +346,7 @@ pub fn app(
         certificate_status,
         certificate_valid_until,
         plugins,
+        exec_registry,
     })
 }
 
@@ -912,6 +945,13 @@ pub(crate) async fn run_capture(
         Ok(v) => v,
         Err(resp) => return Err(run_fail_from_response(*resp).await),
     };
+    // REQ-11 G2：挂断联动——admit 成功后发 token，guard 伴随整个 handler 执行；
+    // 客户端断连导致本 future 被 drop 时，guard 触达本请求登记的在飞池执行。
+    let mut guard = st.exec_registry.as_ref().map(|reg| DisconnectGuard {
+        token: CANCEL_TOKEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+        registry: Arc::clone(reg),
+        armed: true,
+    });
     let req = RequestInfo {
         method: verb.to_string(),
         params,
@@ -929,7 +969,7 @@ pub(crate) async fn run_capture(
         user,
         files,
         bus_tx: None,
-        cancel_token: None, // REQ-11 G2：挂断联动 token（Task 5 接线）
+        cancel_token: guard.as_ref().map(|g| g.token),
     };
     // oj-5c：路由级 timeout 覆盖（按声明顺序首个命中；含 base 的全路径匹配）。
     let timeout = st
@@ -939,13 +979,15 @@ pub(crate) async fn run_capture(
         .find(|(p, _)| path_matches(std::slice::from_ref(p), full_path))
         .map(|(_, d)| *d)
         .or(st.timeout);
-    st.actor
-        .run_module(file, handler, req, timeout, true)
-        .await
-        .map_err(|e| RunFail {
-            status: if e.timeout { 408 } else { 500 },
-            msg: e.msg,
-        })
+    let res = st.actor.run_module(file, handler, req, timeout, true).await;
+    // 正常完成：解除挂断联动（cancel 已由响应语义决定，不得由 guard 再触达）。
+    if let Some(g) = guard.as_mut() {
+        g.disarm();
+    }
+    res.map_err(|e| RunFail {
+        status: if e.timeout { 408 } else { 500 },
+        msg: e.msg,
+    })
 }
 
 /// 共享 dispatch 的失败载体：HTTP 状态 + 信封 msg（MCP 侧映射 isError，run_route 侧
@@ -1213,7 +1255,7 @@ async fn dispatch_meta_handler(
         user: None,
         files: Vec::new(),
         bus_tx: None,
-        cancel_token: None, // REQ-11 G2：挂断联动 token（Task 5 接线）
+        cancel_token: None, // meta 内部合成派发：无独立客户端连接，不挂挂断联动
     };
     let cap = st
         .actor
@@ -1919,6 +1961,39 @@ fn is_multipart(headers: &HeaderMap) -> bool {
         .is_some_and(|s| s.starts_with("multipart/form-data"))
 }
 
+/// 挂断联动守卫（REQ-11 G2）：客户端断连/超时取消导致 handler future 被 drop 时，
+/// 经 cancel token 触达该请求登记的在飞池执行（cancel_by_token → close_on_drop 真杀）。
+/// 正常完成路径先 `disarm()`。语义同 [`PutStreamGuard`]（客户端断开 ≠ 查询该跑完）。
+struct DisconnectGuard {
+    token: u64,
+    registry: Arc<only_js::bridge::db_exec::ExecRegistry>,
+    armed: bool,
+}
+
+impl DisconnectGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DisconnectGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let registry = Arc::clone(&self.registry);
+            let token = self.token;
+            // Drop 发生在 axum/hyper 的 runtime 线程上（取消即就地 drop future）——spawn 可用。
+            // cancel_by_token 只置 flag + notify：在飞 select! 分支 drop fetch 并 close_on_drop。
+            tokio::spawn(async move {
+                registry.cancel_by_token(token);
+            });
+        }
+    }
+}
+
+/// 请求级 cancel token 源（REQ-11 G2）：进程级单调分配；0 预留给「无 token」语义外的
+/// 未来扩展，故从 1 起。token 随 RequestInfo 进桥，池执行登记时记入 PoolExecShared。
+static CANCEL_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// 流式上传会话守卫（v0.1.84）：pump future 被丢弃（客户端断连/超时取消）时
 /// Drop fire `put_stream_abort`——s3 multipart 不 abort 会留 orphan parts 烧钱，
 /// 且插件侧会话条目永久泄漏（v0.1.38 起两路 pump 只覆盖显式错误路径）。
@@ -2323,6 +2398,7 @@ pub(crate) mod tests {
             certificate_status: Arc::new(RwLock::new(CertificateStatus::Valid)),
             certificate_valid_until: Arc::new(RwLock::new(None)),
             plugins: Arc::default(),
+            exec_registry: None,
         }
     }
 

@@ -81,7 +81,9 @@ impl ExecHandle {
             }
             ExecHandle::Pool(p) => {
                 p.cancel_requested.store(true, Ordering::SeqCst);
-                p.notify.notify_one();
+                // notify_waiters：并存在飞 listener（poll op 的等待 + 池执行体内 select!）
+                // ——notify_one 只醒一个，会饿死执行体的取消分支（REQ-11 G2 挂断实测）。
+                p.notify.notify_waiters();
             }
         }
     }
@@ -165,8 +167,8 @@ impl ExecRegistry {
 
     /// REQ-11 G2：挂断联动——按请求级 token 取消所有未 settle 的池执行（无判权：
     /// token 本身即隔离，guard 只在丢失的 handler future 内触达本请求的 token）。
-    /// 返回触达数（0 = 空扫，幂等）。
-    pub(crate) fn cancel_by_token(&self, token: u64) -> usize {
+    /// 返回触达数（0 = 空扫，幂等）。pub：serve 的 DisconnectGuard 跨 crate 消费。
+    pub fn cancel_by_token(&self, token: u64) -> usize {
         let g = lock(&self.inner);
         let mut n = 0;
         for e in g.values() {
@@ -297,8 +299,11 @@ mod tests {
         // 他人/未知/畸形同既有语义：not-found
         assert!(reg.cancel(&id, &owner(Some("t2"), Some("u"))).is_none());
         assert!(
-            reg.cancel("exec_粗00_00000000000000000000000000000000", &owner(Some("t"), Some("u")))
-                .is_none()
+            reg.cancel(
+                "exec_粗00_00000000000000000000000000000000",
+                &owner(Some("t"), Some("u"))
+            )
+            .is_none()
         );
     }
 
@@ -503,7 +508,11 @@ mod tests {
         )
         .await;
         assert_eq!(v["data"]["n"], json!(2), "{v}");
-        assert_eq!(reg.len(), 0, "legacy pool execution must be deregistered after settle");
+        assert_eq!(
+            reg.len(),
+            0,
+            "legacy pool execution must be deregistered after settle"
+        );
     }
 
     // REQ-11 Task 3：begin/poll/take 全旅程——id 空间、相位 drain、行交付。
@@ -528,7 +537,11 @@ mod tests {
         )
         .await;
         assert_eq!(v["data"]["idOk"], json!(true), "{v}");
-        assert_eq!(v["data"]["phases"], json!(["sent", "fetching", "done"]), "{v}");
+        assert_eq!(
+            v["data"]["phases"],
+            json!(["sent", "fetching", "done"]),
+            "{v}"
+        );
         assert_eq!(v["data"]["n"], json!(2), "{v}");
     }
 
@@ -573,7 +586,9 @@ mod tests {
             })()"#,
         )
         .await;
-        let err = v["data"]["err"].as_str().unwrap_or_else(|| panic!("no err: {v}"));
+        let err = v["data"]["err"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no err: {v}"));
         assert!(err.contains("not done"), "{err}");
     }
 
@@ -646,6 +661,63 @@ mod tests {
         assert!(v["data"]["count"].as_i64().unwrap() >= 1, "{v}");
         assert_eq!(v["data"]["bytesOk"], json!(true), "{v}");
         assert_eq!(v["data"]["mono"], json!(true), "{v}");
+    }
+
+    // REQ-11 Task 5（env-gated 真库腿）：长查询在飞 cancel → take 得 OJ_DB_CANCELLED、
+    // 登记无泄漏。poll 先等 300ms 保证 cancel 落在在飞窗口（连接真死），而非提交前。
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_pg_mysql_cancel_maps_oj_db_cancelled() {
+        let cases = [
+            ("OJ_TEST_PG", "select pg_sleep(30) as s"),
+            ("OJ_TEST_MYSQL", "select sleep(30) as s"),
+        ];
+        let mut ran = 0;
+        for (env, sql) in cases {
+            let Ok(url) = std::env::var(env) else {
+                eprintln!("skip: {env} unset");
+                continue;
+            };
+            if url.is_empty() {
+                eprintln!("skip: {env} empty");
+                continue;
+            }
+            ran += 1;
+            let db = crate::bridge::SqlxAccessor::arc(&url).await.unwrap();
+            let mut dbs = std::collections::HashMap::new();
+            dbs.insert("default".to_string(), db as Arc<dyn DataAccessor>);
+            let reg = Arc::new(ExecRegistry::default());
+            let b = Bridge::with_dbs_and_loader(
+                dbs,
+                Arc::new(InMemoryKV::new()),
+                SchemaRegistry::new(),
+                false,
+                None,
+                Extras {
+                    exec_sessions: Some(reg.clone()),
+                    ..Extras::default()
+                },
+            );
+            let v = run(
+                &b,
+                &format!(
+                    r#"(async () => {{
+                      const v = await __ojCall.queryBegin("default", "{sql}", null, null);
+                      await __ojCall.poll(v.executionId, 300);
+                      await db.cancel(v.executionId);
+                      for (;;) {{ const r = await __ojCall.poll(v.executionId, 1000); if (r.done) break; }}
+                      let code = null;
+                      try {{ await __ojCall.queryTake(v.executionId); }} catch (e) {{ code = e.code || null; }}
+                      return json.ok({{ code }});
+                    }})()"#
+                ),
+            )
+            .await;
+            assert_eq!(v["data"]["code"], json!("OJ_DB_CANCELLED"), "{env}: {v}");
+            assert_eq!(reg.len(), 0, "{env}: registry leak after cancel");
+        }
+        if ran == 0 {
+            eprintln!("skip: OJ_TEST_PG / OJ_TEST_MYSQL both unset");
+        }
     }
 
     /// 取消语义落在**请求边界**上：同一请求内开流 → cancel → 下一次 `next` 必须抛

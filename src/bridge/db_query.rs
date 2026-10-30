@@ -155,6 +155,73 @@ async fn run_pool_query(
     let reg = registry_of(state);
     match reg.register_pool(shared.clone()) {
         Ok(id) => {
+            // REQ-11 G2：挂了 cancel token 的请求（serve 挂断联动），执行体必须
+            // 独立于 op future spawn——客户端断开把 handler future drop 掉之后，
+            // spawn 任务仍听 notify，cancel_by_token 才能真杀服务端语句。
+            // meter 经 meter_final 往返（spawn 任务写回，本臂取回供 query_tail）。
+            if shared.cancel_token.is_some() {
+                let mut meter_owned = std::mem::replace(
+                    meter,
+                    super::db_quota::ByteMeter::new(None, super::db_policy::OnExceed::default()),
+                );
+                let shared2 = shared.clone();
+                let da2 = Arc::clone(da);
+                let norm2 = norm.to_string();
+                let params2 = params.to_vec();
+                tokio::spawn(async move {
+                    let res = da2
+                        .query_cancelable(&norm2, &params2, &mut meter_owned, &shared2)
+                        .await;
+                    *lock(&shared2.meter_final) = Some(meter_owned);
+                    settle_pool(&shared2, res.map(PoolOutcome::Rows));
+                });
+                let wait = async {
+                    loop {
+                        shared.notify.notified().await;
+                        if shared.done.load(Ordering::SeqCst) {
+                            break;
+                        }
+                    }
+                    Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+                };
+                return match super::db_quota::race_statement(wait, alias, timeout_ms, cancelled)
+                    .await
+                {
+                    Ok(()) => {
+                        let outcome = lock(&shared.outcome)
+                            .take()
+                            .expect("settle_pool writes outcome before done");
+                        let r: BridgeResult<Vec<Row>> = match outcome {
+                            PoolOutcome::Rows(rows) => Ok(rows),
+                            PoolOutcome::Err {
+                                category,
+                                retryable,
+                                msg,
+                            } => Err(Box::new(BridgeError {
+                                category,
+                                retryable,
+                                session_disposition: SessionDisposition::Close,
+                                message: msg,
+                                data: Default::default(),
+                            })),
+                            PoolOutcome::Affected(_) => unreachable!("query arm"),
+                        };
+                        *meter = lock(&shared.meter_final)
+                            .take()
+                            .expect("spawn returns meter via meter_final");
+                        reg.remove(&id);
+                        r
+                    }
+                    Err(e) => {
+                        // 语句超时：取消 spawn 任务（close_on_drop 真杀连接）并摘除登记。
+                        shared.cancel_requested.store(true, Ordering::SeqCst);
+                        // 广播：执行体 select! 与 poll 等待可能同时在听。
+                        shared.notify.notify_waiters();
+                        reg.remove(&id);
+                        Err(e)
+                    }
+                };
+            }
             let r = super::db_quota::race_statement(
                 da.query_cancelable(norm, params, meter, &shared),
                 alias,
@@ -192,6 +259,59 @@ async fn run_pool_exec(
     let reg = registry_of(state);
     match reg.register_pool(shared.clone()) {
         Ok(id) => {
+            // G2 spawn 独立执行体：同 run_pool_query（挂断后 cancel_by_token 仍可达）。
+            if shared.cancel_token.is_some() {
+                let shared2 = shared.clone();
+                let da2 = Arc::clone(da);
+                let norm2 = norm.to_string();
+                let params2 = params.to_vec();
+                tokio::spawn(async move {
+                    let res = da2.exec_cancelable(&norm2, &params2, &shared2).await;
+                    settle_pool(&shared2, res.map(PoolOutcome::Affected));
+                });
+                let wait = async {
+                    loop {
+                        shared.notify.notified().await;
+                        if shared.done.load(Ordering::SeqCst) {
+                            break;
+                        }
+                    }
+                    Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+                };
+                return match super::db_quota::race_statement(wait, alias, timeout_ms, cancelled)
+                    .await
+                {
+                    Ok(()) => {
+                        let outcome = lock(&shared.outcome)
+                            .take()
+                            .expect("settle_pool writes outcome before done");
+                        let r: BridgeResult<i64> = match outcome {
+                            PoolOutcome::Affected(n) => Ok(n),
+                            PoolOutcome::Err {
+                                category,
+                                retryable,
+                                msg,
+                            } => Err(Box::new(BridgeError {
+                                category,
+                                retryable,
+                                session_disposition: SessionDisposition::Close,
+                                message: msg,
+                                data: Default::default(),
+                            })),
+                            PoolOutcome::Rows(_) => unreachable!("exec arm"),
+                        };
+                        reg.remove(&id);
+                        r
+                    }
+                    Err(e) => {
+                        shared.cancel_requested.store(true, Ordering::SeqCst);
+                        // 广播：执行体 select! 与 poll 等待可能同时在听。
+                        shared.notify.notify_waiters();
+                        reg.remove(&id);
+                        Err(e)
+                    }
+                };
+            }
             let r = super::db_quota::race_statement(
                 da.exec_cancelable(norm, params, &shared),
                 alias,
@@ -302,8 +422,11 @@ async fn query_tail(
     if meter.exceeded && res.is_ok() {
         match on_exceed {
             super::db_policy::OnExceed::Fail => {
-                let e =
-                    super::db_quota::result_too_large_error(alias, max_result_bytes.unwrap_or(0), meter.counted);
+                let e = super::db_quota::result_too_large_error(
+                    alias,
+                    max_result_bytes.unwrap_or(0),
+                    meter.counted,
+                );
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 trace_sql(
                     state,
@@ -541,7 +664,8 @@ fn settle_pool(shared: &PoolExecShared, res: BridgeResult<PoolOutcome>) {
     };
     *lock(&shared.outcome) = Some(outcome);
     shared.done.store(true, Ordering::SeqCst);
-    shared.notify.notify_one();
+    // notify_waiters：并存在飞 listener（poll 等待 + 执行体 select!），广播防饿死。
+    shared.notify.notify_waiters();
 }
 
 /// db.query 回调面入口（REQ-11 G1）：前置与 query_impl 同款；登记后 spawn 执行体，
@@ -557,7 +681,14 @@ pub async fn op_db_query_begin(
     #[serde] opts: Option<DbCallOpts>,
 ) -> Result<BeginReply, JsErrorBox> {
     let params = params.unwrap_or_default();
-    let pre = call_prelude(&state, &name, &sql, &params, opts.and_then(|o| o.timeout_ms)).await?;
+    let pre = call_prelude(
+        &state,
+        &name,
+        &sql,
+        &params,
+        opts.and_then(|o| o.timeout_ms),
+    )
+    .await?;
     let Target::Pool(da) = pre.target else {
         return Err(JsErrorBox::generic(
             "query begin is only available on the pool path (not inside db.tx)",
@@ -578,7 +709,9 @@ pub async fn op_db_query_begin(
     let on_exceed = pre.on_exceed;
     tokio::spawn(async move {
         let mut meter = super::db_quota::ByteMeter::new(max_result_bytes, on_exceed);
-        let res = da.query_cancelable(&norm, &params, &mut meter, &shared).await;
+        let res = da
+            .query_cancelable(&norm, &params, &mut meter, &shared)
+            .await;
         *lock(&shared.meter_final) = Some(meter);
         settle_pool(&shared, res.map(PoolOutcome::Rows));
     });
@@ -596,7 +729,14 @@ pub async fn op_db_exec_begin(
     #[serde] opts: Option<DbCallOpts>,
 ) -> Result<BeginReply, JsErrorBox> {
     let params = params.unwrap_or_default();
-    let pre = call_prelude(&state, &name, &sql, &params, opts.and_then(|o| o.timeout_ms)).await?;
+    let pre = call_prelude(
+        &state,
+        &name,
+        &sql,
+        &params,
+        opts.and_then(|o| o.timeout_ms),
+    )
+    .await?;
     let Target::Pool(da) = pre.target else {
         return Err(JsErrorBox::generic(
             "exec begin is only available on the pool path (not inside db.tx)",

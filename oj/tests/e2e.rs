@@ -3156,3 +3156,176 @@ async fn mcp_e2e_path_param_tool_roundtrip() {
         "嵌套 path 参数必须调通：{v}"
     );
 }
+
+/// REQ-11 设计 §7 Task 0 验证（env-gated PG）：客户端挂断后，在飞查询被
+/// cancel token 联动取消——pg_stat_activity 里的 pg_sleep 须在断开 ≤5s 内消失
+/// （不依赖语句自带超时；无 guard 时它会跑满 30s，本用例轮询 10s 后红）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disconnect_cancels_running_query_within_5s() {
+    let _g = lock();
+    let url = match std::env::var("OJ_TEST_PG") {
+        Ok(u) if !u.is_empty() => u,
+        _ => {
+            eprintln!("skip: OJ_TEST_PG unset");
+            return;
+        }
+    };
+    // 独立 fixture：tmp/src/sleep/api.ts（dev 模式直接服务该目录）。
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = std::env::temp_dir().join(format!("oj-e2e-disc-{}-{}", std::process::id(), n));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(tmp.join("src/sleep")).unwrap();
+    std::fs::write(
+        tmp.join("src/sleep/manifest.yaml"),
+        "name: \"sleep\"\ndesc: \"REQ-11 disconnect e2e fixture\"\nversion: \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.join("src/sleep/api.ts"),
+        r#"async function get() {
+  try {
+    const rows = await db.query("select pg_sleep(30) as s");
+    return json.ok({ n: rows.length });
+  } catch (e) {
+    return json.fail(500, "sleep failed: " + (e && e.message ? e.message : e));
+  }
+}
+export default { get };
+"#,
+    )
+    .unwrap();
+    // 监控经服务自身查 pg_stat_activity（根 crate 无 PG 驱动；插件轴已载）。
+    std::fs::create_dir_all(tmp.join("src/probe")).unwrap();
+    std::fs::write(
+        tmp.join("src/probe/manifest.yaml"),
+        "name: \"probe\"\ndesc: \"REQ-11 disconnect e2e probe\"\nversion: \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.join("src/probe/api.ts"),
+        r#"async function get() {
+  const rows = await db.query(
+    "select count(*)::int4 as n from pg_stat_activity where state = 'active' and query like '%pg_sleep(30)%' and pid <> pg_backend_pid()");
+  return json.ok({ n: rows[0].n });
+}
+export default { get };
+"#,
+    )
+    .unwrap();
+    let mut cfg: Config = serde_yaml::from_str(
+        &std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../sample/config.yaml"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    cfg.server.port = 0;
+    cfg.db.insert("default".into(), url.clone());
+    cfg.tenant = Default::default();
+    cfg.auth = None;
+    cfg.mounts.clear();
+    cfg.platform = None;
+    cfg.blob = None;
+    cfg.oidc = None;
+    cfg.http_sso = None;
+    cfg.smtp = None;
+    cfg.ldap = None;
+    cfg.es.clear();
+    cfg.secrets.private_key_path = None;
+    cfg.secrets.public_key_path = None;
+    cfg.fs = None;
+    let secs = serve::test_support::now_secs();
+    serve::test_support::write_cert_into(
+        &mut cfg.server,
+        &tmp,
+        secs.saturating_sub(3600),
+        secs + 365 * 86_400,
+    );
+    let (addr, _h) = serve_cmd::start(cfg, &tmp, tmp.join("src"), "/v1/api".into())
+        .await
+        .unwrap();
+    // probe 长超时客户端：actor 池轮询可能把 probe 派到正被 sleep job 占用的 worker
+    // 上排队（队前 job 最久 30s），短超时会误判——probe 语义只信实际响应。
+    let probe_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(35))
+        .build()
+        .unwrap();
+    let probe_active = |addr: std::net::SocketAddr| {
+        let c = probe_client.clone();
+        async move {
+            let v: serde_json::Value = c
+                .get(format!("http://{addr}/v1/api/probe/"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            v["data"]["n"].as_i64().unwrap_or(-1)
+        }
+    };
+    // 预检：probe 自身可服务（断开前 pg_sleep 未在跑 → 0）。
+    assert_eq!(probe_active(addr).await, 0, "probe pre-check");
+    // 裸 TCP 发请求（connection: close）——500ms 后 drop socket = 确定的 FIN。
+    // 不能用 reqwest 丢 future：连接可能回池复用，服务端看不到断开。
+    use tokio::io::AsyncWriteExt as _;
+    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    sock.write_all(b"GET /v1/api/sleep/ HTTP/1.1\r\nhost: oj-e2e\r\nconnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    // 500ms 内若服务端已回包 = handler 提前结束（错误路径），抓出来看。
+    let mut early = Vec::new();
+    let read = async {
+        use tokio::io::AsyncReadExt as _;
+        let mut buf = [0u8; 4096];
+        loop {
+            match sock.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => early.extend_from_slice(&buf[..n]),
+                Err(_) => break,
+            }
+        }
+    };
+    tokio::select! {
+        _ = read => {}
+        _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+    }
+    assert!(
+        early.is_empty(),
+        "sleep handler returned early: {}",
+        String::from_utf8_lossy(&early)
+    );
+    // 断开前确认 sleep 已在飞（probe 看到 1；排队 probe 会等到 sleep 结束，仍返回真值）。
+    let t1 = std::time::Instant::now();
+    loop {
+        let n = probe_active(addr).await;
+        if n == 1 {
+            break;
+        }
+        assert!(
+            t1.elapsed() <= std::time::Duration::from_secs(5),
+            "pg_sleep(30) never observed in flight"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    drop(sock); // FIN：hyper 侧应感知连接死亡 → guard 触发 cancel_by_token
+    let t0 = std::time::Instant::now();
+    let deadline = std::time::Duration::from_secs(10);
+    loop {
+        let active = probe_active(addr).await;
+        if active == 0 {
+            let el = t0.elapsed();
+            assert!(
+                el <= std::time::Duration::from_secs(5),
+                "cancel took {:?} (>5s) after disconnect",
+                el
+            );
+            return;
+        }
+        if t0.elapsed() > deadline {
+            panic!("pg_sleep(30) still active 10s after disconnect — guard not wired");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}

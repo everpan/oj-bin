@@ -119,7 +119,11 @@ fn redact_msg(s: &str) -> String {
 
 /// 1=SQLITE_ERROR（语法）；Io/PoolTimedOut/WorkerCrashed=连接；其余=Internal。
 /// REQ-11 G3：推入相位事件（elapsed 以 `shared.start` 为基准）。
-fn push_event(shared: &super::db::PoolExecShared, phase: &'static str, rows: Option<u64>) {
+pub(crate) fn push_event(
+    shared: &super::db::PoolExecShared,
+    phase: &'static str,
+    rows: Option<u64>,
+) {
     let elapsed_ms = shared.start.elapsed().as_millis() as u64;
     shared
         .events
@@ -132,7 +136,8 @@ fn push_event(shared: &super::db::PoolExecShared, phase: &'static str, rows: Opt
         });
 }
 
-fn sqlite_err(e: &sqlx::Error, ctx: &str) -> BridgeError {    use DbErrorCategory as C;
+fn sqlite_err(e: &sqlx::Error, ctx: &str) -> BridgeError {
+    use DbErrorCategory as C;
     let (category, retryable, session_disposition) = match e {
         sqlx::Error::Io(_) => (C::Connection, false, SessionDisposition::Keep),
         sqlx::Error::PoolTimedOut | sqlx::Error::WorkerCrashed => {
@@ -581,10 +586,17 @@ mod tests {
     async fn cancelable_query_records_sent_fetching_done_events() {
         let db = SqlxAccessor::connect("sqlite::memory:").await.unwrap();
         let shared = test_shared();
-        let mut meter =
-            super::super::db_quota::ByteMeter::new(None, super::super::db_policy::OnExceed::Truncate);
+        let mut meter = super::super::db_quota::ByteMeter::new(
+            None,
+            super::super::db_policy::OnExceed::Truncate,
+        );
         let rows = db
-            .query_cancelable("select 1 as x union all select 2 as x", &[], &mut meter, &shared)
+            .query_cancelable(
+                "select 1 as x union all select 2 as x",
+                &[],
+                &mut meter,
+                &shared,
+            )
             .await
             .unwrap();
         assert_eq!(rows.len(), 2);
@@ -605,8 +617,10 @@ mod tests {
         let db = SqlxAccessor::connect("sqlite::memory:").await.unwrap();
         let shared = test_shared();
         shared.cancel_requested.store(true, Ordering::SeqCst);
-        let mut meter =
-            super::super::db_quota::ByteMeter::new(None, super::super::db_policy::OnExceed::Truncate);
+        let mut meter = super::super::db_quota::ByteMeter::new(
+            None,
+            super::super::db_policy::OnExceed::Truncate,
+        );
         let e = db
             .query_cancelable("select 1", &[], &mut meter, &shared)
             .await
@@ -620,7 +634,10 @@ mod tests {
             .exec_cancelable("create table nope (id int)", &[], &shared)
             .await
             .unwrap_err();
-        assert_eq!(e2.downcast_ref::<BridgeError>().unwrap().category, DbErrorCategory::Cancelled);
+        assert_eq!(
+            e2.downcast_ref::<BridgeError>().unwrap().category,
+            DbErrorCategory::Cancelled
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -637,12 +654,17 @@ mod tests {
                 tokio::task::yield_now().await;
             }
             s2.cancel_requested.store(true, Ordering::SeqCst);
-            s2.notify.notify_one();
+            s2.notify.notify_waiters();
         });
-        let mut meter =
-            super::super::db_quota::ByteMeter::new(None, super::super::db_policy::OnExceed::Truncate);
+        let mut meter = super::super::db_quota::ByteMeter::new(
+            None,
+            super::super::db_policy::OnExceed::Truncate,
+        );
         let big = "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt LIMIT 5000000)";
-        let e = db.query_cancelable(big, &[], &mut meter, &shared).await.unwrap_err();
+        let e = db
+            .query_cancelable(big, &[], &mut meter, &shared)
+            .await
+            .unwrap_err();
         killer.await.unwrap();
         assert_eq!(
             e.downcast_ref::<BridgeError>().unwrap().category,
