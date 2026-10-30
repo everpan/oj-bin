@@ -2601,7 +2601,10 @@ fn apply_tenant_guard(
 }
 
 /// 按方言出 SQL（QueryStatementWriter::build 泛型，四类 statement 通吃）。
-pub(crate) fn build_sql<S: sea_query::QueryStatementWriter>(d: Dialect, q: &S) -> (String, sea_query::Values) {
+pub(crate) fn build_sql<S: sea_query::QueryStatementWriter>(
+    d: Dialect,
+    q: &S,
+) -> (String, sea_query::Values) {
     match d {
         Dialect::Sqlite => q.build(SqliteQueryBuilder),
         Dialect::MySql => q.build(sea_query::MysqlQueryBuilder),
