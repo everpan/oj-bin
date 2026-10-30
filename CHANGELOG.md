@@ -48,6 +48,13 @@ base64。TEXT 列行为不变（MySQL 判别依据：binary charset 拒 String �
 MySQL `db.forSchema(s).catalog("ddl", t)` 放开（两段白名单内联，其余 kind 的
 scope 拒绝语义不变；跨库视图类型探测回退 TABLE 动词 → MySQL 报错 fail-loud）。
 
+**fix（db.ddlDiff，评审 minors 收敛）**：
+
+- 疑似改名 `warnings` 按 removed 列聚类——多列同型一删一增时一列一条（列名全部同
+  型新增候选），不再发 N×M 叉积。
+- `catalog()` item 形态 match 改穷尽守卫（新增 catalog kind 漏 shape 臂编译失败）。
+- rename + 改类型组合补真库重放回归（RENAME 在先、变更语句用新名、数据保留）。
+
 ## v0.1.111
 
 **fix（db 内省）**：BUG-02 MySQL `catalog("constraints")` 跨表串味修复——
