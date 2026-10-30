@@ -7,6 +7,8 @@ edition = "2024"
 # 剥除 Windows verbatim 前缀（\\?\）：canonicalize 结果拼进 sqlite DSN 前必须先简化
 # （unix 上为 no-op）。宿主与插件共用 path_util::sqlite_file_dsn。
 dunce = "1"
+# cellenv（REQ-07a）：$<type>:<base64> 降级单元格编码，workspace 同版本（根 [dependencies]）。
+base64 = "0.23.1"
 paste = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

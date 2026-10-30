@@ -9,6 +9,7 @@ pub mod auth;
 pub mod axis;
 pub mod blob;
 pub mod bus;
+pub mod cellenv;
 pub mod db;
 pub mod es;
 pub mod future;
