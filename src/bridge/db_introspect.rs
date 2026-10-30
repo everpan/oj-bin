@@ -29,7 +29,7 @@ pub async fn op_db_catalog(
 ) -> Result<serde_json::Value, JsErrorBox> {
     let kind = super::introspect::Kind::parse_catalog(&kind).ok_or_else(|| {
         JsErrorBox::generic(format!(
-            "db catalog: unknown kind {kind:?} (views|routines|sequences|ddl|comment|constraints|stats|processlist|users|roles)"
+            "db catalog: unknown kind {kind:?} (views|routines|sequences|ddl|comment|constraints|stats|processlist|users|roles|triggers)"
         ))
     })?;
     let target = resolve_target(&state, &name)?;
@@ -40,13 +40,14 @@ pub async fn op_db_catalog(
     let alias = super::guard::bound_db(&state, &name);
     super::db_policy::granted_only(&state, &alias)?;
 
-    // REQ-10 一期：全实例/全库语义的 kind 拒绝 scope——scoped_sql 的绑定参数替换
-    // 模型套不上（无范围谓词可替换），显式 unsupported 绝不静默内联。
+    // REQ-10 一期 + REQ-08 收口：无 scope 参数位（或范围谓词走 DATABASE() 常量）的
+    // kind 拒绝 scope——scoped_sql 的绑定参数替换模型套不上，显式 unsupported 绝不静默内联。
     if matches!(
         kind,
         super::introspect::Kind::Processlist
             | super::introspect::Kind::Users
             | super::introspect::Kind::Roles
+            | super::introspect::Kind::Triggers
     ) && scope.is_some()
     {
         return Err(to_js_err(Box::new(crate::bridge::db_error::unsupported(

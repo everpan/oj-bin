@@ -547,6 +547,167 @@ async fn real_catalog_routines_and_ddl_routing_pg_mysql() {
     }
 }
 
+/// REQ-08 收口 + REQ-10 一期（env-gated 真库，PG 腿）：`db.catalog("triggers")`
+/// timing/events 从 pg_get_triggerdef 令牌扫（BEFORE + INSERT OR UPDATE）；processlist /
+/// users / roles 形状 + truncated 旗标；四类 kind 拒绝 scope（for_schema unsupported）。
+#[tokio::test(flavor = "current_thread")]
+async fn real_pg_triggers_and_ops_kinds() {
+    let Ok(url) = std::env::var("OJ_TEST_PG") else {
+        eprintln!("skip: OJ_TEST_PG unset");
+        return;
+    };
+    if url.is_empty() {
+        eprintln!("skip: OJ_TEST_PG empty");
+        return;
+    }
+    let db = crate::bridge::SqlxAccessor::arc(&url).await.unwrap();
+    for s in [
+        "drop trigger if exists trg_req08b on t_req08b",
+        "drop table if exists t_req08b",
+        "drop function if exists f_req08b()",
+        "create table t_req08b(id int)",
+        "create function f_req08b() returns trigger language plpgsql as $$ begin return new; end $$",
+        "create trigger trg_req08b before insert or update on t_req08b for each row execute function f_req08b()",
+    ] {
+        db.exec_with_params(s, &[]).await.unwrap();
+    }
+    let b = Bridge::with_dbs_and_loader(
+        std::collections::HashMap::from([("default".to_string(), db.clone() as _)]),
+        Arc::new(InMemoryKV::new()),
+        SchemaRegistry::new(),
+        false,
+        None,
+        Default::default(),
+    );
+    let cap = b
+        .run_with(
+            r#"(async () => {
+                 const trg = await db.catalog("triggers");
+                 const t = (trg.items || []).find((x) => x.name === "trg_req08b");
+                 const pl = await db.catalog("processlist");
+                 const us = await db.catalog("users");
+                 const roles = await db.catalog("roles");
+                 const scoped = await db.forSchema("public").catalog("processlist")
+                   .then(() => null, (e) => ({ code: e.code, capability: e.data && e.data.capability }));
+                 json.ok({ t, plN: (pl.items || []).length, plTrunc: pl.truncated,
+                           users: (us.items || []).map((x) => x.name),
+                           rolesN: (roles.items || []).length, scoped });
+               })().catch(e => json.fail(500, String(e)))"#,
+            crate::bridge::RequestInfo::default(),
+        )
+        .await
+        .unwrap();
+    for s in [
+        "drop trigger if exists trg_req08b on t_req08b",
+        "drop table if exists t_req08b",
+        "drop function if exists f_req08b()",
+    ] {
+        db.exec_with_params(s, &[]).await.unwrap();
+    }
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["code"], 0, "{v}");
+    let d = &v["data"];
+    let t = &d["t"];
+    assert_eq!(t["table"], json!("t_req08b"), "{t}");
+    assert_eq!(t["timing"], json!("BEFORE"), "{t}");
+    let mut ev = t["events"].as_array().expect("events").clone();
+    ev.sort_by_key(|e| e.as_str().unwrap_or("").to_string());
+    assert_eq!(Value::Array(ev), json!(["INSERT", "UPDATE"]), "{t}");
+    assert_eq!(t["enabled"], json!(true), "{t}");
+    assert!(d["plN"].as_u64().unwrap_or(0) >= 1, "{d}");
+    assert_eq!(d["plTrunc"], json!(false), "{d}");
+    let users = d["users"].as_array().expect("users");
+    assert!(
+        users.iter().any(|u| u == "postgres"),
+        "users 须含 postgres: {d}"
+    );
+    assert!(d["scoped"]["code"] == "OJ_DB_UNSUPPORTED", "{d}");
+    assert_eq!(d["scoped"]["capability"], json!("for_schema"), "{d}");
+}
+
+/// REQ-08 收口 + REQ-10 一期（env-gated 真库，MySQL 腿）：triggers 直映
+/// information_schema 列（AFTER + INSERT，body/order 有值）；processlist / users /
+/// roles 形状；scope 拒绝同 PG 腿。
+#[tokio::test(flavor = "current_thread")]
+async fn real_mysql_triggers_and_ops_kinds() {
+    let Ok(url) = std::env::var("OJ_TEST_MYSQL") else {
+        eprintln!("skip: OJ_TEST_MYSQL unset");
+        return;
+    };
+    if url.is_empty() {
+        eprintln!("skip: OJ_TEST_MYSQL empty");
+        return;
+    }
+    let db = crate::bridge::SqlxAccessor::arc(&url).await.unwrap();
+    for s in [
+        "drop table if exists t_req08b",
+        "create table t_req08b(id int)",
+    ] {
+        db.exec_with_params(s, &[]).await.unwrap();
+    }
+    // CREATE/DROP TRIGGER 同 CREATE FUNCTION 不在 prepared 支持集——setup 走原始文本协议。
+    let pool = sqlx::MySqlPool::connect(&url).await.unwrap();
+    sqlx::raw_sql(
+        "drop trigger if exists trg_req08b; \
+         create trigger trg_req08b after insert on t_req08b for each row set @oj_req08b = 1",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let b = Bridge::with_dbs_and_loader(
+        std::collections::HashMap::from([("default".to_string(), db.clone() as _)]),
+        Arc::new(InMemoryKV::new()),
+        SchemaRegistry::new(),
+        false,
+        None,
+        Default::default(),
+    );
+    let cap = b
+        .run_with(
+            r#"(async () => {
+                 const trg = await db.catalog("triggers");
+                 const t = (trg.items || []).find((x) => x.name === "trg_req08b");
+                 const pl = await db.catalog("processlist");
+                 const us = await db.catalog("users");
+                 const roles = await db.catalog("roles");
+                 const scoped = await db.forSchema("ojtest").catalog("triggers")
+                   .then(() => null, (e) => ({ code: e.code, capability: e.data && e.data.capability }));
+                 json.ok({ t, plN: (pl.items || []).length, plTrunc: pl.truncated,
+                           users: (us.items || []).map((x) => x.name),
+                           rolesOk: Array.isArray(roles.items), scoped });
+               })().catch(e => json.fail(500, String(e)))"#,
+            crate::bridge::RequestInfo::default(),
+        )
+        .await
+        .unwrap();
+    sqlx::raw_sql("drop trigger if exists trg_req08b")
+        .execute(&pool)
+        .await
+        .unwrap();
+    db.exec_with_params("drop table if exists t_req08b", &[])
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["code"], 0, "{v}");
+    let d = &v["data"];
+    let t = &d["t"];
+    assert_eq!(t["table"], json!("t_req08b"), "{t}");
+    assert_eq!(t["timing"], json!("AFTER"), "{t}");
+    assert_eq!(t["events"], json!(["INSERT"]), "{t}");
+    assert!(
+        t["body"].as_str().unwrap_or("").contains("@oj_req08b"),
+        "{t}"
+    );
+    assert_eq!(t["enabled"], Value::Null, "{t}");
+    assert!(d["plN"].as_u64().unwrap_or(0) >= 1, "{d}");
+    assert_eq!(d["plTrunc"], json!(false), "{d}");
+    let users = d["users"].as_array().expect("users");
+    assert!(users.iter().any(|u| u == "root"), "users 须含 root: {d}");
+    assert_eq!(d["rolesOk"], json!(true), "{d}");
+    assert_eq!(d["scoped"]["code"], json!("OJ_DB_UNSUPPORTED"), "{d}");
+    assert_eq!(d["scoped"]["capability"], json!("for_schema"), "{d}");
+}
+
 /// 缺陷修复（env-gated 真库矩阵腿）：listIndexes / listForeignKeys 的投影别名含
 /// 保留字（column / unique / primary），MySQL 8 / PG 下裸投影必现语法错误；以及
 /// scoped（forSchema）下 PG 的 scope 占位符序错致静默空结果

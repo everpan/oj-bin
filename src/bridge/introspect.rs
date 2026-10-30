@@ -43,6 +43,8 @@ pub enum Kind {
     Processlist,
     Users,
     Roles,
+    // ---- REQ-08 收口（v0.1.112）：triggers 清单（拒绝 scope，见 op 拦截）----
+    Triggers,
 }
 
 impl Kind {
@@ -62,6 +64,7 @@ impl Kind {
             Kind::Processlist => "processlist",
             Kind::Users => "users",
             Kind::Roles => "roles",
+            Kind::Triggers => "triggers",
         }
     }
 
@@ -88,6 +91,7 @@ impl Kind {
             "processlist" => Kind::Processlist,
             "users" => Kind::Users,
             "roles" => Kind::Roles,
+            "triggers" => Kind::Triggers,
             _ => return None,
         })
     }
@@ -288,6 +292,37 @@ pub fn pg_view_wrap(name: &str, viewdef: &str, materialized: bool) -> String {
         "CREATE OR REPLACE VIEW"
     };
     format!("{kw} {} AS {def}", pg_quote_ident(name))
+}
+
+/// REQ-08 收口：从 `pg_get_triggerdef` 文本扫 timing/events——
+/// `CREATE TRIGGER x BEFORE|AFTER|INSTEAD OF INSERT|UPDATE|DELETE ... ON t ...`。
+/// 只认触发器子句（第一个 `ON` 之前）的令牌，函数体里的同名词不串味。
+pub fn pg_trigger_meta(def: &str) -> (Option<String>, Vec<String>) {
+    let words: Vec<&str> = def.split_whitespace().collect();
+    let mut timing = None;
+    let mut events: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        let w = words[i].to_ascii_uppercase();
+        if w == "ON" && timing.is_some() {
+            break;
+        }
+        match w.as_str() {
+            "BEFORE" | "AFTER" => timing = Some(w),
+            "INSTEAD"
+                if words
+                    .get(i + 1)
+                    .is_some_and(|n| n.eq_ignore_ascii_case("OF")) =>
+            {
+                timing = Some("INSTEAD OF".into());
+                i += 1;
+            }
+            "INSERT" | "UPDATE" | "DELETE" if !events.contains(&w) => events.push(w),
+            _ => {}
+        }
+        i += 1;
+    }
+    (timing, events)
 }
 
 // ---------------------------------------------------------------------------
@@ -726,6 +761,23 @@ pub fn catalog_sql(kind: Kind, d: Dialect) -> Option<&'static str> {
             "SELECT DISTINCT role_name AS name FROM information_schema.applicable_roles \
                   ORDER BY role_name",
         ),
+        // ---------------- REQ-08 收口：triggers 清单（sqlite 无目录来源 → unsupported）----------------
+        (Kind::Triggers, Dialect::Postgres) => Some(
+            "SELECT t.tgname::text AS name, c.relname::text AS \"table\", \
+                  t.tgenabled::text AS tgenabled, \
+                  pg_get_triggerdef(t.oid)::text AS definition \
+                  FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
+                  JOIN pg_namespace n ON n.oid = c.relnamespace \
+                  WHERE NOT t.tgisinternal AND n.nspname = current_schema() \
+                  ORDER BY t.tgname",
+        ),
+        (Kind::Triggers, Dialect::MySql) => Some(
+            "SELECT trigger_name AS name, event_object_table AS `table`, \
+                  action_timing AS timing, event_manipulation AS event, \
+                  action_statement AS body, action_order AS ord \
+                  FROM information_schema.triggers \
+                  WHERE trigger_schema = DATABASE() ORDER BY trigger_name",
+        ),
         _ => None,
     }
 }
@@ -862,6 +914,37 @@ pub fn catalog(kind: Kind, rows: Vec<Value>) -> (Vec<Value>, bool) {
                     Kind::Roles => json!({
                         "name": str_of(r, "name"),
                     }),
+                    Kind::Triggers => {
+                        // PG 行带 definition（pg_get_triggerdef）→ timing/events 令牌扫；
+                        // MySQL 行直映 information_schema 列（events 单元素数组）。
+                        if let Some(def) = opt_str(r.get("definition")) {
+                            let (timing, events) = pg_trigger_meta(&def);
+                            json!({
+                                "name": str_of(r, "name"),
+                                "table": str_of(r, "table"),
+                                "timing": timing,
+                                "events": events,
+                                "body": Value::Null,
+                                "order": Value::Null,
+                                "enabled": str_of(r, "tgenabled") == "O",
+                            })
+                        } else {
+                            let ev = str_of(r, "event");
+                            json!({
+                                "name": str_of(r, "name"),
+                                "table": str_of(r, "table"),
+                                "timing": opt_str(r.get("timing")),
+                                "events": if ev.is_empty() {
+                                    Vec::<Value>::new()
+                                } else {
+                                    vec![json!(ev)]
+                                },
+                                "body": opt_str(r.get("body")),
+                                "order": r.get("ord").cloned().unwrap_or(Value::Null),
+                                "enabled": Value::Null,
+                            })
+                        }
+                    }
                     _ => json!({}),
                 })
                 .collect(),
@@ -1292,6 +1375,63 @@ mod tests {
         assert_eq!(roles[0]["name"], "r");
     }
 
+    /// REQ-08 收口（v0.1.112）：triggers kind——PG 行 timing/events 从
+    /// pg_get_triggerdef 文本令牌扫（definition 键存在即 PG 路径）。
+    #[test]
+    fn triggers_shape_pg_parses_definition() {
+        let (items, t) = catalog(
+            Kind::Triggers,
+            vec![json!({
+                "name": "trg", "table": "t", "tgenabled": "O",
+                "definition": "CREATE TRIGGER trg BEFORE INSERT OR UPDATE ON t \
+                               FOR EACH ROW EXECUTE FUNCTION f()"
+            })],
+        );
+        assert!(!t);
+        let it = &items[0];
+        for k in [
+            "name", "table", "timing", "events", "body", "order", "enabled",
+        ] {
+            assert!(it.get(k).is_some(), "missing {k}: {it:?}");
+        }
+        assert_eq!(it["timing"], "BEFORE");
+        assert_eq!(it["events"], json!(["INSERT", "UPDATE"]));
+        assert_eq!(it["enabled"], json!(true));
+        // PG：body/order 无独立来源（definition 即全文）→ 显式 null，schema 稳定。
+        assert_eq!(it["body"], Value::Null);
+        assert_eq!(it["order"], Value::Null);
+        // INSTEAD OF（pg 视图触发器）与 DISABLED 判定。
+        let (v, _) = catalog(
+            Kind::Triggers,
+            vec![json!({
+                "name": "iv", "table": "v", "tgenabled": "D",
+                "definition": "CREATE TRIGGER iv INSTEAD OF DELETE ON v \
+                               FOR EACH ROW EXECUTE FUNCTION g()"
+            })],
+        );
+        assert_eq!(v[0]["timing"], "INSTEAD OF");
+        assert_eq!(v[0]["events"], json!(["DELETE"]));
+        assert_eq!(v[0]["enabled"], json!(false));
+    }
+
+    /// MySQL 行：timing/event/body/ord 直映（events 为单元素数组），enabled 无来源 → null。
+    #[test]
+    fn triggers_shape_mysql_direct_columns() {
+        let (items, _) = catalog(
+            Kind::Triggers,
+            vec![json!({
+                "name": "trg", "table": "t", "timing": "AFTER",
+                "event": "INSERT", "body": "BEGIN SET @a = 1; END", "ord": 1
+            })],
+        );
+        let it = &items[0];
+        assert_eq!(it["timing"], "AFTER");
+        assert_eq!(it["events"], json!(["INSERT"]));
+        assert_eq!(it["body"], "BEGIN SET @a = 1; END");
+        assert_eq!(it["order"], json!(1));
+        assert_eq!(it["enabled"], Value::Null);
+    }
+
     /// REQ-08 §3.1（v0.1.112）：routines items 带元数据键集（缺省 null，schema 稳定）。
     #[test]
     fn routines_shape_carries_metadata() {
@@ -1376,7 +1516,7 @@ mod tests {
 
     // ---- U-14 批 a：catalog 类的静态守卫（同一组离线防线扩展）----
 
-    const CATALOG: [Kind; 10] = [
+    const CATALOG: [Kind; 11] = [
         Kind::Views,
         Kind::Routines,
         Kind::Sequences,
@@ -1387,6 +1527,7 @@ mod tests {
         Kind::Processlist,
         Kind::Users,
         Kind::Roles,
+        Kind::Triggers,
     ];
 
     /// BUG-02 守卫：`key_column_usage` JOIN 必须含 table_name 关联。MySQL 全库 PK
@@ -1504,6 +1645,7 @@ mod tests {
             Kind::Processlist,
             Kind::Users,
             Kind::Roles,
+            Kind::Triggers,
         ] {
             assert!(
                 catalog_sql(kind, Dialect::Sqlite).is_none(),
