@@ -16,6 +16,45 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.115（未打标签）
+
+**feat（db，REQ-12 批量导入三件套）**：`db.import` / `db.importStatus` / `db.importCancel`。
+
+- **G1 三件套**：`db.import(args)` 发起即返 `{taskId}`（前缀 `imp_`，与 `exp_`/`exec_`
+  天然隔离）；`importStatus` = `{taskId, state: running|done|failed|cancelled, alias, table,
+  rows, errors, bytes, startedAtMs, finishedAtMs, error, samples}`；`importCancel` 幂等。
+  任务模型镜像 ExportRegistry——bearer 归属（他人 id 一律 not found）、惰性清扫、审计
+  全量。源二选一：`blobKey`（csv/jsonl，经 blob `read_range` 1MiB 窗口流式读，不整读
+  内存）或内联 `rows`（≤ `db_import.max_rows`，登记前拒）。
+- **G2 方言路径**：全部走多值 INSERT 全参数化（值只走绑定参数，注入红线不破）。append
+  直插；upsert = PG `ON CONFLICT (keys) DO UPDATE` 直挂多值 INSERT（spec 临时表路径
+  裁决：少类型映射与往返、语义等价；COPY 登记为未来工作）/ MySQL `ON DUPLICATE KEY
+  UPDATE`（要求表上有唯一键，缺 → 参数错误）/ sqlite `INSERT OR REPLACE` 仅
+  `conflictKeys=["rowid"]`（rowid 是 sqlite 内建准列，白名单放行）；replace = 显式
+  `DELETE` + 多值 INSERT（批外单事务；不用 `REPLACE INTO`——FK cascade 语义不同）。
+  批收敛 65535 绑定上限 / 列数；**sqlite append/upsert 全单事务**（spec §4.3 性能关键：
+  cancel/fail 整回滚 rows=0、库空——与网络方言「已提交批保留」语义不同，文档已明写）。
+- **G3 samples 绝对行号**：`samples[] = {line, reason, raw?}`（≤20 条）；`line` = 源文件
+  绝对行号（csv 含 header 偏移，1-based）。skip 模式 = 批内逐行 INSERT：单行错记
+  sample、行不落库、继续；`errors > maxErrors`（默认 10）→ 整任务 Failed。abort（默认）
+  批内错 → 整批回滚 Failed，网络方言已提交前序批保留（rows = 已提交）。
+- **G4 幂等口径**：append 重复导入 = 约束错照常上报（不误称幂等）；幂等只由
+  upsert/replace 承担。
+- **守卫矩阵（放行绝不宽于等效裸 INSERT）**：sql_guard 下目标表已登记且 tenant-scoped
+  → fail-closed——Warn 档 `OJ_DB_UNSUPPORTED(capability="import_under_guard")`、Deny 档
+  报 `import_under_guard`（守卫只能验「某参数=当前 tid」，无法证明导入每行都属于该
+  租户）；Deny + 未登记 → 拒绝（同裸 SQL「cannot verify tenant scope」）；其余逐档
+  复用 `check_tenant_raw` 既有裁决。import 侧逐行租户强制（把 tenant 列强制写成当前
+  tid）登记为未来工作。op 层复用 db_access write 判定 + `allow_ddl`（replace 需 DDL
+  许可）+ 危险写确认 token（replace = truncate 同档），不开旁路。标识符只走
+  `quote_ident` + SchemaRegistry 白名单；csv 表头只用于列序匹配，与登记列名不符 →
+  参数错误 fail-fast，不猜。
+- **配额**：`db_import:` 段（全局并发 4 / 每主体 2 / max_rows 100 万 / max_bytes
+  512MiB / default_batch_size 5000 / TTL 24h，装配期 validate fail-loud）；导入与
+  导出配额互相独立。`db.import.start/done/failed/cancelled` 全量落审计。
+- **验证**：500k×10 CSV 全链路实测 PG 1.8s / MySQL 3.3s（预算 <60s）；三腿 env-gated
+  （`OJ_TEST_PG` / `OJ_TEST_MYSQL`：性能 / upsert 幂等 / 批间取消已提交保留）。
+
 ## v0.1.114（未打标签）
 
 **feat（db，REQ-11 非流式取消与执行进度全交付）**：

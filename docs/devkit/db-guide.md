@@ -444,6 +444,71 @@ for (const s of statements) await db.asSystem().exec(s); // DDL 须 allow_ddl �
   `ddlDiff` 不生成序列对象（serial 的 `CREATE SEQUENCE` 不在 ALTER 流里）；版本错位先探
   `typeof db.ddlDiff === "function"`。
 
+### 3.4 任务式批量导入（`db.import` / `importStatus` / `importCancel`，REQ-12，v0.1.115）
+
+大表灌数不用手写 `for + db.table(...).insert()`：导入是**长任务**——发起即返
+`{taskId}`，Rust consumer 自驱「读源 → 解析 → 多值 INSERT 批事务」落库，前端轮询
+`importStatus` 画进度条，用户点「取消」走 `importCancel`（批间协作，已提交批不回退）。
+
+```ts
+// 1) 上传 CSV 到 blob（既有上传接口），拿到 key
+const { key } = await blob.uploadUrl("imports/users.csv");
+
+// 2) 发起导入（立即返回）
+const { taskId } = await db.import({
+  table: "users",
+  blobKey: key,            // 或 rows: [{...}] 内联小数据（≤ db_import.max_rows）
+  format: "csv",           // csv | jsonl
+  // columns: ["id","name"],  // 缺省 = csv 表头 / 首行键——生产用法请显式给
+  mode: "append",          // append | upsert | replace
+  // onError: "skip",       // 坏行进 samples 行不落库；缺省 abort（批错整批回滚）
+});
+
+// 3) 轮询状态
+for (;;) {
+  const st = await db.importStatus(taskId);
+  if (st.state !== "running") {
+    // st.rows = 已提交行数；st.errors + st.samples（≤20，line = 源文件绝对行号）
+    return json.ok(st);
+  }
+  await new Promise((r) => setTimeout(r, 500)); // 轮询间隔自定
+}
+
+// 4) 取消（任意后续请求，同主体）：幂等；终态任务 no-op
+await db.importCancel(taskId);
+```
+
+**方言路径**（全部多值 INSERT 全参数化——值只走绑定参数）：
+
+| 方言 | append | upsert | replace | 事务 |
+|---|---|---|---|---|
+| PG | 多值 INSERT | 多值 INSERT 直挂 `ON CONFLICT (keys) DO UPDATE` | `DELETE` + 多值 INSERT（单事务） | 每批一个事务 |
+| MySQL | 多值 INSERT | `ON DUPLICATE KEY UPDATE`（**表上须有唯一键**，缺 → 参数错误） | 同上 | 每批一个事务 |
+| sqlite | 多值 INSERT | `INSERT OR REPLACE` **仅 `conflictKeys=["rowid"]`** | 同上 | **全单事务**（性能关键） |
+
+- **批收敛**：`batchSize`（100..=50000，缺省 `db_import.default_batch_size` 5000）再按
+  65535 绑定上限/列数收敛。
+- **sqlite 特例（语义差，必读）**：append/upsert 在 sqlite 走**全单事务**——cancel/
+  fail 是**整回滚**：`rows=0`、库空。网络方言（PG/MySQL）abort/cancel 则**已提交批保留**
+  （`rows`=已提交）。跨方言业务代码不要假设取消后 rows>0。
+- **幂等口径**：append 重复导入 = 主键/唯一约束错照常上报（不误称幂等）；幂等只由
+  upsert/replace 承担。同数据 upsert 跑两遍行数不变（实测腿：PG/MySQL 3k 行）。
+- **samples 行号口径**：`line` = 源文件绝对行号（1-based，csv 的 header 计 1 行）——
+  直接拿去编辑器/日志定位原行。skip 模式单行错记 sample 行不落库，`errors >
+  maxErrors`（默认 10）→ 整任务 Failed。
+- **守卫（放行绝不宽于等效裸 INSERT）**：sql_guard 下目标表**已登记且 tenant-scoped**
+  → fail-closed——Warn 档 `OJ_DB_UNSUPPORTED`（`e.data.capability="import_under_guard"`）、
+  Deny 档报 `import_under_guard`（守卫只能验「某参数=当前 tid」，无法证明导入每行都属于
+  该租户）；Deny + 未登记 → 拒（同裸 SQL「cannot verify tenant scope」）。逐行租户强制
+  （tenant 列强制写成当前 tid）是未来工作，落地前 scoped 表导入保持拒绝。
+- **replace 是危险写**：`allow_ddl` + 危险写确认 token（truncate 同档），先删后插单事务。
+- **标识符红线**：表/列名只走 `quote_ident` + SchemaRegistry 白名单；csv 表头只用于
+  列序匹配——与登记列名不符 → 参数错误 fail-fast，**绝不**把表头文本当标识符拼 SQL。
+- **配额**（`db_import:` 段，装配期 validate fail-loud）：全局并发 4 / 每主体 2 /
+  max_rows 100 万 / max_bytes 512MiB / default_batch_size 5000 / TTL 24h；导入与导出
+  配额互相独立。`db.import.start/done/failed/cancelled` 全量落审计。
+- **性能口径**：500k×10 CSV 全链路实测 PG 1.8s / MySQL 3.3s（预算 <60s）。
+
 ## 4. 事务
 
 ```ts
@@ -975,6 +1040,7 @@ const rows = await DB("analytics").fromJSON(snap).all();   // 在另一个库上
 | `db.stream` | ✅ | ✅（typed 直连，真流式） | ✅（typed 直连，真流式） | 取决于插件是否声明 `stream`；未声明回落 `db.query` 全量 |
 | `db.stream` 的 `signal` 取消 | 协作式（批间） | ✅ `KILL QUERY` | ✅ `pg_cancel_backend` | 取决于插件是否声明 `cancel`。`db.cancel`（v0.1.96）复用同一取消链，只是触发点跨请求 |
 | `db.query`/`db.exec` 的取消（v0.1.114） | 客户端早停（category 仍 `OJ_DB_CANCELLED`） | ✅ `KILL QUERY`（连接报废不回池） | ✅ `pg_cancel_backend`（连接报废不回池） | 插件轴 query 经宿主侧复用 stream vtable 真杀（query_cancelable）；插件轴 exec 取消不可达（ABI 13 车） |
+| `db.import` 任务式批量导入（REQ-12，v0.1.115） | ✅（全单事务：cancel/fail 整回滚 rows=0） | ✅ 多值 INSERT + `ON DUPLICATE KEY UPDATE`（upsert 需唯一键） | ✅ 多值 INSERT + `ON CONFLICT (keys) DO UPDATE` | ❌（构造器形态，按上表构造器行同门——见 §3.4） |
 | `db.table(...)` 构造器（含 DML / join / CTE / 聚合） | ✅ | ✅ | ✅ | ❌ `OJ_DB_UNSUPPORTED` |
 | `db.listTables` | ✅ | ✅ | ✅ | ❌ |
 | `db.nextSeq` | ✅ | ✅ | ✅ | ❌ |

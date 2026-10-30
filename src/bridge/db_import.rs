@@ -1455,7 +1455,6 @@ mod render_tests {
 
 #[cfg(test)]
 mod op_tests {
-    use super::*;
     use crate::bridge::{Bridge, Extras, InMemoryAccessor, InMemoryKV, SchemaRegistry, SqlGuard};
     use serde_json::{Value, json};
     use std::collections::HashMap;
@@ -2041,7 +2040,7 @@ pub async fn op_db_import_cancel(
 mod consumer_tests {
     use super::*;
     use crate::bridge::db::TxSession;
-    use crate::bridge::{Bridge, BridgeResult, DataAccessor, Extras, InMemoryKV, SchemaRegistry};
+    use crate::bridge::{Bridge, DataAccessor, Extras, InMemoryKV, SchemaRegistry};
     use serde_json::{Value, json};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -2110,7 +2109,11 @@ mod consumer_tests {
 
     /// 轮询直至 status.state 离开 running（deadline 有界——禁固定 sleep 当同步）。
     async fn wait_terminal(b: &Bridge, task_id: &str) -> Value {
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        wait_terminal_until(b, task_id, 15).await
+    }
+
+    async fn wait_terminal_until(b: &Bridge, task_id: &str, secs: u64) -> Value {
+        let deadline = std::time::Instant::now() + Duration::from_secs(secs);
         loop {
             let js = format!(
                 r#"(async () => {{
@@ -2283,7 +2286,7 @@ mod consumer_tests {
         let st = wait_terminal(&b, r["taskId"].as_str().unwrap()).await;
         assert_eq!(st["state"], json!("failed"), "{st}");
         assert_eq!(st["rows"], json!(0), "{st}");
-        assert!(st["error"].as_str().unwrap().len() > 0, "{st}");
+        assert!(!st["error"].as_str().unwrap().is_empty(), "{st}");
         assert_eq!(count_rows(&db, "users").await, 0);
     }
 
@@ -2520,6 +2523,206 @@ mod consumer_tests {
         assert_eq!(st["state"], json!("failed"), "{st}");
         assert!(st["error"].as_str().unwrap().contains("max_bytes"), "{st}");
     }
+
+    // ---- env-gated 真库腿（OJ_TEST_PG / OJ_TEST_MYSQL 缺 → 该腿跳过）----
+
+    /// env-gated 真库连接；缺 env 的腿打印 skip 并略过。
+    async fn real_dbs() -> Vec<(&'static str, Arc<dyn DataAccessor>)> {
+        let mut out = Vec::new();
+        for env in ["OJ_TEST_PG", "OJ_TEST_MYSQL"] {
+            match std::env::var(env) {
+                Ok(url) if !url.is_empty() => {
+                    let db = crate::bridge::SqlxAccessor::arc(&url).await.unwrap();
+                    out.push((env, db));
+                }
+                _ => eprintln!("skip: {env} unset"),
+            }
+        }
+        out
+    }
+
+    /// env 腿目标表注册：id BigInt + f1..f9 Text；shared → 租户守卫不介入
+    /// （这些腿验性能/幂等/取消，守卫矩阵由离线腿覆盖）。
+    /// 表名按测试分发（cargo 并行跑测试共享同一真库，撞名即互踩）。
+    fn imp_registry(table: &str) -> SchemaRegistry {
+        let mut cols: Vec<(&str, ColumnType)> = vec![("id", ColumnType::BigInt)];
+        cols.extend((1..=9).map(|i| {
+            (
+                &*Box::leak(format!("f{i}").into_boxed_str()),
+                ColumnType::Text,
+            )
+        }));
+        SchemaRegistry::new().table_owned_shared_typed("tester", table, &["id"], &cols, true)
+    }
+
+    /// DDL 无值可参数化（静态列清单）；表名来自测试内常量。
+    async fn imp_reset(db: &Arc<dyn DataAccessor>, table: &str) {
+        db.exec_with_params(&format!("drop table if exists {table}"), &[])
+            .await
+            .unwrap();
+        db.exec_with_params(
+            &format!("create table {table} (id bigint primary key, f1 text, f2 text, f3 text, f4 text, f5 text, f6 text, f7 text, f8 text, f9 text)"),
+            &[],
+        )
+        .await
+        .unwrap();
+    }
+
+    /// 500k×10 CSV 全链路性能腿：Done、rows=500k、<60s（实测秒数入 ledger）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_pg_mysql_import_perf_500k_under_60s() {
+        const N: i64 = 500_000;
+        let mut csv: Vec<u8> = b"id,f1,f2,f3,f4,f5,f6,f7,f8,f9\n".to_vec();
+        csv.reserve((N as usize) * 36);
+        for i in 0..N {
+            csv.extend_from_slice(
+                format!("{i},v{i}a,v{i}b,v{i}c,v{i}d,v{i}e,v{i}f,v{i}g,v{i}h,v{i}i\n").as_bytes(),
+            );
+        }
+        for (env, db) in real_dbs().await {
+            imp_reset(&db, "imp_perf").await;
+            let (_bd, blobs) = tmp_blobs();
+            blobs
+                .default()
+                .unwrap()
+                .put("in/perf.csv", &csv, None)
+                .await
+                .unwrap();
+            let b = bridge_with(
+                db.clone(),
+                imp_registry("imp_perf"),
+                Some(blobs),
+                Default::default(),
+            );
+            let started = tokio::time::Instant::now();
+            let r = import_js(
+                &b,
+                r#"{ table: "imp_perf", blobKey: "in/perf.csv", format: "csv" }"#,
+            )
+            .await
+            .unwrap();
+            let st = wait_terminal_until(&b, r["taskId"].as_str().unwrap(), 90).await;
+            let elapsed = started.elapsed();
+            assert_eq!(st["state"], json!("done"), "{env}: {st}");
+            assert_eq!(st["rows"], json!(N), "{env}: {st}");
+            eprintln!("{env}: 500k rows import in {elapsed:.1?}");
+            assert!(
+                elapsed < Duration::from_secs(60),
+                "{env}: {elapsed:.1?} >= 60s"
+            );
+            assert_eq!(count_rows(&db, "imp_perf").await, N);
+            db.exec_with_params("drop table imp_perf", &[])
+                .await
+                .unwrap();
+        }
+    }
+
+    /// upsert 幂等：同数据 import 两遍，行数不变（PG ON CONFLICT / MySQL ODKU）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_pg_mysql_upsert_idempotent() {
+        const N: i64 = 3_000;
+        let mut csv: Vec<u8> = b"id,f1\n".to_vec();
+        for i in 0..N {
+            csv.extend_from_slice(format!("{i},n{i}\n").as_bytes());
+        }
+        for (env, db) in real_dbs().await {
+            imp_reset(&db, "imp_up").await;
+            let (_bd, blobs) = tmp_blobs();
+            blobs
+                .default()
+                .unwrap()
+                .put("in/up.csv", &csv, None)
+                .await
+                .unwrap();
+            let b = bridge_with(
+                db.clone(),
+                imp_registry("imp_up"),
+                Some(blobs),
+                Default::default(),
+            );
+            for round in 1..=2 {
+                let r = import_js(
+                    &b,
+                    r#"{ table: "imp_up", blobKey: "in/up.csv", format: "csv", mode: "upsert", conflictKeys: ["id"] }"#,
+                )
+                .await
+                .unwrap();
+                let st = wait_terminal(&b, r["taskId"].as_str().unwrap()).await;
+                assert_eq!(st["state"], json!("done"), "{env} round{round}: {st}");
+                assert_eq!(st["rows"], json!(N), "{env} round{round}: {st}");
+                assert_eq!(count_rows(&db, "imp_up").await, N, "{env} round{round}");
+            }
+            db.exec_with_params("drop table imp_up", &[]).await.unwrap();
+        }
+    }
+
+    /// cancel 落批间：Cancelled、已提交批保留（rows>0、库行数==rows、< 总量）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_pg_mysql_cancel_mid_import() {
+        const N: i64 = 100_000;
+        let mut csv: Vec<u8> = b"id,f1\n".to_vec();
+        for i in 0..N {
+            csv.extend_from_slice(format!("{i},n{i}\n").as_bytes());
+        }
+        for (env, db) in real_dbs().await {
+            imp_reset(&db, "imp_cancel").await;
+            let (_bd, blobs) = tmp_blobs();
+            blobs
+                .default()
+                .unwrap()
+                .put("in/cancel.csv", &csv, None)
+                .await
+                .unwrap();
+            let b = bridge_with(
+                db.clone(),
+                imp_registry("imp_cancel"),
+                Some(blobs),
+                Default::default(),
+            );
+            let r = import_js(
+                &b,
+                r#"{ table: "imp_cancel", blobKey: "in/cancel.csv", format: "csv", batchSize: 100 }"#,
+            )
+            .await
+            .unwrap();
+            let task_id = r["taskId"].as_str().unwrap().to_string();
+            // 等第一批提交（rows>=100）再取消——批间窗口
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            loop {
+                let js = format!(
+                    r#"(async () => {{ const st = await db.importStatus({task_id:?}); json.ok(st); }})().catch(e => json.fail(500, String(e)));"#,
+                );
+                let cap = b.run_with(&js, Default::default()).await.unwrap();
+                let v: Value = serde_json::from_slice(&cap.body).unwrap();
+                if v["data"]["rows"].as_u64().unwrap() >= 100 {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{env}: first batch never committed"
+                );
+                tokio::task::yield_now().await;
+            }
+            let js = format!(
+                r#"(async () => {{ await db.importCancel({task_id:?}); json.ok({{}}); }})().catch(e => json.fail(500, String(e)));"#,
+            );
+            let cap = b.run_with(&js, Default::default()).await.unwrap();
+            let v: Value = serde_json::from_slice(&cap.body).unwrap();
+            assert_eq!(v["code"], 0, "{env}: {v}");
+            let st = wait_terminal_until(&b, &task_id, 30).await;
+            assert_eq!(st["state"], json!("cancelled"), "{env}: {st}");
+            let committed = st["rows"].as_u64().unwrap();
+            assert!(committed > 0 && committed < N as u64, "{env}: {st}");
+            assert_eq!(
+                count_rows(&db, "imp_cancel").await as u64,
+                committed,
+                "{env}: table rows != committed"
+            );
+            db.exec_with_params("drop table imp_cancel", &[])
+                .await
+                .unwrap();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2643,7 +2846,7 @@ impl CsvBlobSource {
     }
 
     fn has_record(&self) -> bool {
-        self.eof || self.buf[self.pos..].iter().any(|&b| b == b'\n')
+        self.eof || self.buf[self.pos..].contains(&b'\n')
     }
 
     async fn fill(&mut self) -> Result<(), String> {

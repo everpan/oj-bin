@@ -103,6 +103,11 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 
 | 症状 | 原因 |
 |---|---|
+| 租户 scoped 表在 sql_guard 下 `db.import` 被拒（`import_under_guard` / `OJ_DB_UNSUPPORTED(capability="import_under_guard")`） | **守卫只能验「某参数=当前 tid」，无法证明导入的每一行都属于该租户**——已登记且 tenant-scoped 的表在 Warn/Deny 下 fail-closed 是刻意设计（放行绝不宽于等效裸 INSERT）。绕行：非 scoped 表导入，或逐行带 tenant 列的 upsert 等逐行租户强制的未来能力；别试图用未登记表绕——Deny 档未登记同样拒 |
+| 取消 sqlite 导入后 `importStatus.rows` 是 0、库也是空的 | sqlite append/upsert 走**全单事务**（性能关键）：cancel/fail = 整回滚。PG/MySQL 才是「已提交批保留（rows>0）」。跨方言代码勿假设取消后 rows>0，按 state 分流 |
+| 同一份 CSV `db.import` 跑两遍报主键冲突 | **append 不误称幂等**——重复导入撞约束是预期行为。要幂等用 `mode:"upsert"`（PG 任意唯一键 / MySQL 需表上有唯一键 / sqlite 仅 `conflictKeys:["rowid"]`）或 `mode:"replace"` |
+| skip 模式 `samples` 的 `line` 对不上「第几行数据」 | `line` = **源文件绝对行号**（1-based，csv header 计 1）——拿去编辑器行号定位原行；换算「第 N 条数据」要再减 header 偏移 |
+| 内联 `rows` 导入的列序和 JS 对象书写序不一致 | 缺省列序 = 首行键的 BTreeMap 排序序（serde_json 无 preserve_order）——**生产用法显式给 `columns`**；blob 源同理优先 `columns` 而不是赌表头 |
 | 想判定哪些列被降级编码，于是嗅探 `$` 前缀（v0.1.111） | **权威面是语句级清单**：查询响应 `X-OJ-Degraded` 头（按 `{col,type}` 去重，干净结果不打头）/ 导出任务 `exportStatus(taskId).degraded`（干净导出 `[]`）。前缀 `$<type>:` 只是单元格编码——TEXT 列字面量可能恰好撞形，嗅探会误判 |
 | 导出 CSV / 查询结果里出现 `$inet:…` / `$point:…` 这类值（v0.1.111） | PG 未解码类型的 base64 编码（按列声明类型降级，替代旧「整条 400」）：查降级清单拿列名 → `atob(payload)` 解码；MySQL `GEOMETRY` 家族仍报错（sqlx 0.9 无字节出口），别期待对称行为 |
 | 命令用了「别人家」的配置 / 行为与预期不符（v0.1.57 起） | `-c` 省略时按 **CWD 逐级向上 → `$HOME/.oj/config.yaml`** 搜索——上级目录甚至 home 兜底有一份 config.yaml 就会被采用。`serve`/`migrate`/`openapi` 等依赖后端配置的场景若回落默认会向 stderr 打 `note: no config.yaml found …`；**`oj exec` / `oj info` 自 v0.1.60 起静默回落、不再打该 note**。排查：怀疑被「别人家」config 影响时显式 `-c` 锁定，或 `oj info` 看实际装配的配置段键名 |

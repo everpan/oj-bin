@@ -4486,3 +4486,59 @@ export default {
 | 拿 `fetching`/`sent` 当进度相位写 UI | `onProgress` 的相位是 `sent`/`fetching`/`done`——done **恒发**；流式的进度只报行数字节数，别等 done 才算「有进度」 |
 | 每行回调里自己打点拖慢导出 | 行回调在泵循环上——重活（落库/网络）请挪走；`onProgress` 已节流，直接用它 |
 | 总量未知想算百分比 | bytes/rows 是累计值不是占比——无总量时分段不定，前端按速率画条形即可；要百分比先 `count(*)` |
+
+## 场景 68：CSV 批量导入 + 取消按钮组合（`db.import` 三件，REQ-12，v0.1.115）
+
+运营后台把一份 50 万行 CSV 灌进 `users` 表，要进度条和「取消」按钮，且刷新页面任务
+不丢。导入是**长任务**：发起即返 taskId，Rust consumer 分批落库，taskId 存 kv 即跨
+请求句柄（与导出任务 `exp_`、执行 `exec_` 前缀隔离）：
+
+```ts
+// src/admin/import/api.ts —— 发起：上传 blob → 起任务 → taskId 落 kv
+export default {
+  async post({ table }: { table: string }) {
+    const up = await blob.uploadUrl("imports/daily.csv");   // 前端 PUT 直传后拿到 key
+    const { taskId } = await db.import({
+      table,                        // 必须在 schema.yaml 登记（白名单源头）
+      blobKey: up.key,
+      format: "csv",
+      columns: ["id", "name"],      // 生产用法显式给——缺省列序是表头/键排序序
+      mode: "append",
+      // onError: "skip", maxErrors: 50,   // 脏数据多时再开：坏行进 samples 行不落库
+    });
+    await kv.set(`imp:${table}`, taskId);   // 跨请求/跨刷新句柄
+    return json.ok({ taskId });
+  },
+};
+
+// src/admin/import/status/api.ts —— 轮询：进度 + 终态 + 坏行样本
+export default {
+  async get({ table }: { table: string }) {
+    const taskId = await kv.get(`imp:${table}`);
+    if (!taskId) return json.ok({ state: "none" });
+    const st = await db.importStatus(taskId);
+    if (st.state === "failed" && st.samples?.length) {
+      // st.samples[i].line = 源文件绝对行号（csv header 计 1）——直接定位原行
+      return json.fail(400, `import failed: ${st.error}; first bad line ${st.samples[0].line}: ${st.samples[0].reason}`);
+    }
+    return json.ok(st);   // {state, rows, bytes, errors, ...}
+  },
+};
+
+// src/admin/import/cancel/api.ts —— 取消：幂等；已提交批不回退（sqlite 除外：全单事务整回滚）
+export default {
+  async post({ table }: { table: string }) {
+    const taskId = await kv.get(`imp:${table}`);
+    if (taskId) await db.importCancel(taskId);
+    return json.ok({ cancelled: true });
+  },
+};
+```
+
+| 坑 | 解 |
+|---|---|
+| 导入租户 scoped 表被 `import_under_guard` 拒 | sql_guard 下 scoped 表 fail-closed 是刻意设计（守卫无法证明每行都属于当前租户）——用非 scoped staging 表导入后按租户 `insert ... select`，等逐行租户强制能力 |
+| 重复导入同一份文件报主键冲突 | append 不误称幂等——重复跑撞约束是预期；要「同文件重放安全」用 `mode:"upsert"`（MySQL 表上须先建唯一键；sqlite 仅 `conflictKeys:["rowid"]`） |
+| 取消后 sqlite 上 rows=0 / 网络库 rows>0 | sqlite 全单事务：cancel/fail 整回滚；PG/MySQL 每批事务：已提交批保留。按 state 分流，勿假设 rows>0 |
+| 大 CSV 把内存吃爆 | blob 源走 `read_range` 1MiB 窗口流式读，缓冲有界；别用内联 `rows` 传大数据（`max_rows` 100 万 / `max_bytes` 512MiB 配额，超限登记前/中途拒，点名键不静默截断） |
+| 想拿 `samples` 的 line 当「第 N 条数据」 | line 是源文件绝对行号（csv header 计 1）——给运营指原文件行定位；换算数据条数自行减 header 偏移 |

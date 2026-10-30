@@ -859,7 +859,8 @@ declare global {
      * 守卫：scoped 表在 sql_guard 下结构化拒（capability="import_under_guard"）；
      * Deny+未登记 → 拒（镜像裸 SQL）；replace = truncate 同档（allow_ddl + 危险写确认门）。
      * 配额：全局/每主体并发（db_import 段）+ max_rows（内联登记前拒）+ max_bytes
-     * （blob 源中途 failed 点名键）；取消不回退已提交批。 */
+     * （blob 源中途 failed 点名键）；取消不回退已提交批——但 sqlite append/upsert
+     * 走全单事务：cancel/fail 整回滚（rows=0、库空），网络方言才保留已提交批。 */
     import(args: {
       table: string;
       schema?: string;
@@ -882,8 +883,9 @@ declare global {
       maxErrors?: number;
     }): Promise<{ taskId: string }>;
     /** 导入任务状态：{taskId, state:"running"|"done"|"failed"|"cancelled", alias, table,
-     * rows（=已提交行数，取消不回退）, errors（=样本计数）, bytes, samples（≤20，
-     * line = 源文件绝对行号，1-based，header 计 1）, startedAtMs, finishedAtMs, error}。 */
+     * rows（=已提交行数；取消不回退已提交批——sqlite 全单事务特例除外：整回滚 rows=0）,
+     * errors（=样本计数）, bytes, samples（≤20，line = 源文件绝对行号，1-based，header 计 1）,
+     * startedAtMs, finishedAtMs, error}。 */
     importStatus(taskId: string): Promise<{
       taskId: string;
       state: "running" | "done" | "failed" | "cancelled";
