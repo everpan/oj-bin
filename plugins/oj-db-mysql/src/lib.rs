@@ -208,6 +208,12 @@ fn safe_ident(s: &str) -> String {
 /// 出现**本插件还不会解码的列类型**时**响亮报错**（`Err`），绝不落成静默 `null`：
 /// `sqlx::Any` 时代这类列（`DECIMAL` / 时间 / `JSON` / `BIT` …）会抛 `AnyDriverError`，
 /// typed 化后若沿用 `unwrap_or(Null)` 就把「报错」退化成「错值」，踩本仓红线。
+///
+/// REQ-07a 降级（`$<type>:<base64>`）在 PG 已落地；MySQL 侧暂不可行——sqlx-mysql 0.9
+/// 把 `MySqlValueRef::as_bytes` 收为 `pub(crate)`（0.7 的 `ValueRef::as_bytes` 公开 API
+/// 在 0.9 被移除），插件侧无公开原始字节出口；`Vec<u8>` 解码的 compatible 面不含
+/// `GEOMETRY`。维持 fail-loud 是 status quo（无回归）；降级需等 sqlx 上游恢复出口或
+/// REQ-07b 另立机制（见 ledger Task 4 ruling）。
 fn row_to_json_mysql(row: &MySqlRow) -> Result<serde_json::Value, String> {
     let mut obj = serde_json::Map::new();
     for col in row.columns() {
