@@ -1482,6 +1482,13 @@ pub async fn assemble_backend(
     let export_registry = Arc::new(only_js::bridge::db_export::ExportRegistry::new(
         &cfg.db_export,
     ));
+    // 任务式批量导入（REQ-12 v0.1.115）：`db_import:` 段装配期校验（fail-loud 点名键），
+    // 注册表同 tx_sessions——热更前后同一 Arc（在跑导入任务跨热更存活）。
+    cfg.db_import.validate()?;
+    let import_section = Arc::new(cfg.db_import.clone());
+    let import_registry = Arc::new(only_js::bridge::db_import::ImportRegistry::new(
+        &cfg.db_import,
+    ));
     // 运行期连接工厂（与装配期同集：含插件 mysql/postgres）；config 目录作为 sqlite 相对路径基准。
     let db_backend = Arc::new(registries.dbs.clone());
     let config_dir_arc = Arc::new(config_dir.to_path_buf());
@@ -1552,6 +1559,8 @@ pub async fn assemble_backend(
         let tx_sessions = tx_sessions.clone();
         let export_section = export_section.clone();
         let export_registry = export_registry.clone();
+        let import_section = import_section.clone();
+        let import_registry = import_registry.clone();
         let audit = audit.clone();
         let audit_store = audit_store.clone();
         let exec_sessions = exec_sessions.clone();
@@ -1620,6 +1629,8 @@ pub async fn assemble_backend(
                     exec_sessions: Some(exec_sessions.clone()),
                     export_section: Some(export_section.clone()),
                     export_registry: Some(export_registry.clone()),
+                    import_section: Some(import_section.clone()),
+                    import_registry: Some(import_registry.clone()),
                     mgmt_section: Some(mgmt_section.clone()),
                     mgmt_axes: Some(mgmt_axes.clone()),
                     mgmt: Some(mgmt.clone()),
@@ -1690,6 +1701,8 @@ pub async fn assemble_backend(
         exec_sessions: exec_sessions.clone(), // 与 make_bridge 的 Extras.exec_sessions 同一注册表。
         export_section: export_section.clone(), // 与 make_bridge 的 Extras.export_section 同一 Arc。
         export_registry: export_registry.clone(), // 与 make_bridge 的 Extras.export_registry 同一注册表。
+        import_section: import_section.clone(), // 与 make_bridge 的 Extras.import_section 同一 Arc。
+        import_registry: import_registry.clone(), // 与 make_bridge 的 Extras.import_registry 同一注册表。
         mgmt_section: mgmt_section.clone(), // 与 make_bridge 的 Extras.mgmt_section 同一 Arc。
         mgmt_axes: mgmt_axes.clone(),       // 与 make_bridge 的 Extras.mgmt_axes 同一注册表。
         mgmt: mgmt.clone(),                 // 与 make_bridge 的 Extras.mgmt 同一登记表。

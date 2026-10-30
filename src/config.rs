@@ -1460,6 +1460,10 @@ pub struct Config {
     /// 上限、回落硬顶、产物 TTL 与清扫间隔。装配期 validate fail-loud（0/超界点名键）。
     #[serde(default, deserialize_with = "null_as_default")]
     pub db_export: crate::bridge::db_policy::DbExportSection,
+    /// 任务式批量导入（REQ-12，v0.1.115，`db_import:` 段）：并发配额（全局/每主体）、
+    /// 行/字节上限、默认批大小、任务 TTL 与清扫间隔。装配期 validate fail-loud。
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub db_import: crate::bridge::db_policy::DbImportSection,
     /// 安全审计（U-9，v0.1.98，`audit:` 段）：统一事件出口 + 进程内有界环形存储。
     /// `enabled` 缺省 **true**（零凭据事件、双限自动清理）；`allow` 缺省不限制
     /// （`audit.query` 的读取门；enabled 且不限制时装配期 warn 提示收紧）。

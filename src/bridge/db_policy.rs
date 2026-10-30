@@ -548,6 +548,81 @@ impl DbExportSection {
     }
 }
 
+/// 任务式批量导入配置段（`db_import:`，REQ-12 v0.1.115）。并发配额 + 行/字节上限
+/// + 默认批大小 + 任务 TTL。全部 0/超界 → 装配期拒启并点名键（fail-loud 同 export 段口径）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DbImportSection {
+    /// 进程级并发上限（缺省 4；>64 拒——回归测试/异常配置防线）。
+    pub global_concurrency: usize,
+    /// 每主体并发上限（缺省 2；>16 拒）。
+    pub per_subject_concurrency: usize,
+    /// 单任务行数上限（缺省 1_000_000；内联 rows 登记前拒，blob 源超 → failed）。
+    pub max_rows: u64,
+    /// 单任务源字节上限（缺省 512 MiB；<1 MiB 拒——低于此值的导入不值得任务化）。
+    pub max_bytes: u64,
+    /// 默认批大小（缺省 5000；100..=50000——渲染 SQL 的语句级配额）。
+    pub default_batch_size: usize,
+    /// 任务 TTL 秒（缺省 24h；终态超时摘表，清扫即丢——import 无 blob 产物）。
+    pub ttl_secs: u64,
+    /// 回收器清扫间隔秒（缺省 1h）。
+    pub sweep_interval_secs: u64,
+}
+
+impl Default for DbImportSection {
+    fn default() -> Self {
+        Self {
+            global_concurrency: 4,
+            per_subject_concurrency: 2,
+            max_rows: 1_000_000,
+            max_bytes: 512 * 1024 * 1024,
+            default_batch_size: 5000,
+            ttl_secs: 24 * 3600,
+            sweep_interval_secs: 3600,
+        }
+    }
+}
+
+impl DbImportSection {
+    /// 装配期 fail-loud 校验：Err 文案点名键（同 DbExportSection::validate 口径）。
+    pub fn validate(&self) -> Result<(), String> {
+        let check = |ok: bool, key: &str, msg: &str| {
+            if ok {
+                Ok(())
+            } else {
+                Err(format!("db_import.{key}: {msg}"))
+            }
+        };
+        check(
+            self.global_concurrency >= 1 && self.global_concurrency <= 64,
+            "global_concurrency",
+            "must be 1..=64",
+        )?;
+        check(
+            self.per_subject_concurrency >= 1 && self.per_subject_concurrency <= 16,
+            "per_subject_concurrency",
+            "must be 1..=16",
+        )?;
+        check(self.max_rows >= 1, "max_rows", "must be >= 1")?;
+        check(
+            self.max_bytes >= 1024 * 1024,
+            "max_bytes",
+            "must be >= 1 MiB (1048576)",
+        )?;
+        check(
+            self.default_batch_size >= 100 && self.default_batch_size <= 50000,
+            "default_batch_size",
+            "must be 100..=50000",
+        )?;
+        check(self.ttl_secs >= 1, "ttl_secs", "must be >= 1")?;
+        check(
+            self.sweep_interval_secs >= 1,
+            "sweep_interval_secs",
+            "must be >= 1",
+        )
+    }
+}
+
 /// 安全审计配置段（`audit:`，U-9 v0.1.98）。缺省**开**（有界环形缓冲，零凭据事件）；
 /// 读面 `allow` 缺省不限制（单进程、零凭据，装配期 warn 提示收紧）。
 /// `max_entries` / `retention_secs` 为 0 装配期拒启（= 不设限的 DoS 面）。
@@ -2041,6 +2116,44 @@ mod behavior {
         }
         // 未知键 fail-loud（serde 默认拒绝）
         assert!(serde_yaml::from_str::<DbExportSection>("concurency: 4\n").is_err());
+    }
+
+    /// E1（REQ-12）：`db_import:` 段解析 + fail-loud 校验。缺省值即规格值
+    /// （全局 4 / 每主体 2 / 行上限 1M / 字节 512MiB / 批 5000 / TTL 24h / 清扫 1h）；
+    /// 0/超界/字节 < 1MiB → Err 点名 `db_import.<key>`。
+    #[test]
+    fn import_section_parses_defaults_and_validates() {
+        // Given 空段，Then 全缺省
+        let s: DbImportSection = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(s.global_concurrency, 4);
+        assert_eq!(s.per_subject_concurrency, 2);
+        assert_eq!(s.max_rows, 1_000_000);
+        assert_eq!(s.max_bytes, 512 * 1024 * 1024);
+        assert_eq!(s.default_batch_size, 5000);
+        assert_eq!(s.ttl_secs, 24 * 3600);
+        assert_eq!(s.sweep_interval_secs, 3600);
+        assert!(s.validate().is_ok(), "{s:?}");
+        // When 非法值，Then Err 点名 db_import.<key>
+        for (yaml, key) in [
+            ("global_concurrency: 0\n", "global_concurrency"),
+            ("global_concurrency: 65\n", "global_concurrency"),
+            ("per_subject_concurrency: 0\n", "per_subject_concurrency"),
+            ("per_subject_concurrency: 17\n", "per_subject_concurrency"),
+            ("max_rows: 0\n", "max_rows"),
+            ("max_bytes: 0\n", "max_bytes"),
+            ("max_bytes: 1048575\n", "max_bytes"),
+            ("default_batch_size: 99\n", "default_batch_size"),
+            ("default_batch_size: 50001\n", "default_batch_size"),
+            ("ttl_secs: 0\n", "ttl_secs"),
+            ("sweep_interval_secs: 0\n", "sweep_interval_secs"),
+        ] {
+            let s: DbImportSection = serde_yaml::from_str(yaml).unwrap();
+            let e = s.validate().expect_err("must reject");
+            assert!(e.contains("db_import."), "{e} must prefix db_import.");
+            assert!(e.contains(key), "{e} must name {key}");
+        }
+        // 未知键 fail-loud（serde 默认拒绝）
+        assert!(serde_yaml::from_str::<DbImportSection>("concurrencyy: 4\n").is_err());
     }
 
     /// 只能收紧：调用侧 timeoutMs > 配置 → 结构化拒，message 点名 statement_timeout_ms。

@@ -229,6 +229,8 @@ mod tests {
             exec_sessions: Arc::new(crate::bridge::db_exec::ExecRegistry::default()),
             export_section: Arc::new(crate::bridge::db_policy::DbExportSection::default()),
             export_registry: Arc::new(crate::bridge::db_export::ExportRegistry::default()),
+            import_section: Arc::new(crate::bridge::db_policy::DbImportSection::default()),
+            import_registry: Arc::new(crate::bridge::db_import::ImportRegistry::default()),
             mgmt_section: Arc::new(Default::default()),
             mgmt_axes: Arc::new(std::collections::HashMap::new()),
             mgmt: Arc::new(crate::bridge::mgmt::MgmtRegistry::new(8, 4)),

@@ -38,6 +38,7 @@ pub mod db_error;
 pub mod db_exec;
 mod db_explain;
 pub mod db_export;
+pub mod db_import;
 mod db_introspect;
 pub mod db_policy;
 mod db_query;
@@ -262,6 +263,10 @@ pub struct StableState {
     /// None 缺省 = 段落缺省值 + 新表（与 exec_sessions 同款生命周期）。
     pub export_section: Arc<db_policy::DbExportSection>,
     pub export_registry: Arc<db_export::ExportRegistry>,
+    /// 任务式批量导入（REQ-12 v0.1.115）：配置段 + 进程级任务登记表（配额/进度/状态机）。
+    /// None 缺省 = 段落缺省值 + 新表（与 export 同款生命周期，热更存活）。
+    pub import_section: Arc<db_policy::DbImportSection>,
+    pub import_registry: Arc<db_import::ImportRegistry>,
     /// 执行登记表（U-5 v0.1.96）：`db.cancel(executionId)` 的跨请求路由表。
     /// 进程级生命周期（热更存活），无配置段（取消判权只看归属主体）。
     pub exec_sessions: Arc<db_exec::ExecRegistry>,
@@ -371,6 +376,9 @@ pub struct Extras {
     /// 任务式导出段 + 登记表（U-18 v0.1.104，`db_export:`）。None = 段落缺省 + 新表。
     pub export_section: Option<Arc<db_policy::DbExportSection>>,
     pub export_registry: Option<Arc<db_export::ExportRegistry>>,
+    /// 任务式批量导入段 + 登记表（REQ-12 v0.1.115，`db_import:`）。None = 段落缺省 + 新表。
+    pub import_section: Option<Arc<db_policy::DbImportSection>>,
+    pub import_registry: Option<Arc<db_import::ImportRegistry>>,
     /// 管理面（U-15）：段 + 收编轴 + 登记表。None = 缺省。
     pub mgmt_section: Option<Arc<db_policy::MgmtSection>>,
     pub mgmt_axes: Option<generic_axis::GenericAxisRegistry>,
@@ -963,6 +971,11 @@ impl Bridge {
             .export_registry
             .clone()
             .unwrap_or_else(|| Arc::new(db_export::ExportRegistry::new(&export_section)));
+        let import_section = extras.import_section.clone().unwrap_or_default();
+        let import_registry = extras
+            .import_registry
+            .clone()
+            .unwrap_or_else(|| Arc::new(db_import::ImportRegistry::new(&import_section)));
         let mgmt_section = extras
             .mgmt_section
             .clone()
@@ -1025,6 +1038,8 @@ impl Bridge {
             exec_sessions,
             export_section,
             export_registry,
+            import_section,
+            import_registry,
             mgmt_section,
             mgmt_axes,
             mgmt,
@@ -2756,6 +2771,8 @@ mod tests {
             exec_sessions: Arc::new(db_exec::ExecRegistry::default()),
             export_section: Arc::new(db_policy::DbExportSection::default()),
             export_registry: Arc::new(db_export::ExportRegistry::default()),
+            import_section: Arc::new(db_policy::DbImportSection::default()),
+            import_registry: Arc::new(db_import::ImportRegistry::default()),
             mgmt_section: Arc::new(db_policy::MgmtSection::default()),
             mgmt_axes: Arc::new(HashMap::new()),
             mgmt: Arc::new(mgmt::MgmtRegistry::new(8, 4)),
