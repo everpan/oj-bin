@@ -464,6 +464,7 @@ pub(crate) struct DbStreamShared {
 pub(crate) const DB_STREAM_CHANNEL_CAP: usize = 64;
 
 /// REQ-11 G3：非流式执行的相位事件（`onProgress` 数据源；JS 经 poll 批量取走）。
+#[derive(serde::Serialize)]
 pub struct CallEvent {
     pub phase: &'static str,
     pub elapsed_ms: u64,
@@ -474,7 +475,22 @@ pub struct CallEvent {
 pub enum PoolOutcome {
     Rows(Vec<Row>),
     Affected(i64),
-    Err { category: DbErrorCategory, msg: String },
+    /// retryable 一并保存——take 侧重建 BridgeError 时保真透传（不加则 Timeout 变 false）。
+    Err {
+        category: DbErrorCategory,
+        retryable: bool,
+        msg: String,
+    },
+}
+
+/// REQ-11：query take 的响应整形上下文（op_db_query_begin 登记时写入，take 消费）。
+pub struct QueryTakeCtx {
+    pub sql: String,
+    pub params: Vec<Value>,
+    /// db 访问控制的行数上限（取回后截断口径，与 legacy query_impl 同款）。
+    pub row_cap: Option<u32>,
+    /// trace_sql 画像用（池路径恒 false；begin 拒绝 Tx target，保留字段防漂移）。
+    pub in_tx: bool,
 }
 
 /// REQ-11 G1/G2：非流式池执行（db.query/exec）的共享状态。与 `DbStreamShared` 同表异型
@@ -496,6 +512,10 @@ pub struct PoolExecShared {
     pub events: std::sync::Mutex<Vec<CallEvent>>,
     /// 完成结果；take 时搬走。
     pub outcome: std::sync::Mutex<Option<PoolOutcome>>,
+    /// REQ-11：执行体结束后回写的计量器终态（query 路径；take 按 exceeded × on_exceed 分档）。
+    pub meter_final: std::sync::Mutex<Option<super::db_quota::ByteMeter>>,
+    /// REQ-11：query take 的整形上下文（exec 路径为 None）。
+    pub query_ctx: std::sync::Mutex<Option<QueryTakeCtx>>,
 }
 
 /// stream_id 全局自增（每请求注册表独立，跨请求重复无妨；u32 足以覆盖请求生命周期内的并发流）。

@@ -47,6 +47,9 @@ pub struct RequestInfo {
     pub anonymous: bool,
     /// 已验签用户（auth 启用且非匿名路径：{id, roles, claims}；否则 None）。
     pub user: Option<Value>,
+    /// REQ-11 G2：请求级取消 token（serve 挂断联动——guard drop 时按 token 取消本请求
+    /// 未 settle 的池执行）。None = 不联动（WS 帧 / 任务桥 / 测试默认）。
+    pub cancel_token: Option<u64>,
     /// 上传文件（multipart 解析结果；非 multipart 为空）。
     pub files: Vec<UploadedFile>,
     /// WS 会话的 bus 发送端（bus.subscribe 注册用；HTTP 请求为 None）。

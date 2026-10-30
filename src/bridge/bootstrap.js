@@ -33,6 +33,11 @@ import {
   op_db_as_system,
   op_db_as_tenant,
   op_db_query,
+  op_db_query_begin,
+  op_db_exec_begin,
+  op_db_call_poll,
+  op_db_query_take,
+  op_db_exec_take,
   op_db_query_build,
   op_db_query_sql,
   op_db_explain,
@@ -1254,6 +1259,16 @@ globalThis.DB = function (name) {
     });
   return dbCache.get(name);
 };
+// REQ-11 G1: raw begin/poll/take surface for the callback path (db.query/exec with
+// onOpen/onProgress wrap these) and for diagnostics/tests. Sync/async semantics as the ops.
+globalThis.__ojCall = {
+  queryBegin: (name, sql, params, opts) => dbOpWrap(op_db_query_begin(name, sql, params, opts)),
+  execBegin: (name, sql, params, opts) => dbOpWrap(op_db_exec_begin(name, sql, params, opts)),
+  poll: (id, waitMs) => dbOpWrap(op_db_call_poll(String(id), waitMs === undefined ? null : waitMs)),
+  queryTake: (id) => dbOpWrap(op_db_query_take(String(id))),
+  execTake: (id) => dbOpWrap(op_db_exec_take(String(id))),
+};
+
 globalThis.db = globalThis.DB("default");
 
 // L3 dynamic data-source registration (client axis, v0.1.91): register a DSN

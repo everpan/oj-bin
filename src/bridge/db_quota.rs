@@ -93,6 +93,11 @@ pub struct ByteMeter {
 }
 
 impl ByteMeter {
+    /// 配置上限的只读访问（REQ-11 take 侧重建分档错误文案用）。
+    pub fn limit(&self) -> Option<u64> {
+        self.limit
+    }
+
     /// `limit = None` 时零开销直通（Continue，counted 照计——信令/画像可用）。
     pub fn new(limit: Option<u64>, on_exceed: OnExceed) -> Self {
         Self {

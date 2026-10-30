@@ -235,9 +235,19 @@ pub async fn op_db_stream_next(
             super::db_exec::PREFIX,
             shared.exec_id.get().map(|s| s.as_str()).unwrap_or(""),
         );
-        return Err(JsErrorBox::generic(format!(
-            "db stream {shown} was cancelled via db.cancel (cursor closed; rows already delivered are kept)"
-        )));
+        // REQ-11：取消落结构化 OJ_DB_CANCELLED（category 可区分；文案与 bearer 遮蔽不变）。
+        return Err(JsErrorBox::from(super::db_error::BridgeError {
+            category: super::db_error::DbErrorCategory::Cancelled,
+            retryable: false,
+            session_disposition: super::db_error::SessionDisposition::Close,
+            message: format!(
+                "db stream {shown} was cancelled via db.cancel (cursor closed; rows already delivered are kept)"
+            ),
+            data: serde_json::json!({ "alias": shared.alias })
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+        }));
     }
     let mut rx = shared.rx.lock().await;
     match rx.recv().await {

@@ -30,13 +30,18 @@ use std::sync::Arc;
 /// normalize_and_trace——登记为已知非裸 SQL 出口。
 #[test]
 fn raw_sql_op_exits_are_pinned() {
-    const WHITELIST: [&str; 27] = [
+    const WHITELIST: [&str; 32] = [
         "op_db_allowed",
         "op_db_as_system",
         "op_db_as_tenant",
+        "op_db_call_poll",
         "op_db_catalog",
         "op_db_dialect",
         "op_db_exec",
+        // REQ-11（v0.1.114）：回调面 begin/take——经 call_prelude 插桩
+        // normalize_and_trace（与 op_db_query 同前置），本身不直接触驱动。
+        "op_db_exec_begin",
+        "op_db_exec_take",
         // G3（v0.1.108）：经 db_query::query_impl 内 normalize_and_trace 插桩（占位符统一），
         // 本身不直接触驱动——登记为已插桩出口。
         "op_db_explain",
@@ -49,8 +54,12 @@ fn raw_sql_op_exits_are_pinned() {
         "op_db_list_tables",
         "op_db_next_seq",
         "op_db_query",
+        // REQ-11（v0.1.114）：回调面 begin/take——经 call_prelude 插桩
+        // normalize_and_trace（与 op_db_query 同前置），本身不直接触驱动。
+        "op_db_query_begin",
         "op_db_query_build",
         "op_db_query_sql",
+        "op_db_query_take",
         "op_db_sql_profile",
         "op_db_stream_abort",
         "op_db_stream_close",
@@ -1006,8 +1015,8 @@ async fn list_indexes_and_foreign_keys_real_pg_mysql() {
 
 /// REQ-05 Q7（env-gated，三方言矩阵的 pg/mysql 腿）：语句级超时在**网络型后端**
 /// 准点触发——5s 级慢语句（pg_sleep/sleep）+ 500ms 上限 → ~500ms 拿
-/// OJ_DB_TIMEOUT（data.cancelled=false：网络方言弃 future ≠ 服务端取消，内置
-/// SqlxAccessor 与插件轴同口径；真取消 = ABI 13 车）。
+/// OJ_DB_TIMEOUT。REQ-11（v0.1.114）起 data.cancelled=true：池路径弃飞 =
+/// close_on_drop 真关 TCP，服务端语句即死（插件轴仍 false = ABI 13 车）。
 /// 未设 OJ_TEST_PG / OJ_TEST_MYSQL 则 skip（本地诚实登记：此腿未经亲跑）。
 /// flavor 必须 current_thread（同存量真库用例：multi_thread 下 op 内 spawn 断言 SIGABRT）。
 #[tokio::test(flavor = "current_thread")]
@@ -1072,8 +1081,8 @@ async fn statement_timeout_matrix_pg_mysql() {
             ms < 4_000,
             "[{env}] 竞速必须在 ~500ms 触发而非 5s 跑完：{ms}ms"
         );
-        // 插件轴诚实位：服务端真取消待 ABI 13 车（执行计划 spike 结论）。
-        assert_eq!(v["data"]["cancelled"], json!(false), "[{env}] {v}");
+        // REQ-11 诚实位：内置 SqlxAccessor 弃飞即真杀（close_on_drop）；插件轴仍待 ABI 13 车。
+        assert_eq!(v["data"]["cancelled"], json!(true), "[{env}] {v}");
     }
     if ran == 0 {
         eprintln!("statement_timeout_matrix_pg_mysql: 双腿皆 skip（env 未设）");

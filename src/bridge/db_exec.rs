@@ -186,6 +186,23 @@ impl ExecRegistry {
         lock(&self.inner).remove(id);
     }
 
+    /// REQ-11：按 id 取 Pool 变体句柄（poll/take 用；判权同 cancel 的 bearer 口径——
+    /// 他人/未知/畸形/流式 id 一律 None，由调用方统一 not-found 文案）。
+    pub(crate) fn pool(&self, id: &str, owner: &Owner) -> Option<Arc<PoolExecShared>> {
+        if !handle_core::id_is_wellformed(PREFIX, id) {
+            return None;
+        }
+        let g = lock(&self.inner);
+        let e = g.get(id)?;
+        if !e.owner.same_subject(owner) {
+            return None;
+        }
+        match &e.handle {
+            ExecHandle::Pool(p) => Some(p.clone()),
+            ExecHandle::Stream(_) => None,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         lock(&self.inner).len()
@@ -260,6 +277,8 @@ mod tests {
             done: AtomicBool::new(false),
             events: Mutex::new(Vec::new()),
             outcome: Mutex::new(None),
+            meter_final: Mutex::new(None),
+            query_ctx: Mutex::new(None),
         })
     }
 
@@ -443,6 +462,121 @@ mod tests {
         serde_json::from_slice(&cap.body).unwrap()
     }
 
+    // REQ-11 Task 3：带外参观察的 bridge（exec_sessions 由测试持有，可断言登记/摘除）。
+    async fn exec_bridge_with_reg(tag: &str) -> (Bridge, Arc<ExecRegistry>) {
+        let p = std::env::temp_dir().join(format!("oj-exec-{}-{tag}.db", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let db = crate::bridge::db_backend::DbBackendRegistry::builtin()
+            .connect(&format!("sqlite://{}", p.display()), &std::env::temp_dir())
+            .await
+            .unwrap();
+        db.exec_with_params("create table t (id integer primary key)", &[])
+            .await
+            .unwrap();
+        db.exec_with_params("insert into t (id) values (1), (2)", &[])
+            .await
+            .unwrap();
+        let mut dbs = std::collections::HashMap::new();
+        dbs.insert("default".to_string(), db as Arc<dyn DataAccessor>);
+        let reg = Arc::new(ExecRegistry::default());
+        let b = Bridge::with_dbs_and_loader(
+            dbs,
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            Extras {
+                exec_sessions: Some(reg.clone()),
+                ..Extras::default()
+            },
+        );
+        (b, reg)
+    }
+
+    // REQ-11 Task 3：legacy db.query 池臂全量登记，settle 后摘除、无泄漏。
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_query_registers_then_deregisters_without_leak() {
+        let (b, reg) = exec_bridge_with_reg("legreg").await;
+        let v = run(
+            &b,
+            r#"(async () => json.ok({ n: (await db.query("select id from t", [])).length }))()"#,
+        )
+        .await;
+        assert_eq!(v["data"]["n"], json!(2), "{v}");
+        assert_eq!(reg.len(), 0, "legacy pool execution must be deregistered after settle");
+    }
+
+    // REQ-11 Task 3：begin/poll/take 全旅程——id 空间、相位 drain、行交付。
+    #[tokio::test(flavor = "current_thread")]
+    async fn begin_poll_take_drains_phases_and_rows() {
+        let b = exec_bridge("bpt").await;
+        let v = run(
+            &b,
+            r#"(async () => {
+              const v = await __ojCall.queryBegin("default", "select id from t order by id", null, null);
+              const id = v.executionId;
+              let phases = [];
+              let done = false;
+              for (let i = 0; i < 200 && !done; i++) {
+                const r = await __ojCall.poll(id, 50);
+                phases = phases.concat(r.events.map((e) => e.phase));
+                done = r.done;
+              }
+              const rows = await __ojCall.queryTake(id);
+              return json.ok({ idOk: id.startsWith("exec_"), phases, n: rows.length });
+            })()"#,
+        )
+        .await;
+        assert_eq!(v["data"]["idOk"], json!(true), "{v}");
+        assert_eq!(v["data"]["phases"], json!(["sent", "fetching", "done"]), "{v}");
+        assert_eq!(v["data"]["n"], json!(2), "{v}");
+    }
+
+    // REQ-11 Task 3：开跑前/取连接竞态窗口内 cancel → OJ_DB_CANCELLED（大结果集保证
+    // cancel 必落在执行完成前——预提交检查与在飞取消两路都收敛同一 category）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_before_or_during_submit_rejects_oj_db_cancelled() {
+        let b = exec_bridge("cbs").await;
+        let v = run(
+            &b,
+            r#"(async () => {
+              const big = "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt LIMIT 5000000)";
+              const v = await __ojCall.queryBegin("default", big, null, null);
+              await db.cancel(v.executionId);
+              let code = null;
+              for (;;) {
+                const r = await __ojCall.poll(v.executionId, 500);
+                if (r.done) break;
+              }
+              try { await __ojCall.queryTake(v.executionId); } catch (e) { code = e.code || null; }
+              return json.ok({ code });
+            })()"#,
+        )
+        .await;
+        assert_eq!(v["data"]["code"], json!("OJ_DB_CANCELLED"), "{v}");
+    }
+
+    // REQ-11 Task 3：未 done 时 take = 参数错误；随后取消收尾（悬挂任务不泄漏）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn take_before_done_is_param_error() {
+        let b = exec_bridge("tbd").await;
+        let v = run(
+            &b,
+            r#"(async () => {
+              const big = "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt LIMIT 5000000)";
+              const v = await __ojCall.queryBegin("default", big, null, null);
+              let err = null;
+              try { await __ojCall.queryTake(v.executionId); } catch (e) { err = String(e); }
+              await db.cancel(v.executionId);
+              for (;;) { const r = await __ojCall.poll(v.executionId, 500); if (r.done) break; }
+              return json.ok({ err });
+            })()"#,
+        )
+        .await;
+        let err = v["data"]["err"].as_str().unwrap_or_else(|| panic!("no err: {v}"));
+        assert!(err.contains("not done"), "{err}");
+    }
+
     /// 取消语义落在**请求边界**上：同一请求内开流 → cancel → 下一次 `next` 必须抛
     /// cancelled（而非静默 done——消费方不得误以为数据取完）；错误文案只含 id 前缀。
     #[tokio::test(flavor = "current_thread")]
@@ -457,16 +591,18 @@ mod tests {
               for await (const row of it) { gotFirst = true; break; }
               let cancelErr = null;
               try { await db.cancel(xid); } catch (e) { cancelErr = String(e); }
-              let afterErr = null;
-              try { for await (const row of it) { void row; } } catch (e) { afterErr = String(e); }
+              let afterErr = null, afterCode = null;
+              try { for await (const row of it) { void row; } } catch (e) { afterErr = String(e); afterCode = e.code || null; }
               return json.ok({ xid, xidOk: typeof xid === "string" && xid.startsWith("exec_"),
-                               gotFirst, cancelErr, afterErr });
+                               gotFirst, cancelErr, afterErr, afterCode });
             })()"#,
         )
         .await;
         assert_eq!(v["data"]["xidOk"], json!(true), "{v}");
         assert_eq!(v["data"]["gotFirst"], json!(true), "{v}");
         assert!(v["data"]["cancelErr"].is_null(), "{v}");
+        // REQ-11：取消落结构化 OJ_DB_CANCELLED（与 OJ_DB_TIMEOUT 可区分）
+        assert_eq!(v["data"]["afterCode"], json!("OJ_DB_CANCELLED"), "{v}");
         let after = v["data"]["afterErr"]
             .as_str()
             .unwrap_or_else(|| panic!("no afterErr: {v}"));

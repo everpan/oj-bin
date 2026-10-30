@@ -321,10 +321,10 @@ impl DataAccessor for SqlxAccessor {
     }
 
     fn server_cancel_on_abandon(&self) -> bool {
-        // sqlite 嵌入式：弃拉取即停客户端步进，无服务端语句残留（REQ-05 data.cancelled）。
-        // 网络型方言（pg/mysql）：弃 future 不等于服务端取消（pg_sleep 类语句仍跑完，
-        // 真取消 = ABI 13 车），与插件轴同口径报 false——真库矩阵用例钉死此语义。
-        matches!(self.dialect, Dialect::Sqlite)
+        // REQ-11（v0.1.114）：池路径改显式连接 + 流被弃/取消时 close_on_drop 真关
+        // TCP——服务端语句即死（pg_sleep/sleep 类不再跑完），三方言同口径 true。
+        // 插件轴仍 false（宿主弃 FfiFuture 只 free state，真取消 = ABI 13 车）。
+        true
     }
 
     async fn query_with_params(&self, sql: &str, params: &[Value]) -> BridgeResult<Vec<JsRow>> {
@@ -571,6 +571,8 @@ mod tests {
             done: std::sync::atomic::AtomicBool::new(false),
             events: Mutex::new(Vec::new()),
             outcome: Mutex::new(None),
+            meter_final: Mutex::new(None),
+            query_ctx: Mutex::new(None),
         })
     }
 

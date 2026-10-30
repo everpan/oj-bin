@@ -929,6 +929,7 @@ pub(crate) async fn run_capture(
         user,
         files,
         bus_tx: None,
+        cancel_token: None, // REQ-11 G2：挂断联动 token（Task 5 接线）
     };
     // oj-5c：路由级 timeout 覆盖（按声明顺序首个命中；含 base 的全路径匹配）。
     let timeout = st
@@ -1212,6 +1213,7 @@ async fn dispatch_meta_handler(
         user: None,
         files: Vec::new(),
         bus_tx: None,
+        cancel_token: None, // REQ-11 G2：挂断联动 token（Task 5 接线）
     };
     let cap = st
         .actor
