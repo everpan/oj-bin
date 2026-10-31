@@ -1,4 +1,3 @@
-
 use super::*;
 use oj_plugin_ffi::{RBytes, RResult};
 use std::ffi::c_void;

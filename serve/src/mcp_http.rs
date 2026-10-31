@@ -312,13 +312,13 @@ async fn read_inbound(
         return Err(*resp);
     }
     if !is_json_content_type(headers) {
-        return Err(crate::fail_response(
+        return Err(crate::dispatch::fail_response(
             415,
             "Content-Type must be application/json",
         ));
     }
     if !accept_ok(headers) {
-        return Err(crate::fail_response(
+        return Err(crate::dispatch::fail_response(
             406,
             "Accept must include application/json or text/event-stream",
         ));
@@ -326,7 +326,7 @@ async fn read_inbound(
     let limit = st.pipeline.max_upload as usize;
     let bytes = match axum::body::to_bytes(body, limit.saturating_mul(2)).await {
         Ok(b) if b.len() <= limit => b,
-        _ => return Err(crate::fail_response(413, "request too large")),
+        _ => return Err(crate::dispatch::fail_response(413, "request too large")),
     };
     let v: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
