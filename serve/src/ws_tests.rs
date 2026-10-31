@@ -1,0 +1,1571 @@
+// ws_e2e_lock 故意持 std MutexGuard 跨 await：串行化 e2e 用例以隔离进程级
+// WS_LIVE；单线程 runtime 各占一线程，无跨 await 死锁（见 ws_e2e_lock 注释）。
+use super::*;
+
+use crate::app;
+use only_js::bridge::InMemoryKV;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// 裸 TCP WebSocket 客户端：upgrade → 掩码文本帧 → 读回帧。
+/// `pre`：与 101 同段到达的首帧字节（服务端 emit 先于客户端读完握手时存在）。
+struct WsClient {
+    s: tokio::net::TcpStream,
+    pre: Vec<u8>,
+}
+
+impl WsClient {
+    async fn connect(addr: std::net::SocketAddr, path: &str) -> Self {
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(
+                format!(
+                    "GET {path} HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+                     Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = s.read(&mut buf).await.unwrap();
+        let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+        assert!(head.starts_with("HTTP/1.1 101"), "upgrade failed: {head}");
+        // 残留字节（header 之后） = 已到达的 WS 帧，不能丢弃。
+        let pre = buf[head.find("\r\n\r\n").map(|i| i + 4).unwrap_or(n)..n].to_vec();
+        Self { s, pre }
+    }
+
+    /// 客户端帧必须掩码：FIN|opcode, MASK|len, 4 字节 mask, XOR payload。
+    async fn send_frame(&mut self, opcode: u8, bytes: &[u8]) {
+        let mask = [0x37u8, 0xfa, 0x21, 0x3d];
+        let mut frame = vec![0x80 | opcode, 0x80 | bytes.len() as u8];
+        frame.extend_from_slice(&mask);
+        frame.extend(bytes.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+        self.s.write_all(&frame).await.unwrap();
+    }
+
+    async fn send_text(&mut self, payload: &str) {
+        self.send_frame(0x01, payload.as_bytes()).await;
+    }
+
+    /// 客户端二进制帧（opcode 0x2）。
+    async fn send_binary(&mut self, payload: &[u8]) {
+        self.send_frame(0x02, payload).await;
+    }
+
+    /// 读一个服务端帧（不掩码；小 payload 单字节长度足够本测试）。
+    /// 先消费与 101 同段到达的残留字节，不足再从 socket 补。
+    async fn read_frame(&mut self) -> (u8, Vec<u8>) {
+        let mut hdr = [0u8; 2];
+        self.read_exact_buf(&mut hdr).await;
+        let opcode = hdr[0] & 0x0f;
+        let len = (hdr[1] & 0x7f) as usize;
+        let mut payload = vec![0u8; len];
+        self.read_exact_buf(&mut payload).await;
+        (opcode, payload)
+    }
+
+    /// 优先消费缓冲，不足部分 read_exact 补齐。
+    async fn read_exact_buf(&mut self, out: &mut [u8]) {
+        let n = self.pre.len().min(out.len());
+        out[..n].copy_from_slice(&self.pre[..n]);
+        self.pre.drain(..n);
+        if n < out.len() {
+            self.s.read_exact(&mut out[n..]).await.unwrap();
+        }
+    }
+
+    async fn read_text(&mut self) -> String {
+        let (opcode, payload) = self.read_frame().await;
+        assert_eq!(opcode, 0x01, "not a text frame: {opcode:x}");
+        String::from_utf8(payload).unwrap()
+    }
+
+    /// 带超时读（3s）：服务端帧丢失时快速失败，而非挂死整个测试进程。
+    async fn read_text_to(&mut self) -> String {
+        tokio::time::timeout(std::time::Duration::from_secs(3), self.read_text())
+            .await
+            .expect("client read timed out (server frame lost?)")
+    }
+}
+
+async fn spawn(router: axum::Router) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    addr
+}
+
+/// WS_LIVE 是进程级计数：ws e2e 用例并行跑时，彼些的在途连接会抬高读数
+/// （gate 用例对「第 1 条连接须成功」最敏感）。凡起 WS 连接的用例先持此锁
+/// 串行化，隔离进程级状态（单线程 runtime 各占一线程，无跨 await 死锁）。
+fn ws_e2e_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 等 WS_LIVE 归零：上个用例的 serve 任务在其 runtime 关停时才归还槽位，可能
+/// 滞后于锁释放落入本用例；straggler 只会递减，归零后持锁期间即稳定在 0。
+/// 闸门用例（max_connections=1）对存量槽位敏感，归零是硬前提。
+async fn ws_live_zero() {
+    for _ in 0..200 {
+        if WS_LIVE.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!(
+        "WS_LIVE did not drain to 0 in 2s: {}",
+        WS_LIVE.load(Ordering::Relaxed)
+    );
+}
+
+/// ws_connect 走 ESM import：bridge 必须带模块加载器（project_root 指向临时目录）。
+fn make_bridge(root: std::path::PathBuf) -> Bridge {
+    use only_js::bridge::{Extras, LoaderShared, SchemaRegistry};
+    use std::collections::HashMap;
+    Bridge::with_dbs_and_loader(
+        HashMap::new(),
+        Arc::new(InMemoryKV::new()),
+        SchemaRegistry::new(),
+        false,
+        Some(Arc::new(LoaderShared {
+            project_root: root,
+            ts: true,
+        })),
+        Extras::default(),
+    )
+}
+
+/// 测试用路由池：make_bridge 工厂（project_root = handler 所在目录）+
+/// WsOptions::default 的 worker/linger。文件缺失用例传不存在的路径同样适用。
+fn test_pool(file: &Path, timeout: std::time::Duration) -> Arc<RoutePool> {
+    let root = file.parent().unwrap_or(Path::new(".")).to_path_buf();
+    RoutePool::new(
+        file.to_path_buf(),
+        Arc::new(move || make_bridge(root.clone())),
+        timeout,
+        WsOptions::default().workers_per_route,
+        WsOptions::default().idle_linger_ms,
+    )
+}
+
+async fn raw_http(addr: std::net::SocketAddr, req: &str) -> String {
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).await.unwrap();
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// bus 跨会话广播：WS 帧订阅 → HTTP 打 api 路由 publish → WS 客户端收 JSON 帧。
+/// actor 与 ws make_bridge 共享同一 Bus（Extras.bus）——publish 广播到订阅的 WS 连接。
+#[tokio::test]
+async fn ws_bus_subscribe_receives_http_publish() {
+    let _e2e = ws_e2e_lock();
+    use crate::actor::JsActor;
+    use only_js::bridge::{Bus, Extras, LoaderShared, SchemaRegistry};
+    use std::collections::HashMap;
+    let t = crate::tests::routes(&[(
+        "pub/api.ts",
+        "function post() { bus.publish(\"news\", { a: 1 }); json.ok({ sent: 1 }); }\n\
+             export default { post };\n",
+    )]);
+    let handler = t.0.join("ws.js");
+    std::fs::write(
+        &handler,
+        r#"export default { connection() { bus.subscribe("news"); json.ok({ sub: 1 }); } };"#,
+    )
+    .unwrap();
+    let bus = Arc::new(Bus::new());
+    let root = t.0.clone();
+    let bus_actor = bus.clone();
+    let actor = JsActor::pool(1, move || {
+        Bridge::with_dbs_and_loader(
+            HashMap::new(),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            Some(Arc::new(LoaderShared {
+                project_root: root.clone(),
+                ts: true,
+            })),
+            Extras {
+                blobs: None,
+                bus: Some(bus_actor.clone()),
+                ..Default::default()
+            },
+        )
+    });
+    let make_bridge = {
+        let root = t.0.clone();
+        let bus = bus.clone();
+        move || {
+            Bridge::with_dbs_and_loader(
+                HashMap::new(),
+                Arc::new(InMemoryKV::new()),
+                SchemaRegistry::new(),
+                false,
+                Some(Arc::new(LoaderShared {
+                    project_root: root.clone(),
+                    ts: true,
+                })),
+                Extras {
+                    blobs: None,
+                    bus: Some(bus.clone()),
+                    ..Default::default()
+                },
+            )
+        }
+    };
+    let addr = spawn(
+        app(
+            vec![crate::RuntimeMount::Api {
+                prefix: "/v1/api".to_string(),
+                table: crate::tests::build_table(&t.0, true, "/v1/api"),
+                fallback: Some(crate::Routes::new("/v1/api", t.0.clone(), true)),
+                web: None,
+            }],
+            actor,
+            None,
+            crate::StaticOpts::default(),
+            crate::Pipeline::default(),
+            Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+            Arc::new(std::sync::RwLock::new(None)),
+            Arc::default(),
+            None,
+        )
+        .merge(js_route(
+            "/ws/bus",
+            RoutePool::new(
+                handler,
+                Arc::new(make_bridge),
+                std::time::Duration::from_secs(1),
+                WsOptions::default().workers_per_route,
+                WsOptions::default().idle_linger_ms,
+            ),
+            WsOptions::default(),
+        )),
+    )
+    .await;
+
+    let mut c = WsClient::connect(addr, "/ws/bus").await;
+    let env = c.read_text().await;
+    assert!(env.contains("\"sub\":1"), "{env}");
+    // HTTP 发布 → 广播到订阅的 WS 连接
+    raw_http(
+        addr,
+        "POST /v1/api/pub HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    let frame = c.read_text().await;
+    let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({"topic": "news", "data": {"a": 1}}),
+        "{v}"
+    );
+}
+
+/// 回归守卫：双连接首帧投递（纯 axum，无 bridge/池）。源于 oj e2e_ws_rooms 的
+/// Linux CI 挂死排查——排查证明 axum/hyper/tungstenite 升级路径本身无恙，真正
+/// 缺陷是测试客户端丢弃与 101 同段到达的首帧。本用例钉住两件事：服务端在
+/// 「客户端尚未读完握手」时立即写帧的合法形态，与客户端缓冲残留字节的正确读法。
+/// 客户端读全部带 3s 超时：回归时快速失败而非挂死。
+#[tokio::test]
+async fn ws_two_conns_first_frame_delivery_pure_axum() {
+    let _e2e = ws_e2e_lock();
+    async fn mini_handler(ws: axum::extract::WebSocketUpgrade) -> axum::response::Response {
+        ws.on_upgrade(|socket: WebSocket| async move {
+            let (msg_tx, mut msg_rx) = mpsc::channel::<(Vec<u8>, bool)>(64);
+            let (resp_tx, mut resp_rx) = mpsc::channel::<WsSend>(64);
+            let (mut sink, mut stream) = socket.split();
+            tokio::spawn(async move {
+                while let Some(Ok(msg)) = stream.next().await {
+                    let frame = match msg {
+                        Message::Text(t) => (t.as_bytes().to_vec(), false),
+                        Message::Binary(b) => (b.to_vec(), true),
+                        Message::Close(_) => break,
+                        _ => continue,
+                    };
+                    if msg_tx.send(frame).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            static N: AtomicU64 = AtomicU64::new(0);
+            let id = N.fetch_add(1, Ordering::Relaxed);
+            let _ = resp_tx.try_send(WsSend::Text(serde_json::json!({ "hello": id }).to_string()));
+            let writer = tokio::spawn(async move {
+                while let Some(frame) = resp_rx.recv().await {
+                    let msg = match frame {
+                        WsSend::Text(t) => Message::Text(t.into()),
+                        WsSend::Binary(b) => Message::Binary(b.into()),
+                    };
+                    if sink.send(msg).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            while let Some((bytes, _)) = msg_rx.recv().await {
+                let s = String::from_utf8_lossy(&bytes).into_owned();
+                let _ =
+                    resp_tx.try_send(WsSend::Text(serde_json::json!({ "echo": s }).to_string()));
+            }
+            drop(resp_tx);
+            let _ = writer.await;
+        })
+    }
+    let router = axum::Router::new().route("/ws", axum::routing::get(mini_handler));
+    let addr = spawn(router).await;
+    for _ in 0..3 {
+        let mut a = WsClient::connect(addr, "/ws").await;
+        assert!(a.read_text_to().await.contains("\"hello\":"));
+        let mut b = WsClient::connect(addr, "/ws").await;
+        assert!(b.read_text_to().await.contains("\"hello\":"));
+        a.send_text("ping-a").await;
+        assert!(a.read_text_to().await.contains("ping-a"));
+        b.send_text("ping-b").await;
+        assert!(b.read_text_to().await.contains("ping-b"));
+    }
+}
+
+/// 回归守卫：空池 linger 退役后的快速重连。曾实修的缺陷——linger 线程的
+/// sched.close() 落地时 Worker 尚未退出（live 未归零），attach 按 live==0 决定
+/// reopen 会漏掉此窗口，新连接 fire 直接吃 PoolClosed（客户端首帧即 Close 帧）。
+/// 修复后 attach 以 closed 标志（锁内）为信号：见 closed 即 reopen + 补员。
+/// 循环三轮连接/断开/重连，CPU 压力下曾 3/20 复现。
+#[tokio::test]
+async fn ws_pool_reconnect_after_idle_retire() {
+    let _e2e = ws_e2e_lock();
+    let t = crate::tests::routes(&[]);
+    let handler = t.0.join("ws.js");
+    std::fs::write(
+        &handler,
+        r#"export default {
+  connection() { json.ok({ hello: 1 }); },
+  message() { json.ok({ op: (http.body || {}).op }); },
+};
+"#,
+    )
+    .unwrap();
+    let pool = test_pool(&handler, std::time::Duration::from_secs(3));
+    let addr = spawn(axum::Router::new().merge(js_route("/ws", pool, WsOptions::default()))).await;
+    for _ in 0..3 {
+        let mut a = WsClient::connect(addr, "/ws").await;
+        assert!(
+            a.read_text_to().await.contains("\"hello\":1"),
+            "A hello lost"
+        );
+        let mut b = WsClient::connect(addr, "/ws").await;
+        assert!(
+            b.read_text_to().await.contains("\"hello\":1"),
+            "B hello lost"
+        );
+        a.send_text(r#"{"op":"x"}"#).await;
+        assert!(a.read_text_to().await.contains("\"op\":\"x\""));
+        b.send_text(r#"{"op":"y"}"#).await;
+        assert!(b.read_text_to().await.contains("\"op\":\"y\""));
+    }
+}
+
+#[tokio::test]
+async fn ws_echo_roundtrip_on_pinned_thread() {
+    let _e2e = ws_e2e_lock();
+    let t = crate::tests::routes(&[]);
+    let addr = spawn(
+        app(
+            vec![crate::RuntimeMount::Api {
+                prefix: "/v1/api".to_string(),
+                table: crate::tests::build_table(&t.0, true, "/v1/api"),
+                fallback: Some(crate::Routes::new("/v1/api", t.0.clone(), true)),
+                web: None,
+            }],
+            crate::tests::make_actor(t.0.clone(), true),
+            None,
+            crate::StaticOpts::default(),
+            crate::Pipeline::default(),
+            Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+            Arc::new(std::sync::RwLock::new(None)),
+            Arc::default(),
+            None,
+        )
+        .merge(echo_route()),
+    )
+    .await;
+    let mut c = WsClient::connect(addr, "/ws").await;
+    c.send_text("ping").await;
+    assert_eq!(c.read_text().await, "ping");
+}
+
+/// 移植 Go TestWSHandle_Connection_Simple：发帧 → JS 处理 → 信封回写。
+#[tokio::test]
+async fn js_route_runs_handler_per_frame() {
+    let _e2e = ws_e2e_lock();
+    let t = crate::tests::routes(&[]);
+    let handler = t.0.join("ws.js");
+    std::fs::write(
+        &handler,
+        r#"export default { message() { json.ok({ pong: true }); } };"#,
+    )
+    .unwrap();
+    let addr = spawn(
+        app(
+            vec![crate::RuntimeMount::Api {
+                prefix: "/v1/api".to_string(),
+                table: crate::tests::build_table(&t.0, true, "/v1/api"),
+                fallback: Some(crate::Routes::new("/v1/api", t.0.clone(), true)),
+                web: None,
+            }],
+            crate::tests::make_actor(t.0.clone(), true),
+            None,
+            crate::StaticOpts::default(),
+            crate::Pipeline::default(),
+            Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+            Arc::new(std::sync::RwLock::new(None)),
+            Arc::default(),
+            None,
+        )
+        .merge(js_route(
+            "/ws/js",
+            test_pool(&handler, std::time::Duration::from_secs(1)),
+            WsOptions::default(),
+        )),
+    )
+    .await;
+
+    let mut c = WsClient::connect(addr, "/ws/js").await;
+    c.send_text(r#"{"hello":"world"}"#).await;
+    let resp = c.read_text().await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["data"]["pong"], true, "{v}");
+
+    // 第二帧复用同一 VM：仍正常回信封。
+    c.send_text("again").await;
+    let resp2 = c.read_text().await;
+    assert!(resp2.contains("pong"), "{resp2}");
+}
+
+/// v0.1.16 二进制帧往返：客户端发 Binary 帧（含非 UTF-8 字节）→ handler
+/// `ws.send(await http.bodyBytes())` 回显 → 客户端收 Binary 帧（opcode 0x2）
+/// 字节相等（无损；文本信封不掺和）。
+#[tokio::test]
+async fn js_route_ws_binary_echo_roundtrip() {
+    let _e2e = ws_e2e_lock();
+    let t = crate::tests::routes(&[]);
+    let handler = t.0.join("ws.js");
+    std::fs::write(
+        &handler,
+        r#"export default { async message() { ws.send(await http.bodyBytes()); } };"#,
+    )
+    .unwrap();
+    let addr = spawn(
+        app(
+            vec![crate::RuntimeMount::Api {
+                prefix: "/v1/api".to_string(),
+                table: crate::tests::build_table(&t.0, true, "/v1/api"),
+                fallback: Some(crate::Routes::new("/v1/api", t.0.clone(), true)),
+                web: None,
+            }],
+            crate::tests::make_actor(t.0.clone(), true),
+            None,
+            crate::StaticOpts::default(),
+            crate::Pipeline::default(),
+            Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+            Arc::new(std::sync::RwLock::new(None)),
+            Arc::default(),
+            None,
+        )
+        .merge(js_route(
+            "/ws/bin",
+            test_pool(&handler, std::time::Duration::from_secs(1)),
+            WsOptions::default(),
+        )),
+    )
+    .await;
+
+    let mut c = WsClient::connect(addr, "/ws/bin").await;
+    c.send_binary(&[1, 2, 3, 0x00, 0xFF, 0xFE]).await;
+    let (opcode, payload) = c.read_frame().await;
+    assert_eq!(opcode, 0x02, "echo must ride a binary frame");
+    assert_eq!(payload, vec![1, 2, 3, 0x00, 0xFF, 0xFE]);
+}
+
+/// v0.1.16 bus 二进制：HTTP handler `bus.publish(topic, new Uint8Array([...]))` →
+/// 订阅的 WS 连接收 Binary 帧（原字节；Bytes 载荷不包 {"topic","data"} 信封）。
+#[tokio::test]
+async fn ws_bus_binary_publish_reaches_subscriber() {
+    let _e2e = ws_e2e_lock();
+    use crate::actor::JsActor;
+    use only_js::bridge::{Bus, Extras, LoaderShared, SchemaRegistry};
+    use std::collections::HashMap;
+    let t = crate::tests::routes(&[(
+        "pub/api.ts",
+        "function post() { bus.publish(\"bin\", new Uint8Array([0, 159, 255])); json.ok({ sent: 1 }); }\n\
+             export default { post };\n",
+    )]);
+    let handler = t.0.join("ws.js");
+    std::fs::write(
+        &handler,
+        r#"export default { connection() { bus.subscribe("bin"); json.ok({ sub: 1 }); } };"#,
+    )
+    .unwrap();
+    let bus = Arc::new(Bus::new());
+    let root = t.0.clone();
+    let bus_actor = bus.clone();
+    let actor = JsActor::pool(1, move || {
+        Bridge::with_dbs_and_loader(
+            HashMap::new(),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            Some(Arc::new(LoaderShared {
+                project_root: root.clone(),
+                ts: true,
+            })),
+            Extras {
+                blobs: None,
+                bus: Some(bus_actor.clone()),
+                ..Default::default()
+            },
+        )
+    });
+    let make_bridge = {
+        let root = t.0.clone();
+        let bus = bus.clone();
+        move || {
+            Bridge::with_dbs_and_loader(
+                HashMap::new(),
+                Arc::new(InMemoryKV::new()),
+                SchemaRegistry::new(),
+                false,
+                Some(Arc::new(LoaderShared {
+                    project_root: root.clone(),
+                    ts: true,
+                })),
+                Extras {
+                    blobs: None,
+                    bus: Some(bus.clone()),
+                    ..Default::default()
+                },
+            )
+        }
+    };
+    let addr = spawn(
+        app(
+            vec![crate::RuntimeMount::Api {
+                prefix: "/v1/api".to_string(),
+                table: crate::tests::build_table(&t.0, true, "/v1/api"),
+                fallback: Some(crate::Routes::new("/v1/api", t.0.clone(), true)),
+                web: None,
+            }],
+            actor,
+            None,
+            crate::StaticOpts::default(),
+            crate::Pipeline::default(),
+            Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+            Arc::new(std::sync::RwLock::new(None)),
+            Arc::default(),
+            None,
+        )
+        .merge(js_route(
+            "/ws/binbus",
+            RoutePool::new(
+                handler,
+                Arc::new(make_bridge),
+                std::time::Duration::from_secs(1),
+                WsOptions::default().workers_per_route,
+                WsOptions::default().idle_linger_ms,
+            ),
+            WsOptions::default(),
+        )),
+    )
+    .await;
+
+    let mut c = WsClient::connect(addr, "/ws/binbus").await;
+    let env = c.read_text().await;
+    assert!(env.contains("\"sub\":1"), "{env}");
+    raw_http(
+        addr,
+        "POST /v1/api/pub HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    let (opcode, payload) = c.read_frame().await;
+    assert_eq!(opcode, 0x02, "bus Bytes payload must ride a binary frame");
+    assert_eq!(payload, vec![0, 159, 255]);
+}
+
+/// 闸门：max=1 时第 2 条连接被拒（503），存量连接不受影响；max=0 不限。
+#[tokio::test]
+async fn gate_rejects_over_limit_with_503() {
+    let _e2e = ws_e2e_lock();
+    // 闸门是进程级计数：straggler 槽位未归零时「第 1 条连接」也会吃 503。
+    ws_live_zero().await;
+    let t = crate::tests::routes(&[]);
+    let handler = t.0.join("ws.js");
+    std::fs::write(
+        &handler,
+        r#"export default { message() { json.ok({ pong: 1 }); } };"#,
+    )
+    .unwrap();
+    let addr = spawn(
+        app(
+            vec![crate::RuntimeMount::Api {
+                prefix: "/v1/api".to_string(),
+                table: crate::tests::build_table(&t.0, true, "/v1/api"),
+                fallback: Some(crate::Routes::new("/v1/api", t.0.clone(), true)),
+                web: None,
+            }],
+            crate::tests::make_actor(t.0.clone(), true),
+            None,
+            crate::StaticOpts::default(),
+            crate::Pipeline::default(),
+            Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+            Arc::new(std::sync::RwLock::new(None)),
+            Arc::default(),
+            None,
+        )
+        .merge(js_route(
+            "/ws/gate",
+            test_pool(&handler, std::time::Duration::from_secs(1)),
+            WsOptions {
+                max_connections: 1,
+                ..WsOptions::default()
+            },
+        )),
+    )
+    .await;
+    let mut c1 = WsClient::connect(addr, "/ws/gate").await; // 第 1 条：占满
+    c1.send_text("hi").await;
+    assert!(c1.read_text().await.contains("\"pong\":1"));
+    // 第 2 条：upgrade 被拒（非 101）
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    s.write_all(b"GET /ws/gate HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
+            .await
+            .unwrap();
+    let mut buf = vec![0u8; 256];
+    let n = s.read(&mut buf).await.unwrap();
+    assert!(
+        String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 503"),
+        "expected 503"
+    );
+    // 存量连接不受影响
+    c1.send_text("again").await;
+    assert!(c1.read_text().await.contains("\"pong\":1"));
+}
+
+/// upgrade 半路失败的槽位归还钉（v0.1.10 终审 Critical #1）：gate_enter 计数
+/// 与 GateGuard 递减必须 1:1——Arc 双克隆（on_failed_upgrade / on_upgrade 各持
+/// 一份）共享一个 Guard，两份克隆都 drop 后 WS_LIVE 恰好回到原值（不多减、
+/// 不漏减）。真实握手失败需客户端 RST 竞态时序，集成层不可稳定复现；本钉锁死
+/// 修复依赖的配对语义——若有人退回「只在 on_upgrade 闭包里 new GateGuard」，
+/// failed 路径无对应克隆，本测试与 js_route 装配的共同前提即被破坏。
+#[tokio::test]
+async fn gate_slot_returned_exactly_once_via_shared_guard() {
+    let _e2e = ws_e2e_lock();
+    // 基线前等 straggler 槽位归零：上个用例释放锁后其 runtime 关停才归还，
+    // 迟来递减会把终值拉低（Windows 复现：left 0 right 1）。
+    ws_live_zero().await;
+    let before = WS_LIVE.load(Ordering::Relaxed);
+    assert!(gate_enter(u64::MAX));
+    assert_eq!(WS_LIVE.load(Ordering::Relaxed), before + 1);
+    let gate = Arc::new(GateGuard);
+    let failed_gate = Arc::clone(&gate);
+    drop(failed_gate); // on_failed_upgrade 路径先终结：Guard 仍被 gate 持有，不减
+    assert_eq!(WS_LIVE.load(Ordering::Relaxed), before + 1);
+    drop(gate); // 另一路径终结：Guard 唯一一次 drop，恰好减一
+    assert_eq!(WS_LIVE.load(Ordering::Relaxed), before);
+}
+
+/// ws.send 先于信封写出、ws.close 结束连接（顺序契约）。
+#[tokio::test]
+async fn js_route_ws_send_order_and_close() {
+    let _e2e = ws_e2e_lock();
+    let t = crate::tests::routes(&[]);
+    let handler = t.0.join("ws.js");
+    std::fs::write(
+        &handler,
+        r#"export default { message() { ws.send("side"); json.ok({ done: 1 }); ws.close(); } };"#,
+    )
+    .unwrap();
+    let addr = spawn(
+        app(
+            vec![crate::RuntimeMount::Api {
+                prefix: "/v1/api".to_string(),
+                table: crate::tests::build_table(&t.0, true, "/v1/api"),
+                fallback: Some(crate::Routes::new("/v1/api", t.0.clone(), true)),
+                web: None,
+            }],
+            crate::tests::make_actor(t.0.clone(), true),
+            None,
+            crate::StaticOpts::default(),
+            crate::Pipeline::default(),
+            Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+            Arc::new(std::sync::RwLock::new(None)),
+            Arc::default(),
+            None,
+        )
+        .merge(js_route(
+            "/ws/close",
+            test_pool(&handler, std::time::Duration::from_secs(1)),
+            WsOptions::default(),
+        )),
+    )
+    .await;
+
+    let mut c = WsClient::connect(addr, "/ws/close").await;
+    c.send_text("go").await;
+    assert_eq!(c.read_text().await, "side"); // ws.send 先写
+    let envelope = c.read_text().await;
+    assert!(envelope.contains("\"done\":1"), "{envelope}");
+    // close 后连接终止：Close 帧或 EOF（不 panic）。
+    let mut buf = [0u8; 64];
+    let n = c.s.read(&mut buf).await.unwrap();
+    assert!(
+        n == 0 || buf[0] == 0x88,
+        "expected close, got {n} bytes: {:x?}",
+        &buf[..n]
+    );
+}
+
+/// 生产挂载（与 oj server 装配同构）：<root>/<dir>/ws.ts 目录镜像 → GET {base}/<dir>/ws；
+/// app().merge(mirror_routes())，WS 工厂与 actor 共享 Bus → HTTP publish 广播到订阅连接。
+/// ws.ts 经统一转译管线（类型标注可用）。
+#[tokio::test]
+async fn mirror_routes_mount_directory_ws() {
+    let _e2e = ws_e2e_lock();
+    use crate::actor::JsActor;
+    use only_js::bridge::{Bus, Extras, LoaderShared, SchemaRegistry};
+    use std::collections::HashMap;
+    let t = crate::tests::routes(&[
+        (
+            "news/api.ts",
+            "function post() { bus.publish(\"news\", { a: 1 }); json.ok({ sent: 1 }); }\n\
+                 export default { post };\n",
+        ),
+        (
+            "news/ws.ts",
+            "const n: number = 1;\nexport default {\n  connection() {\n    bus.subscribe(\"news\");\n    json.ok({ sub: n });\n  },\n};\n",
+        ),
+    ]);
+    let bus = Arc::new(Bus::new());
+    let root = t.0.clone();
+    let bus2 = bus.clone();
+    let make = move || {
+        Bridge::with_dbs_and_loader(
+            HashMap::new(),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            Some(Arc::new(LoaderShared {
+                project_root: root.clone(),
+                ts: true,
+            })),
+            Extras {
+                blobs: None,
+                bus: Some(bus2.clone()),
+                ..Default::default()
+            },
+        )
+    };
+    let mounts = ws_mounts("/v1/api", &t.0, true, None).unwrap();
+    let addr = spawn(
+        app(
+            vec![crate::RuntimeMount::Api {
+                prefix: "/v1/api".to_string(),
+                table: crate::tests::build_table(&t.0, true, "/v1/api"),
+                fallback: Some(crate::Routes::new("/v1/api", t.0.clone(), true)),
+                web: None,
+            }],
+            JsActor::pool(1, make.clone()),
+            None,
+            crate::StaticOpts::default(),
+            crate::Pipeline::default(),
+            Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+            Arc::new(std::sync::RwLock::new(None)),
+            Arc::default(),
+            None,
+        )
+        .merge(mirror_routes(
+            &mounts,
+            std::time::Duration::from_secs(2),
+            make,
+            WsOptions::default(),
+            None,
+        )),
+    )
+    .await;
+
+    let mut c = WsClient::connect(addr, "/v1/api/news/ws").await;
+    let env = c.read_text().await;
+    assert!(env.contains("\"sub\":1"), "{env}");
+    // HTTP publish（run_module 生产路径）→ 订阅连接收广播帧
+    raw_http(
+        addr,
+        "POST /v1/api/news HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&c.read_text().await).unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({"topic": "news", "data": {"a": 1}}),
+        "{v}"
+    );
+}
+
+/// 根级 ws.ts → GET {base}/ws（rel 为空时不得拼出 {base}//ws 双斜杠路径）。
+#[tokio::test]
+async fn mirror_routes_root_ws() {
+    let _e2e = ws_e2e_lock();
+    use crate::actor::JsActor;
+    use only_js::bridge::{Extras, LoaderShared, SchemaRegistry};
+    use std::collections::HashMap;
+    let t = crate::tests::routes(&[(
+        "ws.ts",
+        "export default { message() { json.ok({ root: true }); } };\n",
+    )]);
+    let root = t.0.clone();
+    let make = move || {
+        Bridge::with_dbs_and_loader(
+            HashMap::new(),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            Some(Arc::new(LoaderShared {
+                project_root: root.clone(),
+                ts: true,
+            })),
+            Extras::default(),
+        )
+    };
+    let mounts = ws_mounts("/v1/api", &t.0, true, None).unwrap();
+    let addr = spawn(
+        app(
+            vec![crate::RuntimeMount::Api {
+                prefix: "/v1/api".to_string(),
+                table: crate::tests::build_table(&t.0, true, "/v1/api"),
+                fallback: Some(crate::Routes::new("/v1/api", t.0.clone(), true)),
+                web: None,
+            }],
+            JsActor::pool(1, make.clone()),
+            None,
+            crate::StaticOpts::default(),
+            crate::Pipeline::default(),
+            Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+            Arc::new(std::sync::RwLock::new(None)),
+            Arc::default(),
+            None,
+        )
+        .merge(mirror_routes(
+            &mounts,
+            std::time::Duration::from_secs(2),
+            make,
+            WsOptions::default(),
+            None,
+        )),
+    )
+    .await;
+
+    // 单斜杠 {base}/ws 必须命中（文档契约）；双斜杠路径本就不该存在。
+    let mut c = WsClient::connect(addr, "/v1/api/ws").await;
+    c.send_text("hi").await;
+    let env = c.read_text().await;
+    assert!(env.contains("\"root\":true"), "{env}");
+}
+
+/// module-root 布局：WS 挂载与 api.ts **同源**——`src/wiki/api/ws.ts` → `{base}/wiki/ws`。
+/// 回归钉：v0.1.87 前按挂载根平铺算 rel，多出一层布局段（`api` 是模块根本身，不是
+/// 路由段）→ 文档契约里的 `/api/wiki/ws` 恒 404，而真实的 `/api/wiki/api/ws` 无人知道。
+#[test]
+fn ws_mounts_module_root_strips_layout_segment() {
+    let t = crate::tests::routes(&[
+        (
+            "wiki/api/manifest.yaml",
+            "name: wiki\nversion: 0.1.0\nprefix: wiki\n",
+        ),
+        (
+            "wiki/api/ws.ts",
+            "export default { connection() { json.ok({ok:1}); } };\n",
+        ),
+        (
+            "wiki/api/tree/ws.ts",
+            "export default { connection() { json.ok({ok:1}); } };\n",
+        ),
+    ]);
+    let idx = only_js::bridge::resolve_roots(&t.0, true, None).unwrap();
+    let mounts = ws_mounts("/api", &t.0, true, Some(&idx)).unwrap();
+    let paths: Vec<&str> = mounts.iter().map(|m| m.path.as_str()).collect();
+    assert!(paths.contains(&"/api/wiki/ws"), "{paths:?}");
+    assert!(paths.contains(&"/api/wiki/tree/ws"), "{paths:?}");
+    // 守卫面（anonymous_paths 同根）：配置里写 /wiki/ws 即命中（修复前是 /wiki/api/ws）。
+    let wiki = mounts.iter().find(|m| m.path == "/api/wiki/ws").unwrap();
+    assert_eq!(wiki.path_no_base, "/wiki/ws");
+    let sub = mounts
+        .iter()
+        .find(|m| m.path == "/api/wiki/tree/ws")
+        .unwrap();
+    assert_eq!(sub.path_no_base, "/wiki/tree/ws");
+}
+
+/// 平铺布局（无模块索引）逐字不变：`src/news/ws.ts` → `{base}/news/ws`（兼容面锚）。
+#[test]
+fn ws_mounts_flat_layout_unchanged() {
+    let t = crate::tests::routes(&[(
+        "news/ws.ts",
+        "export default { connection() { json.ok({ok:1}); } };\n",
+    )]);
+    let mounts = ws_mounts("/v1/api", &t.0, true, None).unwrap();
+    assert_eq!(mounts.len(), 1, "{mounts:?}");
+    assert_eq!(mounts[0].path, "/v1/api/news/ws");
+    assert_eq!(mounts[0].path_no_base, "/news/ws");
+}
+
+/// 根前缀挂载（prefix = `/`）不得拼出 `{base}//ws` 双斜杠。
+#[test]
+fn ws_mounts_root_prefix_has_no_double_slash() {
+    let t = crate::tests::routes(&[(
+        "ws.ts",
+        "export default { connection() { json.ok({ok:1}); } };\n",
+    )]);
+    let mounts = ws_mounts("/", &t.0, true, None).unwrap();
+    assert_eq!(mounts[0].path, "/ws");
+}
+
+/// release 维持现状：`dist/<name>-<version>/ws.js` → `{base}/<name>-<version>/ws`
+/// （v0.2 已知限制；dev 与 release 的 WS 分叉见 api-manual 限制表）。
+#[test]
+fn ws_mounts_release_keeps_version_segment() {
+    let t = crate::tests::routes(&[
+        (
+            "wiki-0.1.0/ws.js",
+            "export default { connection() { json.ok({ok:1}); } };\n",
+        ),
+        (
+            "wiki-0.1.0/ws.ts",
+            "export default { connection() { json.ok({ok:1}); } };\n",
+        ),
+    ]);
+    let mounts = ws_mounts("/api", &t.0, false, None).unwrap();
+    // release 下 ws.js 优先（dist 残留的 ws.ts 不得抢先），同目录兄弟只挂一条。
+    assert_eq!(mounts.len(), 1, "{mounts:?}");
+    assert_eq!(mounts[0].path, "/api/wiki-0.1.0/ws");
+    assert!(mounts[0].file.ends_with("ws.js"), "{:?}", mounts[0].file);
+}
+
+/// 碰撞 fail-fast：模块内 `wiki/api/ws.ts` 与模块外散文件 `wiki/ws.ts` 映射到同一
+/// path → 拒启并点名两侧（胜者决定执行哪份 JS，不能交给文件遍历顺序）。
+#[test]
+fn ws_mounts_conflict_rejects_startup() {
+    let t = crate::tests::routes(&[
+        ("wiki/api/manifest.yaml", "name: wiki\nversion: 0.1.0\n"),
+        (
+            "wiki/api/ws.ts",
+            "export default { connection() { json.ok({ok:1}); } };\n",
+        ),
+        (
+            "wiki/ws.ts",
+            "export default { connection() { json.ok({ok:1}); } };\n",
+        ),
+    ]);
+    let idx = only_js::bridge::resolve_roots(&t.0, true, None).unwrap();
+    let err = ws_mounts("/api", &t.0, true, Some(&idx)).unwrap_err();
+    assert!(err.contains("ws mount conflict"), "{err}");
+    assert!(err.contains("/api/wiki/ws"), "{err}");
+}
+
+/// 挂载根下的 `node_modules` 不进挂载面（剪枝与模块发现同口径）。
+#[test]
+fn ws_mounts_skips_node_modules() {
+    let t = crate::tests::routes(&[
+        (
+            "news/ws.ts",
+            "export default { connection() { json.ok({ok:1}); } };\n",
+        ),
+        (
+            "node_modules/pkg/ws.ts",
+            "export default { connection() { json.ok({ok:1}); } };\n",
+        ),
+        (
+            ".hidden/ws.ts",
+            "export default { connection() { json.ok({ok:1}); } };\n",
+        ),
+    ]);
+    let mounts = ws_mounts("/v1/api", &t.0, true, None).unwrap();
+    assert_eq!(mounts.len(), 1, "{mounts:?}");
+    assert_eq!(mounts[0].path, "/v1/api/news/ws");
+}
+
+/// module-root 下真实握手：文档契约里的 `/v1/api/wiki/ws` 必须能连上
+/// （修复前该 URL 404，只有多一层布局段的 `/v1/api/wiki/api/ws` 存在）。
+#[tokio::test]
+async fn mirror_routes_module_root_handshake() {
+    let _e2e = ws_e2e_lock();
+    use crate::actor::JsActor;
+    use only_js::bridge::{Extras, LoaderShared, SchemaRegistry};
+    use std::collections::HashMap;
+    let t = crate::tests::routes(&[
+        ("wiki/api/manifest.yaml", "name: wiki\nversion: 0.1.0\n"),
+        (
+            "wiki/api/ws.ts",
+            "export default { connection() { json.ok({ wiki: true }); } };\n",
+        ),
+    ]);
+    let root = t.0.clone();
+    let make = move || {
+        Bridge::with_dbs_and_loader(
+            HashMap::new(),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            Some(Arc::new(LoaderShared {
+                project_root: root.clone(),
+                ts: true,
+            })),
+            Extras::default(),
+        )
+    };
+    let idx = only_js::bridge::resolve_roots(&t.0, true, None).unwrap();
+    let mounts = ws_mounts("/v1/api", &t.0, true, Some(&idx)).unwrap();
+    assert!(mounts.iter().any(|m| m.path == "/v1/api/wiki/ws"));
+    let addr = spawn(
+        app(
+            vec![crate::RuntimeMount::Api {
+                prefix: "/v1/api".to_string(),
+                table: crate::tests::build_table(&t.0, true, "/v1/api"),
+                fallback: Some(crate::Routes::new("/v1/api", t.0.clone(), true)),
+                web: None,
+            }],
+            JsActor::pool(1, make.clone()),
+            None,
+            crate::StaticOpts::default(),
+            crate::Pipeline::default(),
+            Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+            Arc::new(std::sync::RwLock::new(None)),
+            Arc::default(),
+            None,
+        )
+        .merge(mirror_routes(
+            &mounts,
+            std::time::Duration::from_secs(2),
+            make,
+            WsOptions::default(),
+            None,
+        )),
+    )
+    .await;
+
+    let mut c = WsClient::connect(addr, "/v1/api/wiki/ws").await;
+    let env = c.read_text().await;
+    assert!(env.contains("\"wiki\":true"), "{env}");
+}
+
+/// 移植 Go TestWSHandle_Connection_MissingFile：handler 文件缺失不 panic，连接直接关闭。
+#[tokio::test]
+async fn js_route_missing_handler_closes_quietly() {
+    let _e2e = ws_e2e_lock();
+    let t = crate::tests::routes(&[]);
+    let addr = spawn(
+        app(
+            vec![crate::RuntimeMount::Api {
+                prefix: "/v1/api".to_string(),
+                table: crate::tests::build_table(&t.0, true, "/v1/api"),
+                fallback: Some(crate::Routes::new("/v1/api", t.0.clone(), true)),
+                web: None,
+            }],
+            crate::tests::make_actor(t.0.clone(), true),
+            None,
+            crate::StaticOpts::default(),
+            crate::Pipeline::default(),
+            Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+            Arc::new(std::sync::RwLock::new(None)),
+            Arc::default(),
+            None,
+        )
+        .merge(js_route(
+            "/ws/missing",
+            test_pool(&t.0.join("nope.js"), std::time::Duration::from_secs(1)),
+            WsOptions::default(),
+        )),
+    )
+    .await;
+    let mut c = WsClient::connect(addr, "/ws/missing").await;
+    c.send_text("any").await;
+    // 服务端发 Close 帧（0x88）后关连接：读到 Close、EOF 均算干净终止，不 panic。
+    // Windows 上，缺失 handler 时服务端丢弃连接且入站 "any" 仍留在接收缓冲区，
+    // 关闭会触发 TCP RST（而非 FIN），read 返回 Err(ConnectionReset) 而非 Ok(0)，
+    // 同样表示连接已被对端干净终止。只接受传输层终止类错误——其他错误（如
+    // 服务端 panic 之外的意外 IO 失败）仍应让测试失败，保住本用例的回归护栏。
+    let mut buf = [0u8; 64];
+    let res = c.s.read(&mut buf).await;
+    let clean = match &res {
+        Ok(0) => true,            // 对端优雅关闭（EOF / FIN）
+        Ok(_n) => buf[0] == 0x88, // 收到 WebSocket Close 帧
+        Err(e) => matches!(
+            e.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+        ),
+    };
+    assert!(clean, "expected close or reset, got {res:?}");
+}
+
+/// oj-4：守卫形态的 js_route——带守卫时无凭证握手 401 不升级；匿名路径放行。
+#[tokio::test]
+async fn js_route_guarded_handshake_auth() {
+    let _e2e = ws_e2e_lock();
+    struct CookieGuard;
+    impl only_js::bridge::AuthGuard for CookieGuard {
+        fn verify(
+            &self,
+            path: &str,
+            _method: &str,
+            _auth: Option<&str>,
+            headers: Option<&str>,
+        ) -> Result<Option<serde_json::Value>, String> {
+            if path == "/pub/ws" {
+                return Ok(None);
+            }
+            // 模拟 cookie 会话：cookie 头含 oj_sess=good → 放行。
+            match headers.and_then(|h| h.contains("oj_sess=good").then_some(h)) {
+                Some(_) => Ok(Some(serde_json::json!({"id": "1", "roles": []}))),
+                None => Err("missing or invalid bearer token".into()),
+            }
+        }
+    }
+    let t = crate::tests::routes(&[]);
+    let pool_root = t.0.clone();
+    let addr = spawn(axum::Router::new().merge(js_route_guarded(
+        "/ws/priv",
+        "/priv/ws",
+        test_pool(
+            &pool_root.join("nope.js"),
+            std::time::Duration::from_secs(1),
+        ),
+        WsOptions::default(),
+        Some(Arc::new(CookieGuard) as Arc<dyn only_js::bridge::AuthGuard>),
+    )))
+    .await;
+
+    // 无凭证：握手应得 401（不升级）。
+    let status = raw_handshake(addr, "/ws/priv", &[]).await;
+    assert_eq!(status, 401, "no credentials must not upgrade");
+    // 带 session cookie：升级成功（101）。
+    let status = raw_handshake(addr, "/ws/priv", &[("Cookie", "oj_sess=good")]).await;
+    assert_eq!(status, 101, "cookie session must upgrade");
+
+    // 匿名路径：无凭证也 101。
+    let addr = spawn(axum::Router::new().merge(js_route_guarded(
+        "/ws/pub",
+        "/pub/ws",
+        test_pool(&t.0.join("nope.js"), std::time::Duration::from_secs(1)),
+        WsOptions::default(),
+        Some(Arc::new(CookieGuard) as Arc<dyn only_js::bridge::AuthGuard>),
+    )))
+    .await;
+    let status = raw_handshake(addr, "/ws/pub", &[]).await;
+    assert_eq!(status, 101, "anonymous ws path must upgrade");
+}
+
+/// 原始 WS 握手（含 Upgrade 头），返回 HTTP 状态码（101 = 升级成功）。
+async fn raw_handshake(addr: std::net::SocketAddr, path: &str, headers: &[(&str, &str)]) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+    );
+    for (k, v) in headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str("\r\n");
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = vec![0u8; 256];
+    let n = s.read(&mut buf).await.unwrap();
+    let head = String::from_utf8_lossy(&buf[..n]);
+    head.split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0)
+}
+
+/// 帧内 bus.publish（教学案例 sample/src/news/chat/ws.ts 的回归钉）：
+/// 连接 A 订阅后，连接 B 发 {"text":..} 帧 → B 的帧内 publish → A 收广播帧，
+/// B 自己（同主题订阅）也自收（自回声）。同时验证：
+/// 1) publish 无上下文限制（fire-and-forget，不 await 也照常广播——
+///    run_event_loop 会把 op future 驱动完才捕获信封）；
+/// 2) 模块作用域 = 连接状态；进房 = connection 钩子（无需 join 帧）；
+/// 3) http.body 对 JSON 文本帧自动 parse 成对象。
+#[tokio::test]
+async fn ws_frame_publish_broadcasts_to_subscribers() {
+    let _e2e = ws_e2e_lock();
+    use crate::actor::JsActor;
+    use only_js::bridge::{Bus, Extras, LoaderShared, SchemaRegistry};
+    use std::collections::HashMap;
+    let t = crate::tests::routes(&[
+        ("news/api.ts", "export default {};\n"),
+        (
+            "news/ws.ts",
+            r#"export default {
+  connection() {
+    bus.subscribe("chat");
+    json.ok({ joined: true });
+  },
+  message() {
+    const frame = http.body;
+    if (frame && frame.text) {
+      bus.publish("chat", { from: frame.from ?? "anon", text: frame.text });
+      json.ok({ sent: true });
+    }
+  },
+};
+"#,
+        ),
+    ]);
+    let bus = Arc::new(Bus::new());
+    let root = t.0.clone();
+    let bus2 = bus.clone();
+    let make = move || {
+        Bridge::with_dbs_and_loader(
+            HashMap::new(),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            Some(Arc::new(LoaderShared {
+                project_root: root.clone(),
+                ts: true,
+            })),
+            Extras {
+                blobs: None,
+                bus: Some(bus2.clone()),
+                ..Default::default()
+            },
+        )
+    };
+    let mounts = ws_mounts("/v1/api", &t.0, true, None).unwrap();
+    let addr = spawn(
+        app(
+            vec![crate::RuntimeMount::Api {
+                prefix: "/v1/api".to_string(),
+                table: crate::tests::build_table(&t.0, true, "/v1/api"),
+                fallback: Some(crate::Routes::new("/v1/api", t.0.clone(), true)),
+                web: None,
+            }],
+            JsActor::pool(1, make.clone()),
+            None,
+            crate::StaticOpts::default(),
+            crate::Pipeline::default(),
+            Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+            Arc::new(std::sync::RwLock::new(None)),
+            Arc::default(),
+            None,
+        )
+        .merge(mirror_routes(
+            &mounts,
+            std::time::Duration::from_secs(2),
+            make,
+            WsOptions::default(),
+            None,
+        )),
+    )
+    .await;
+
+    let broadcast = serde_json::json!({
+        "topic": "chat",
+        "data": {"from": "anon", "text": "hi"}
+    });
+    // 连接 A 进房（进房 = connection 钩子，无需 join 帧）
+    let mut a = WsClient::connect(addr, "/v1/api/news/ws").await;
+    assert!(a.read_text().await.contains("\"joined\":true"), "a join");
+    // 连接 B 进房后发聊天帧（JSON 文本 → http.body 自动 parse）
+    let mut b = WsClient::connect(addr, "/v1/api/news/ws").await;
+    assert!(b.read_text().await.contains("\"joined\":true"), "b join");
+    b.send_text(r#"{"text":"hi"}"#).await;
+    // A 只会收到一条：广播帧（fire-and-forget publish 照常投递）
+    let v: serde_json::Value = serde_json::from_str(&a.read_text().await).unwrap();
+    assert_eq!(v, broadcast, "a receives broadcast");
+    // B 收两条：回执信封 + 自己的广播（自回声），顺序不保证（Processor vs forwarder）
+    let f1 = c_frame(&mut b).await;
+    let f2 = c_frame(&mut b).await;
+    let frames = [f1, f2];
+    let got_broadcast = frames.contains(&broadcast);
+    let got_envelope = frames
+        .iter()
+        .any(|f| f["data"]["sent"] == serde_json::Value::Bool(true));
+    assert!(got_broadcast, "b self-echo broadcast");
+    assert!(got_envelope, "b envelope");
+}
+
+/// 读一帧并 parse 成 JSON（测试辅助）。
+async fn c_frame(c: &mut WsClient) -> serde_json::Value {
+    serde_json::from_str(&c.read_text().await).unwrap()
+}
+
+/// error() 兜底后连接继续：message 抛异常 → error(e) 经 ws.send 带出 → 下一帧仍正常处理。
+#[tokio::test]
+async fn js_route_error_hook_keeps_connection_alive() {
+    let _e2e = ws_e2e_lock();
+    let t = crate::tests::routes(&[]);
+    let handler = t.0.join("ws.js");
+    std::fs::write(
+        &handler,
+        r#"export default {
+  message() {
+    if (http.body.bad) throw new Error("boom");
+    json.ok({ ok: 1 });
+  },
+  error(e) { ws.send("err:" + e.message); },
+};"#,
+    )
+    .unwrap();
+    let addr = spawn(
+        app(
+            vec![crate::RuntimeMount::Api {
+                prefix: "/v1/api".to_string(),
+                table: crate::tests::build_table(&t.0, true, "/v1/api"),
+                fallback: Some(crate::Routes::new("/v1/api", t.0.clone(), true)),
+                web: None,
+            }],
+            crate::tests::make_actor(t.0.clone(), true),
+            None,
+            crate::StaticOpts::default(),
+            crate::Pipeline::default(),
+            Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+            Arc::new(std::sync::RwLock::new(None)),
+            Arc::default(),
+            None,
+        )
+        .merge(js_route(
+            "/ws/err",
+            test_pool(&handler, std::time::Duration::from_secs(1)),
+            WsOptions::default(),
+        )),
+    )
+    .await;
+    let mut c = WsClient::connect(addr, "/ws/err").await;
+    c.send_text(r#"{"bad":true}"#).await;
+    assert_eq!(c.read_text().await, "err:boom"); // 异常帧：error 兜底，无信封
+    c.send_text(r#"{"bad":false}"#).await;
+    let resp = c.read_text().await; // 连接继续：下一帧正常回信封
+    assert!(resp.contains("\"ok\":1"), "{resp}");
+}
+
+/// close 钩子恰好一次：ws.close() 触发收尾 → close() 执行、ws.send 离帧先于 Close 写出。
+/// 注：不用客户端断连（Close 帧 / FIN）观察钩子离帧——axum/tungstenite 一旦收到对端
+/// 关闭信号即拒绝一切出站数据帧（SendAfterClosing），close 钩子的离帧无法上线
+/// （服务端仍恰好 fire 一次 close，仅输出不可见）；故以三来源统一的 ws.close() 钉钩子。
+#[tokio::test]
+async fn js_route_close_hook_fires_exactly_once() {
+    let _e2e = ws_e2e_lock();
+    let t = crate::tests::routes(&[]);
+    let handler = t.0.join("ws.js");
+    std::fs::write(
+        &handler,
+        r#"export default { message() { ws.close(); }, close() { ws.send("bye"); } };"#,
+    )
+    .unwrap();
+    let addr = spawn(
+        app(
+            vec![crate::RuntimeMount::Api {
+                prefix: "/v1/api".to_string(),
+                table: crate::tests::build_table(&t.0, true, "/v1/api"),
+                fallback: Some(crate::Routes::new("/v1/api", t.0.clone(), true)),
+                web: None,
+            }],
+            crate::tests::make_actor(t.0.clone(), true),
+            None,
+            crate::StaticOpts::default(),
+            crate::Pipeline::default(),
+            Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+            Arc::new(std::sync::RwLock::new(None)),
+            Arc::default(),
+            None,
+        )
+        .merge(js_route(
+            "/ws/bye",
+            test_pool(&handler, std::time::Duration::from_secs(1)),
+            WsOptions::default(),
+        )),
+    )
+    .await;
+    let mut c = WsClient::connect(addr, "/ws/bye").await;
+    c.send_text("go").await;
+    assert_eq!(c.read_text().await, "bye"); // close 钩子的离帧（恰好一条）
+    // 随后 Close 帧或 EOF（Writer 收尾），不 panic。
+    let mut buf = [0u8; 8];
+    let n = c.s.read(&mut buf).await.unwrap_or(0);
+    assert!(n == 0 || buf[0] == 0x88, "expected close, got {n} bytes");
+}
+
+/// 一刀切契约：无任何钩子导出 → 连接建立即断（Close 帧 / EOF），不静默空转。
+#[tokio::test]
+async fn js_route_no_hooks_disconnects() {
+    let _e2e = ws_e2e_lock();
+    let t = crate::tests::routes(&[]);
+    let handler = t.0.join("ws.js");
+    std::fs::write(&handler, r#"json.ok({});"#).unwrap(); // 无 default 导出
+    let addr = spawn(
+        app(
+            vec![crate::RuntimeMount::Api {
+                prefix: "/v1/api".to_string(),
+                table: crate::tests::build_table(&t.0, true, "/v1/api"),
+                fallback: Some(crate::Routes::new("/v1/api", t.0.clone(), true)),
+                web: None,
+            }],
+            crate::tests::make_actor(t.0.clone(), true),
+            None,
+            crate::StaticOpts::default(),
+            crate::Pipeline::default(),
+            Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+            Arc::new(std::sync::RwLock::new(None)),
+            Arc::default(),
+            None,
+        )
+        .merge(js_route(
+            "/ws/nohooks",
+            test_pool(&handler, std::time::Duration::from_secs(1)),
+            WsOptions::default(),
+        )),
+    )
+    .await;
+    let mut c = WsClient::connect(addr, "/ws/nohooks").await;
+    c.send_text("any").await;
+    // ws_connect 失败 → 服务端发 Close 帧后关连接；传输层终止类错误同样算干净断连
+    // （Windows RST 语义，断言同 js_route_missing_handler_closes_quietly）。
+    let mut buf = [0u8; 64];
+    let res = c.s.read(&mut buf).await;
+    let clean = match &res {
+        Ok(0) => true,
+        Ok(_n) => buf[0] == 0x88,
+        Err(e) => matches!(
+            e.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+        ),
+    };
+    assert!(clean, "expected close or reset, got {res:?}");
+}
+
+/// 帧池毒化半径 = 1（e2e）：连接 A 死循环帧 300ms 看门狗超时 → A 必断连；
+/// 连接 B 照常收发（同池其他 worker/补员接帧，每连接独立 ConnHandle）。
+#[tokio::test]
+async fn frame_pool_timeout_isolates_connections() {
+    let _e2e = ws_e2e_lock();
+    let t = crate::tests::routes(&[]);
+    let handler = t.0.join("ws.js");
+    std::fs::write(
+        &handler,
+        r#"export default {
+  message() {
+    if (http.body.boom) { const t = Date.now(); while (Date.now() - t < 60_000) {} }
+    json.ok({ ok: 1 });
+  },
+};"#,
+    )
+    .unwrap();
+    let timeout = std::time::Duration::from_millis(300);
+    let addr = spawn(
+        app(
+            vec![crate::RuntimeMount::Api {
+                prefix: "/v1/api".to_string(),
+                table: crate::tests::build_table(&t.0, true, "/v1/api"),
+                fallback: Some(crate::Routes::new("/v1/api", t.0.clone(), true)),
+                web: None,
+            }],
+            crate::tests::make_actor(t.0.clone(), true),
+            None,
+            crate::StaticOpts::default(),
+            crate::Pipeline::default(),
+            Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+            Arc::new(std::sync::RwLock::new(None)),
+            Arc::default(),
+            None,
+        )
+        .merge(js_route(
+            "/ws/iso",
+            test_pool(&handler, timeout),
+            WsOptions::default(),
+        )),
+    )
+    .await;
+    let mut a = WsClient::connect(addr, "/ws/iso").await;
+    let mut b = WsClient::connect(addr, "/ws/iso").await;
+    // A：毒帧 → 300ms 超时断连（Close/EOF/RST 族，判定同 missing-file 用例）。
+    a.send_text(r#"{"boom":true}"#).await;
+    let mut buf = [0u8; 64];
+    let res = a.s.read(&mut buf).await;
+    let clean = match &res {
+        Ok(0) => true,
+        Ok(_n) => buf[0] == 0x88,
+        Err(e) => matches!(
+            e.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+        ),
+    };
+    assert!(clean, "expected poisoned conn to close, got {res:?}");
+    // B：毒化只波及执行它的 worker，B 照常收发。
+    b.send_text(r#"{"boom":false}"#).await;
+    let v: serde_json::Value = serde_json::from_str(&b.read_text().await).unwrap();
+    assert_eq!(v["data"]["ok"], 1, "{v}");
+}
+
+/// 同连接保序（帧池 per-conn 串行调度钉）：三帧连发，回帧序必须 = 1,2,3。
+/// handler 忙等 30ms 制造重叠窗口——若调度不按连接串行，后帧会在前帧写回
+/// 会话状态前克隆到旧 state，断言即崩。注：本 runtime 无 timer 全局
+/// （setTimeout 不可用），以 Date.now 忙等代替 brief 草图中的 await sleep。
+#[tokio::test]
+async fn frame_pool_preserves_per_connection_order() {
+    let _e2e = ws_e2e_lock();
+    let t = crate::tests::routes(&[]);
+    let handler = t.0.join("ws.js");
+    std::fs::write(
+        &handler,
+        r#"export default {
+  message() {
+    const t = Date.now(); while (Date.now() - t < 30) {}
+    sess.state.n = (sess.state.n ?? 0) + 1;
+    json.ok({ n: sess.state.n });
+  },
+};"#,
+    )
+    .unwrap();
+    let timeout = std::time::Duration::from_secs(1);
+    let addr = spawn(
+        app(
+            vec![crate::RuntimeMount::Api {
+                prefix: "/v1/api".to_string(),
+                table: crate::tests::build_table(&t.0, true, "/v1/api"),
+                fallback: Some(crate::Routes::new("/v1/api", t.0.clone(), true)),
+                web: None,
+            }],
+            crate::tests::make_actor(t.0.clone(), true),
+            None,
+            crate::StaticOpts::default(),
+            crate::Pipeline::default(),
+            Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+            Arc::new(std::sync::RwLock::new(None)),
+            Arc::default(),
+            None,
+        )
+        .merge(js_route(
+            "/ws/order",
+            test_pool(&handler, timeout),
+            WsOptions::default(),
+        )),
+    )
+    .await;
+    let mut c = WsClient::connect(addr, "/ws/order").await;
+    for _ in 0..3 {
+        c.send_text("go").await;
+    }
+    for expect in [1, 2, 3] {
+        let v: serde_json::Value = serde_json::from_str(&c.read_text().await).unwrap();
+        assert_eq!(v["data"]["n"], expect, "同连接回帧必须保序: {v}");
+    }
+}
