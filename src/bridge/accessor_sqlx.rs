@@ -675,7 +675,8 @@ mod tests {
             None,
             super::super::db_policy::OnExceed::Truncate,
         );
-        let big = "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt LIMIT 5000000)";
+        // LIMIT 放外层（Windows 上 sqlx 捆绑的旧版 sqlite 不接受 CTE 内的 LIMIT）
+        let big = "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt) SELECT x FROM cnt LIMIT 5000000";
         let e = db
             .query_cancelable(big, &[], &mut meter, &shared)
             .await
