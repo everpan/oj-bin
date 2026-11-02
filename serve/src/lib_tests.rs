@@ -1592,6 +1592,8 @@ async fn html_meta_injects_escaped_tags_and_hides_meta_dir() {
             ],
             StaticOpts {
                 html_meta: Some("__meta".into()),
+                // v0.1.116 OJ-10：本用例锚定注入语义，默认缓存策略另测——此处关。
+                web_cache_policy: CachePolicy::None_,
                 ..Default::default()
             },
         )
@@ -1718,7 +1720,12 @@ async fn html_meta_handler_off_is_byte_identical() {
         &[],
         true,
         &[("index.html", "<html><head></head><body>hi</body></html>")],
-        StaticOpts::default(),
+        // v0.1.116 OJ-10：本用例锚定「注入面全关 = 逐字节同 v0.1.115」——默认缓存
+        // 策略另测，此处关。
+        StaticOpts {
+            web_cache_policy: CachePolicy::None_,
+            ..Default::default()
+        },
     )
     .await;
     let r = raw_http(addr, &get(addr, "/space/abc")).await;
@@ -1741,6 +1748,8 @@ async fn html_cache_control_alone_still_applies() {
         &[("index.html", "<html><head></head><body>hi</body></html>")],
         StaticOpts {
             html_cache_control: Some("no-cache".into()),
+            // v0.1.116 OJ-10：本用例锚定「html_cache_control 只管 HTML」——默认策略另测。
+            web_cache_policy: CachePolicy::None_,
             ..Default::default()
         },
     )
@@ -1760,6 +1769,8 @@ async fn html_cache_control_alone_still_applies() {
         &[("index.html", "x"), ("assets/app.js", "console.log(1)")],
         StaticOpts {
             html_cache_control: Some("no-cache".into()),
+            // v0.1.116 OJ-10：本用例锚定「html_cache_control 只管 HTML」——默认策略另测。
+            web_cache_policy: CachePolicy::None_,
             ..Default::default()
         },
     )

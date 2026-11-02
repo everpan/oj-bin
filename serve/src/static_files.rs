@@ -228,14 +228,38 @@ async fn compress_response(r: &mut Response, enc: Encoding, opts: &StaticLayerOp
     true
 }
 
-/// 默认缓存兜底（spec D8/D10）：显式头缺席时按两档制补 Cache-Control。
-/// 本任务先接通调用点与缺席检查；两档启发式在 T6 落地。
-fn apply_default_cache_control(r: &mut Response, _file: &Path, policy: &CachePolicy) {
+/// 两档制（spec D10）：文件 stem 按 [-._] 分段，**末段** ≥8 字符且同时含数字与字母
+/// → immutable（确证内容寻址）；其余一律 no-cache 恒校验（现状对齐，ETag/304 下重验
+/// 只花一个 RTT；纯字母词如 `production` 漏过是**特性**——防 config-production.js
+/// 被 immutable 钉死一年）。判定只用落盘文件路径，绝不用深链接 rel_path。
+fn default_cache_control(file: &Path) -> &'static str {
+    const IMMUTABLE: &str = "public, max-age=31536000, immutable";
+    let hashed = file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|stem| {
+            stem.rsplit(['-', '_', '.']).next().filter(|seg| {
+                seg.len() >= 8
+                    && seg.chars().any(|c| c.is_ascii_digit())
+                    && seg.chars().any(|c| c.is_ascii_alphabetic())
+            })
+        })
+        .is_some();
+    if hashed { IMMUTABLE } else { "no-cache" }
+}
+
+/// 默认缓存兜底（spec D8/D10）：显式头缺席时按两档制补 Cache-Control；
+/// `none` 策略 = 全不加（v0.1.115 行为）。
+fn apply_default_cache_control(r: &mut Response, file: &Path, policy: &CachePolicy) {
     if *policy == CachePolicy::None_
         || r.headers().contains_key(axum::http::header::CACHE_CONTROL)
     {
         return;
     }
+    r.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static(default_cache_control(file)),
+    );
 }
 
 /// 路由命中 → 前置管线（鉴权/租户/上传上限/multipart）→ 执行 handler → Capture 回写。

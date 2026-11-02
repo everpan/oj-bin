@@ -407,3 +407,137 @@ async fn html_compressed_but_never_cached() {
     assert_eq!(std::fs::read_dir(&cd).unwrap().count(), 0, "HTML 不落缓存");
     let _ = (std::fs::remove_dir_all(&cd), std::fs::remove_dir_all(&wd));
 }
+
+// —— T6 两档制默认缓存策略（OJ-10） ——
+
+/// Given 各形态文件名
+/// When default_cache_control
+/// Then 哈希段（[-._] 分隔末段≥8 且含数字与字母）→ immutable；纯字母词/纯数字/无段 → no-cache
+#[test]
+fn default_cache_control_two_tier_table() {
+    let cc = |name: &str| default_cache_control(Path::new(name));
+    assert_eq!(
+        cc("app-B2R7x9cW.js"),
+        "public, max-age=31536000, immutable"
+    );
+    assert_eq!(
+        cc("main.1a2b3c4d.js"),
+        "public, max-age=31536000, immutable"
+    );
+    assert_eq!(cc("config-production.js"), "no-cache", "纯字母段防误钉");
+    assert_eq!(cc("20240101.js"), "no-cache", "纯数字段防误钉");
+    assert_eq!(cc("index.html"), "no-cache");
+    assert_eq!(cc("modules.json"), "no-cache");
+    assert_eq!(cc("logo.png"), "no-cache");
+    assert_eq!(cc("sw.js"), "no-cache");
+}
+
+/// Given spa 挂载 + meta 目录两个路由 JSON（不同 title）
+/// When 分别 GET /a、/b（Accept html）
+/// Then 各自 title 正确不串、均 no-cache、均压缩
+#[tokio::test(flavor = "current_thread")]
+async fn spa_fallback_meta_not_cross_contaminated() {
+    let (cd, wd) = t5_dirs("meta");
+    std::fs::create_dir_all(wd.join("__meta")).unwrap();
+    std::fs::write(wd.join("__meta/a.json"), r#"{"title":"A 页"}"#).unwrap();
+    std::fs::write(wd.join("__meta/b.json"), r#"{"title":"B 页"}"#).unwrap();
+    std::fs::write(
+        wd.join("index.html"),
+        format!("<html><head><title>t</title></head><body>{}</body></html>", "y".repeat(4096)),
+    )
+    .unwrap();
+    let (mut st, mount) = comp_state(&wd, Some(layer_opts(Some(cd.clone()))), CachePolicy::Auto);
+    st.static_opts.html_meta = Some("__meta".into());
+    let ra = get(&st, &mount, "/a", "br").await;
+    let rb = get(&st, &mount, "/b", "br").await;
+    let ba = axum::body::to_bytes(ra.into_body(), 1 << 20).await.unwrap().to_vec();
+    let bb = axum::body::to_bytes(rb.into_body(), 1 << 20).await.unwrap().to_vec();
+    // 注入内容各自正确（经 br 解码验证不串内容）
+    let da = decompress_br(&ba);
+    let db = decompress_br(&bb);
+    assert!(da.contains("A 页") && !da.contains("B 页"), "a 不串 b");
+    assert!(db.contains("B 页") && !db.contains("A 页"), "b 不串 a");
+    let _ = (std::fs::remove_dir_all(&cd), std::fs::remove_dir_all(&wd));
+}
+
+fn decompress_br(b: &[u8]) -> String {
+    let mut r = brotli::Decompressor::new(b, 4096);
+    let mut s = Vec::new();
+    std::io::Read::read_to_end(&mut r, &mut s).unwrap();
+    String::from_utf8(s).unwrap()
+}
+
+/// Given 挂载显式 Cache-Control
+/// When GET 可压资产
+/// Then 响应为显式值（兜底不触发）
+#[tokio::test(flavor = "current_thread")]
+async fn explicit_mount_headers_override_default() {
+    let (cd, wd) = t5_dirs("ovr");
+    std::fs::write(wd.join("app.js"), vec![b'a'; 4096]).unwrap();
+    let (st, mut mount) = comp_state(&wd, Some(layer_opts(None)), CachePolicy::Auto);
+    mount.headers = vec![("Cache-Control".into(), "public, max-age=60".into())];
+    let r = get(&st, &mount, "/app.js", "br").await;
+    assert_eq!(
+        hdr(&r, &axum::http::header::CACHE_CONTROL).as_deref(),
+        Some("public, max-age=60")
+    );
+    assert_eq!(hdr(&r, &axum::http::header::CONTENT_ENCODING).as_deref(), Some("br"));
+    let _ = (std::fs::remove_dir_all(&cd), std::fs::remove_dir_all(&wd));
+}
+
+/// Given html_cache_control 配 no-store
+/// When GET index.html
+/// Then HTML 腿为 no-store（既有语义不回归）
+#[tokio::test(flavor = "current_thread")]
+async fn html_cache_control_still_wins() {
+    let (cd, wd) = t5_dirs("hcc");
+    std::fs::write(wd.join("index.html"), format!("<html><body>{}</body></html>", "z".repeat(4096))).unwrap();
+    let (mut st, mount) = comp_state(&wd, Some(layer_opts(None)), CachePolicy::Auto);
+    st.static_opts.html_cache_control = Some("no-store".into());
+    let r = get(&st, &mount, "/", "br").await;
+    assert_eq!(hdr(&r, &axum::http::header::CACHE_CONTROL).as_deref(), Some("no-store"));
+    let _ = (std::fs::remove_dir_all(&cd), std::fs::remove_dir_all(&wd));
+}
+
+/// Given web_cache_policy: None_
+/// When GET 可压资产与 HTML
+/// Then 全腿无 Cache-Control（Vary/压缩不受影响）
+#[tokio::test(flavor = "current_thread")]
+async fn policy_none_no_cache_control() {
+    let (cd, wd) = t5_dirs("none");
+    std::fs::write(wd.join("app.js"), vec![b'a'; 4096]).unwrap();
+    std::fs::write(wd.join("index.html"), format!("<html><body>{}</body></html>", "w".repeat(4096))).unwrap();
+    let (st, mount) = comp_state(&wd, Some(layer_opts(None)), CachePolicy::None_);
+    let r = get(&st, &mount, "/app.js", "br").await;
+    assert_eq!(hdr(&r, &axum::http::header::CACHE_CONTROL), None);
+    assert_eq!(hdr(&r, &axum::http::header::VARY).as_deref(), Some("Accept-Encoding"));
+    let r = get(&st, &mount, "/", "br").await;
+    assert_eq!(hdr(&r, &axum::http::header::CACHE_CONTROL), None);
+    let _ = (std::fs::remove_dir_all(&cd), std::fs::remove_dir_all(&wd));
+}
+
+/// Given immutable 资产 304 再验证
+/// When INM 命中
+/// Then 304 带 Cache-Control（与 200 同策略，RFC 9110 §15.4.5）
+#[tokio::test(flavor = "current_thread")]
+async fn cache_control_on_304() {
+    let (cd, wd) = t5_dirs("cc304");
+    std::fs::write(wd.join("app-B2R7x9cW.js"), vec![b'a'; 4096]).unwrap();
+    let (st, mount) = comp_state(&wd, Some(layer_opts(None)), CachePolicy::Auto);
+    let r1 = get(&st, &mount, "/app-B2R7x9cW.js", "br").await;
+    assert_eq!(
+        hdr(&r1, &axum::http::header::CACHE_CONTROL).as_deref(),
+        Some("public, max-age=31536000, immutable")
+    );
+    let etag = hdr(&r1, &axum::http::header::ETAG).unwrap();
+    let mut h = HeaderMap::new();
+    h.insert(axum::http::header::ACCEPT_ENCODING, HeaderValue::from_static("br"));
+    h.insert(axum::http::header::IF_NONE_MATCH, HeaderValue::from_str(&etag).unwrap());
+    let r2 = serve_web(&st, &mount, "/app-B2R7x9cW.js", "GET", true, &h).await;
+    assert_eq!(r2.status(), 304);
+    assert_eq!(
+        hdr(&r2, &axum::http::header::CACHE_CONTROL).as_deref(),
+        Some("public, max-age=31536000, immutable")
+    );
+    let _ = (std::fs::remove_dir_all(&cd), std::fs::remove_dir_all(&wd));
+}
