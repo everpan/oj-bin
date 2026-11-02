@@ -2,7 +2,7 @@
 
 - 日期：2026-11-02 · 状态：四路评审（架构/性能/网络/builder-check）意见已合入；
   两处偏离原 PR 文本的裁决（D10 两档制、D9 砍伴生直服）**提出方已确认**；
-  §9 复核意见待回（网络/架构）
+  §9 复核意见：网络已回并合入（CL 三例外/统一空化点/探针成本/Allow），架构待回
 - 基线：oj v0.1.115 · 来源：oj-module 提出的 OJ-9（PR-8）/ OJ-10（PR-9）/ OJ-11（PR-10）诉求文本
 - 一句话：`oj serve` 的 web 静态挂载零配置获得「br>gzip 传输压缩（产物落盘缓存）」与
   「内容哈希 immutable、其余恒校验」的正确默认，外加 API 路由 HEAD 镜像 GET；
@@ -159,8 +159,9 @@ br quality / gzip level / cache dir（None=内存直压）。启动时 web 挂�
 6. HTML：注入后直压；两个深链接各自 meta 正确（不串）；动态 handler 站点不缓存。
 7. 缓存策略两档：哈希段 immutable；`config-production.js` 落 no-cache；点分 hex 命中；
    SPA 深链接回落 → no-cache；`none` 全无；显式头覆盖兜底；`html_cache_control` 仍胜。
-8. HEAD：静态 HEAD 压缩且 CL=压缩后长度；API 镜像 GET-only 同状态码/头/空体；
-   显式 head() 覆盖；POST-only 405；302 端点 Location 保留；dev/release 两腿。
+8. HEAD：静态 HEAD 压缩且显式 CL=压缩后长度；API 镜像 GET-only 同状态码/头/空体；
+   GET 204 → HEAD 无 CL；`finish()` 流式 → HEAD 无 CL；admit 失败腿（401）体空头保留；
+   显式 head() 覆盖；POST-only 405 且带 `Allow`；302 端点 Location 保留；dev/release 两腿。
 9. off 逐字节现状。
 
 ## 7. 留给实现者
@@ -188,10 +189,17 @@ brotli/flate2 API 用法、single-flight 实现细节（`tokio::sync` 原语选�
   verb==HEAD 且 head 方法未注册而 get 已注册时同理。判定与 405 同源（启动期契约表）。
 - **R2 显式优先**：HEAD 先走精确命中（注册了 head 链即原样运行）。
 - **R3 非安全方法不动**：POST/PUT/DELETE/PATCH 仍 405。
-- **体剥离**：镜像走完整前置管线与 handler（鉴权一致：受保护端点 HEAD 无 token → 401），
-  capture 后体置空、状态码与全部头保留、`Content-Length` 显式保留 GET 原值（D18）；
-  流式 `cap.stream` 同样置空只留头。镜像响应不参与压缩。
-- **周边**：路由打印与 openapi 不新增 HEAD 行；CHANGELOG 注明行为变更。
+- **体剥离与 Content-Length（D18 + 网络复核）**：镜像走完整前置管线与 handler（鉴权一致：
+  受保护端点 HEAD 无 token → 401）；空化点在 `run_route` 转出 Response 的**统一出口**
+  （成功捕获与 admit 失败 `RunFail` 两路汇合处，覆盖两腿）。状态码与全部头保留；
+  `Content-Length` 仅当 GET 为缓冲体且状态码 ∉ {1xx, 204} 时按 GET 体长**显式 set**
+  （否则 hyper 按空体定 0；set 放在 cap.headers 处理之后，覆盖 handler 自带值）；
+  流式（`cap.stream`，无「原值」）与 204/1xx 腿不写 CL。镜像响应不参与压缩
+  （与 static 层零共享代码，无交叉污染——复核确认）。
+- **周边**：路由打印与 openapi 不新增 HEAD 行；CHANGELOG 注明行为变更（含「HEAD 不再是
+  空操作——探针执行完整 handler，重查询/副作用会随探针触发」）；SKILL.md 陷阱：探针选
+  轻路由、按状态码族判活；残余 405 顺修补 `Allow` 头（RFC 9110 §15.5.5 MUST，release 表
+  与 dev 兜底各一处）；部署提示：LB 常把 3xx 判探针失败。
 - **验收**：PR §5 三条 + 受保护端点 HEAD 未带 token → 401（进 SKILL.md 陷阱速查）。
 - **测试**：见 §6.8。
 
@@ -200,5 +208,7 @@ brotli/flate2 API 用法、single-flight 实现细节（`tokio::sync` 原语选�
 四路并行评审：架构（8 条）、Web 性能（10 条）、网络协议（10 条）、builder-check（6 问）。
 共识合入：HTML 缓存隔离（D3）、两档缓存策略（D10）、弱比较+变体选择序+304 完整头（D7/D11）、
 single-flight（D13）、inode 键+代际清理（D14）、`server.static:` 子段（D15）、
-`*`→gzip（D16）、stat 先行懒读（D17）。分歧已裁：伴生直服砍除（D9，架构/网络二比一）。
-遗留：§9 网络复核意见待回。
+`*`→gzip（D16）、stat 先行懒读（D17）。分歧已裁：伴生直服砍除（D9，架构/网络二比一，
+提出方确认）。§9 网络复核 5 条已合入：CL 三例外（缓冲体∧非 1xx/204 才显式 set）、
+空化点统一出口（覆盖 RunFail 腿）、探针成本进文档、残余 405 补 `Allow`。
+遗留：§9 架构复核待回。
