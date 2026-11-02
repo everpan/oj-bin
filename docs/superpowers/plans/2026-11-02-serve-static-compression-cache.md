@@ -16,14 +16,14 @@
 
 | # | 任务 | 状态 | 提交 | 小结 |
 |---|---|---|---|---|
-| T1 | `server.static:` 配置面 | ☐ 待做 | — | — |
-| T2 | 选项装配 + 启动 INFO | ☐ 待做 | — | — |
-| T3 | 协商 + 压缩内核（纯函数） | ☐ 待做 | — | — |
-| T4 | 压缩缓存仓库层（key/存储/single-flight） | ☐ 待做 | — | — |
-| T5 | `serve_web` 组装 + 统一头 | ☐ 待做 | — | — |
-| T6 | 两档制默认缓存策略 | ☐ 待做 | — | — |
-| T7 | OJ-11 HEAD 镜像 + Allow + 证书门 | ☐ 待做 | — | — |
-| T8 | v0.1.116 bump + CHANGELOG + devkit + 门禁 | ☐ 待做 | — | — |
+| T1 | `server.static:` 配置面 | ✅ 完成 | c47ead7 | StaticConf 七键+默认值+serde rename；根套件 1083 绿 |
+| T2 | 选项装配 + 启动 INFO | ✅ 完成 | 941b452 | 3 条 ruling（Option 三态/地板集内核拦/eprintln）；serve+oj 全绿 |
+| T3 | 协商 + 压缩内核（纯函数） | ✅ 完成 | 5c1b401 | 协商/压缩/弱比较/is_compressible 四场景；serve 203+1 绿 |
+| T4 | 压缩缓存仓库层（key/存储/single-flight） | ✅ 完成 | 35eeb42 | 5 场景；抓出 canonicalize 键漂移事故并回归钉死（ruling 已记） |
+| T5 | `serve_web` 组装 + 统一头 | ✅ 完成 | 5de8aff | 6 场景（4 RED→GREEN + 2 守卫）；B1 fixture 落地；oj 269 绿 |
+| T6 | 两档制默认缓存策略 | ✅ 完成 | 009cc1d | 6 场景 + 跨内容注入验证（br 解码断言）；3 个既有用例显式 None_ 保持原 scope |
+| T7 | OJ-11 HEAD 镜像 + Allow + 证书门 | ✅ 完成 | f7ab499 | 助手级 RED + 真表集成；serve 223+1 / e2e 55 绿；3 条 ruling |
+| T8 | v0.1.116 bump + CHANGELOG + devkit + 门禁 | ✅ 完成 | 5f871c4 | 全门禁绿；Windows 路径审计已记（CI platforms=windows 待跑后打标签） |
 
 **阶段小结协议**：每任务完成时 ① 更新上表（状态/提交/一句话小结：交付面、测试数、与计划的偏差）；② 在会话中给三行以内小结。偏差（签名/文件/方案与本计划不符处）必须记入小结，终局复审以此为线索。
 
