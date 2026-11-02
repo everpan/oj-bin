@@ -1,7 +1,7 @@
-# 设计：`oj serve` 静态层按需压缩（OJ-9）+ web 挂载默认缓存策略（OJ-10）
+# 设计：`oj serve` 静态层按需压缩（OJ-9）+ web 挂载默认缓存策略（OJ-10）+ API HEAD 镜像（OJ-11）
 
 - 日期：2026-11-02 · 状态：评审中（架构 / Web 性能 / 网络三路专家评审）
-- 基线：oj v0.1.115 · 来源：oj-module 提出的 OJ-9（PR-8）/ OJ-10（PR-9）诉求文本
+- 基线：oj v0.1.115 · 来源：oj-module 提出的 OJ-9（PR-8）/ OJ-10（PR-9）/ OJ-11（PR-10）诉求文本
 - 一句话：`oj serve` 的 web 静态挂载零配置获得「br>gzip 传输压缩」与「内容哈希 immutable /
   HTML+清单 no-cache」的正确默认，`off`/`none` 两个逃生门完全回退现状。
 
@@ -172,3 +172,31 @@ doc 注释措辞。
   建议关 nginx gzip 防双压）、`scenarios.md` 可照抄场景、`README.md`；`cargo xtask build`
   归置 `bin/devkit/`；`cargo test --release -p xtask` devkit 契约用例。
 - 门禁：`cargo fmt --check`、`cargo clippy --release --workspace --all-targets -- -D warnings`。
+
+## 9. OJ-11（PR-10，P3）：API 路由安全方法 HEAD 自动镜像 GET
+
+意图：仅声明 `get()` 的 API 端点收到 HEAD（uptime 探针 / LB 健康检查）不再 405，
+免去每工程手写 `head()` 镜像 handler；显式 `head()` 恒优先。
+
+现状（v0.1.115 核验）：release 表腿 405 在 `serve/src/lib.rs:736`
+（`Lookup::MethodNotAllowed`），dev 兜底腿在 `lib.rs:762`（`method_name("HEAD")→"head"`
+未注册）；web 挂载本就支持 GET/HEAD，不动（R4）。
+
+设计：
+
+- **R1 镜像点（两腿同规则）**：release 腿——HEAD 得 `MethodNotAllowed` 时对同 path 二次
+  `lookup(path, "GET")`，命中即以 GET handler 链运行并标记 `mirror_head`；dev 兜底腿——
+  verb==HEAD 且 head 方法未注册而 get 已注册时同理。镜像判定与 405 判定**同一注册源**
+  （启动期契约表），不做运行时探测。
+- **R2 显式优先**：HEAD 先走精确命中（该 pattern 注册了 head 链即原样运行，不镜像）。
+- **R3 非安全方法不动**：仅 HEAD 触发回退；POST/PUT/DELETE/PATCH 仍 405。
+- **体剥离**：镜像请求走完整前置管线与 handler 执行（admit/鉴权/租户——受保护端点
+  HEAD 无 token 得 401，与 GET 一致），capture 后**体置空**，状态码与全部响应头保留；
+  `Content-Length` 显式保留 GET 原值（RFC 9110 §9.3.2 HEAD/GET 头一致；流式
+  `cap.stream` 同样置空只留头）。镜像响应不参与压缩（OJ-9 R5 动态信封范围外，天然一致）。
+- **周边**：启动路由打印与 openapi 不新增 HEAD 行（隐式镜像不注册）；CHANGELOG 注明
+  行为变更（HEAD 405 → 镜像）。
+- **验收**：PR §5 三条，另加：受保护端点 HEAD 未带 token → 401（与 GET 同，
+  进 SKILL.md 陷阱速查——探针应按状态码族判活，401≠服务不可用）。
+- **测试**：GET-only → HEAD 同状态码/同头/空体；显式 head() 覆盖；POST-only HEAD 仍 405；
+  302 端点 HEAD 保留 Location；dev/release 两腿各一例；镜像 + `finish()` 流式。
