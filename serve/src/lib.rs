@@ -129,6 +129,29 @@ pub struct AppState {
     pub exec_registry: Option<Arc<only_js::bridge::db_exec::ExecRegistry>>,
 }
 
+/// web 默认缓存策略（v0.1.116 OJ-10，`server.static.web_cache_policy`）。
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+pub enum CachePolicy {
+    /// 两档制（spec D10）：文件名哈希段 → immutable 一年；其余 → no-cache 恒校验。
+    #[default]
+    Auto,
+    /// 不加任何 Cache-Control（v0.1.115 行为；排障/兼容逃生门）。
+    None_,
+}
+
+/// 静态压缩选项（v0.1.116 OJ-9，`server.static:` 子段；由装配层校验后注入）。
+#[derive(Clone, Debug)]
+pub struct StaticLayerOpts {
+    pub compress_min_length: u64,
+    /// None = 内置集；Some = 用户替换集（已小写化）。硬排除地板集在
+    /// `static_files::is_compressible` 恒拦截——替换集绕不过（防呆不可关）。
+    pub compress_types: Option<std::collections::HashSet<String>>,
+    pub brotli_quality: u8,
+    pub gzip_level: u8,
+    /// None = 纯内存直压；Some = 缓存目录（派生数据，可整目录删除）。
+    pub cache_dir: Option<std::path::PathBuf>,
+}
+
 /// 静态增强（v0.1.25 起：动态 meta 与 HTML 缓存头；SPA 回落已下沉 per-挂载 `spa`）。
 #[derive(Clone, Default)]
 pub struct StaticOpts {
@@ -146,6 +169,10 @@ pub struct StaticOpts {
     /// 静态站点可用 per-site `headers` 覆盖同名的全局值。默认空 = 行为不变。
     /// 挂在 StaticOpts 是历史签名约束（app() 参数面不变），语义上是全站响应策略。
     pub response_headers: Vec<(String, String)>,
+    /// 静态压缩选项（v0.1.116 OJ-9）。None = 关（不协商不压缩，逐字节同 v0.1.115）。
+    pub static_layer: Option<StaticLayerOpts>,
+    /// web 挂载默认缓存策略（v0.1.116 OJ-10）。默认 Auto。
+    pub web_cache_policy: CachePolicy,
 }
 
 /// handle() 前置管线配置：请求进入 JS 前的注入/守卫（租户/鉴权/上传）。

@@ -764,6 +764,67 @@ fn build_runtime_mounts(
 ///
 /// fail-fast 而非启动后 WARN：配错的后果（页面 meta 没注入）只在爬虫/IM 预览侧可见，
 /// 业务页面自己看不出来——留给运行期的告警等于让配置撒谎。
+/// `server.static` → serve 侧选项（v0.1.116 OJ-9/10）。装配期 fail-fast：quality/level
+/// 越界、policy 非法；cache_dir 三态解析（未配置=config_dir/compress-cache、显式 ""=关、
+/// 其余相对 → 相对 config_dir，`logs_dir` 同款）。compression=false → layer None（关）。
+pub(crate) fn static_opts_of(
+    sc: &config::StaticConf,
+    config_dir: &std::path::Path,
+) -> Result<(Option<serve::StaticLayerOpts>, serve::CachePolicy), String> {
+    let policy = match sc.web_cache_policy.as_str() {
+        "auto" => serve::CachePolicy::Auto,
+        "none" => serve::CachePolicy::None_,
+        other => {
+            return Err(format!(
+                "server.static.web_cache_policy: {other:?} 非法（合法 auto|none）"
+            ))
+        }
+    };
+    if !sc.compression {
+        return Ok((None, policy));
+    }
+    if !(1..=11).contains(&sc.brotli_quality) {
+        return Err(format!(
+            "server.static.brotli_quality: {} 越界（合法 1..=11）",
+            sc.brotli_quality
+        ));
+    }
+    if !(1..=9).contains(&sc.gzip_level) {
+        return Err(format!(
+            "server.static.gzip_level: {} 越界（合法 1..=9）",
+            sc.gzip_level
+        ));
+    }
+    let cache_dir = match &sc.compress_cache_dir {
+        None => Some(config_dir.join("compress-cache")),
+        Some(s) if s.is_empty() => None,
+        Some(rel) => {
+            let p = std::path::Path::new(rel);
+            Some(config_dir.join(p))
+        }
+    };
+    if let Some(d) = &cache_dir
+        && let Err(e) = std::fs::create_dir_all(d)
+    {
+        // 不 panic：运行期写缓存时 fail-open（T4 仓库层回退纯内存直压）。
+        eprintln!("warn: server.static.compress_cache_dir 创建失败（{e}）：{}——将回退纯内存直压", d.display());
+    }
+    Ok((
+        Some(serve::StaticLayerOpts {
+            compress_min_length: sc.compress_min_length,
+            compress_types: if sc.compress_types.is_empty() {
+                None
+            } else {
+                Some(sc.compress_types.iter().map(|s| s.to_ascii_lowercase()).collect())
+            },
+            brotli_quality: sc.brotli_quality,
+            gzip_level: sc.gzip_level,
+            cache_dir,
+        }),
+        policy,
+    ))
+}
+
 fn validate_html_meta_handler(
     cfg: &Config,
     tables: &[(String, routes::RouteTable)],
@@ -2226,6 +2287,28 @@ impl App {
         // 运行时挂载：api 条目吸收同 prefix 的 web（配对 → 无 spa）；独立 web 原样。
         // 最长前缀排序归 serve::app()。
         let runtime_mounts = build_runtime_mounts(resolved, tables);
+        // server.static（v0.1.116 OJ-9/10）：默认行为变更的启动声明（spec D12——
+        // 多站点排障可归因，关闭键名随行）。
+        let (static_layer, web_cache_policy) = static_opts_of(&cfg.server.static_conf, config_dir)?;
+        if static_layer.is_some()
+            && runtime_mounts
+                .iter()
+                .any(|m| matches!(m, serve::RuntimeMount::Web(_)))
+        {
+            let sc = &cfg.server.static_conf;
+            eprintln!(
+                "serve: static compression on (br q{}, gzip L{}, cache {}) / web cache policy {} \
+                 — off keys: server.static.compression, server.static.web_cache_policy",
+                sc.brotli_quality,
+                sc.gzip_level,
+                static_layer
+                    .as_ref()
+                    .and_then(|l| l.cache_dir.as_deref())
+                    .map(|d| d.display().to_string())
+                    .unwrap_or_else(|| "off".into()),
+                sc.web_cache_policy,
+            );
+        }
         let router = serve::app_with_exec(
             runtime_mounts,
             actor,
@@ -2243,6 +2326,9 @@ impl App {
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect(),
+                // server.static（v0.1.116 OJ-9/10）：压缩选项与默认缓存策略。
+                static_layer,
+                web_cache_policy,
             },
             pipeline,
             cert_status,

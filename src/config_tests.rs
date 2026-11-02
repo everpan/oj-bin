@@ -22,7 +22,7 @@ fn static_conf_defaults_and_parse() {
     assert_eq!(c.server.static_conf.brotli_quality, 9);
     assert!(c.server.static_conf.compression);
     assert_eq!(c.server.static_conf.compress_min_length, 1024);
-    assert_eq!(c.server.static_conf.compress_cache_dir, "");
+    assert_eq!(c.server.static_conf.compress_cache_dir, None);
     assert!(c.server.static_conf.compress_types.is_empty());
 
     // Given: base_yaml 不含 static 段

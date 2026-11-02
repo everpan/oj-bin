@@ -1693,6 +1693,9 @@ async fn html_meta_handler_overrides_static_and_sets_cache_control() {
             html_meta_handler: Some("/v1/api/html-meta".into()),
             html_cache_control: Some("no-cache".into()),
             response_headers: Vec::new(),
+            // v0.1.116 OJ-9/10：本用例关静态层（既有行为域）。
+            static_layer: None,
+            web_cache_policy: CachePolicy::None_,
         },
     )
     .await;

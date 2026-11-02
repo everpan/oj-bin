@@ -945,3 +945,64 @@ fn migration_warn_is_auth_only() {
     assert_eq!(entries[0].0, "auth.anonymous_paths");
     assert_eq!(entries[0].1, vec!["/idp/*"]);
 }
+
+// ---- server.static 装配（v0.1.116 OJ-9/10） ----
+
+/// Given 默认 StaticConf + 临时 config_dir
+/// When static_opts_of
+/// Then layer Some（q5/L6、types None、cache_dir=<config_dir>/compress-cache 绝对路径）、policy Auto
+#[test]
+fn static_opts_of_defaults_resolve_cache_dir() {
+    let dir = std::env::temp_dir().join(format!("oj-static-t2-{}", std::process::id()));
+    let (layer, policy) = static_opts_of(&config::StaticConf::default(), &dir).unwrap();
+    let layer = layer.unwrap();
+    assert_eq!(layer.brotli_quality, 5);
+    assert_eq!(layer.gzip_level, 6);
+    assert!(layer.compress_types.is_none());
+    assert_eq!(layer.cache_dir.unwrap(), dir.join("compress-cache"));
+    assert_eq!(policy, serve::CachePolicy::Auto);
+}
+
+/// Given 越界 quality / level、非法 policy、显式关闭与相对 cache_dir
+/// When static_opts_of
+/// Then fail-fast 文案含键名；关→layer None；相对→绝对；显式空串→cache_dir None；none→None_
+#[test]
+fn static_opts_of_validates_and_three_state_dir() {
+    let dir = std::env::temp_dir();
+    let sc = config::StaticConf {
+        brotli_quality: 12,
+        ..Default::default()
+    };
+    assert!(static_opts_of(&sc, &dir).unwrap_err().contains("brotli_quality"));
+    let sc = config::StaticConf {
+        gzip_level: 0,
+        ..Default::default()
+    };
+    assert!(static_opts_of(&sc, &dir).unwrap_err().contains("gzip_level"));
+    let sc = config::StaticConf {
+        web_cache_policy: "fast".into(),
+        ..Default::default()
+    };
+    assert!(static_opts_of(&sc, &dir).unwrap_err().contains("web_cache_policy"));
+    let sc = config::StaticConf {
+        compression: false,
+        ..Default::default()
+    };
+    assert!(static_opts_of(&sc, &dir).unwrap().0.is_none());
+    let sc = config::StaticConf {
+        compress_cache_dir: Some("rel-cache".into()),
+        ..Default::default()
+    };
+    let (layer, _) = static_opts_of(&sc, &dir).unwrap();
+    assert_eq!(layer.unwrap().cache_dir.unwrap(), dir.join("rel-cache"));
+    let sc = config::StaticConf {
+        compress_cache_dir: Some(String::new()),
+        ..Default::default()
+    };
+    assert!(static_opts_of(&sc, &dir).unwrap().0.unwrap().cache_dir.is_none());
+    let sc = config::StaticConf {
+        web_cache_policy: "none".into(),
+        ..Default::default()
+    };
+    assert_eq!(static_opts_of(&sc, &dir).unwrap().1, serve::CachePolicy::None_);
+}

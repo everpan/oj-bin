@@ -177,10 +177,10 @@ pub struct StaticConf {
     pub brotli_quality: u8,
     /// gzip level（1..=9），默认 6。
     pub gzip_level: u8,
-    /// 压缩缓存目录**三态**：未配置（Default `""`）= `<config_dir>/compress-cache`；
+    /// 压缩缓存目录**三态**：未配置（Default `None`）= `<config_dir>/compress-cache`；
     /// 显式 `""` = 关闭落盘（纯内存直压）；其余 = 目录路径（相对 → 相对 config 目录，
     /// `logs_dir` 同款）。目录内容是派生数据，可整目录删除。
-    pub compress_cache_dir: String,
+    pub compress_cache_dir: Option<String>,
     /// web 挂载默认缓存策略：`auto`（默认，哈希→immutable / 其余→no-cache）| `none`
     /// （不加任何 Cache-Control，v0.1.115 行为）。
     pub web_cache_policy: String,
@@ -194,7 +194,7 @@ impl Default for StaticConf {
             compress_types: Vec::new(),
             brotli_quality: 5,
             gzip_level: 6,
-            compress_cache_dir: String::new(),
+            compress_cache_dir: None,
             web_cache_policy: "auto".to_string(),
         }
     }
