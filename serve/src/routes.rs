@@ -526,6 +526,28 @@ impl RouteTable {
         }
     }
 
+    /// 该 path 已注册的 HTTP 方法集（405 `Allow` 头用，RFC 9110 §15.5.5 MUST）。
+    /// path 须先经 `normalize`；未命中 pattern → 空。
+    pub fn methods_of(&self, path: &str) -> Vec<&'static str> {
+        const ALL: [(&str, &str); 7] = [
+            ("get", "GET"),
+            ("post", "POST"),
+            ("put", "PUT"),
+            ("del", "DELETE"),
+            ("patch", "PATCH"),
+            ("head", "HEAD"),
+            ("options", "OPTIONS"),
+        ];
+        let Ok(m) = self.matcher.at(path) else {
+            return Vec::new();
+        };
+        let node = &self.nodes[*m.value];
+        ALL.iter()
+            .filter(|(js, _)| node.contains_key(*js))
+            .map(|(_, http)| *http)
+            .collect()
+    }
+
     /// 查表：path 须先经 `normalize`。未映射动词按"路径存在 → 405"契约处理。
     pub fn lookup(&self, path: &str, verb: &str) -> Lookup {
         // 精确段（静态）优先于参数段：matchit 自带该优先级，与注册顺序无关。

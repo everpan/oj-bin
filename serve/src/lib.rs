@@ -546,8 +546,10 @@ async fn handle(State(st): State<AppState>, req: axum::extract::Request) -> Resp
     // Accept 判据先算：`headers` 稍后被 run 闭包整体捕获（SPA 回落要用）。
     let accept_html = wants_html(&headers);
 
-    // Certificate validation: restrict GET requests when certificate is expired or in grace period
-    if verb == "GET" {
+    // Certificate validation: restrict GET/HEAD requests when certificate is expired
+    // or in grace period（v0.1.116 OJ-11：HEAD 也受门——过期期 HEAD 探针同样 403，
+    // 保「按状态码族判活」的监控语义真实）。
+    if matches!(verb, "GET" | "HEAD") {
         match &*st
             .certificate_status
             .read()
@@ -755,38 +757,94 @@ async fn handle_api(
                     file,
                     params,
                     handler,
+                    false,
                 )
                 .await;
             }
             Lookup::Conflict(msg) => return fail_response(500, &msg),
             Lookup::MethodNotAllowed => {
-                return fail_response(405, &format!("method {verb} not allowed"));
+                // OJ-11（v0.1.116）：HEAD 镜像 = 同 URL GET 本会得到的响应——二次
+                // lookup 复用同一映射（Hit→镜像运行、Conflict→500 原文案不谎报 405、
+                // 其余维持 405+Allow）。镜像请求全程以 GET 语义运行（guard/RequestInfo
+                // 均见 "GET"，按方法设规则的鉴权对公共端点探针放行）。
+                if verb == "HEAD" {
+                    match table.lookup(&path, "GET") {
+                        Lookup::Hit {
+                            file,
+                            params,
+                            handler,
+                        } => {
+                            return run_route(
+                                st,
+                                headers,
+                                body,
+                                "GET",
+                                parse_query(uri.query()),
+                                path_no_base.as_deref(),
+                                &path,
+                                file,
+                                params,
+                                handler,
+                                true,
+                            )
+                            .await;
+                        }
+                        Lookup::Conflict(msg) => return fail_response(500, &msg),
+                        _ => {}
+                    }
+                }
+                let mut r = fail_response(405, &format!("method {verb} not allowed"));
+                let allow = table.methods_of(&path).join(", ");
+                if !allow.is_empty()
+                    && let Ok(v) = axum::http::HeaderValue::from_str(&allow)
+                {
+                    r.headers_mut().insert(axum::http::header::ALLOW, v);
+                }
+                return r;
             }
             Lookup::NotFound => {}
         }
     }
     // dev 兜底：目录镜像（挂 .route 的方法已被替换，不得复活）。
+    // OJ-11：兜底腿只接**表外**文件（内省失败/热重载窗口）——导出了 head 的文件
+    // 在表内、显式优先由表命中承担；此处 HEAD 一律折 "get" 链（模块缺 get 与 GET
+    // 请求同错同文案，spec 架构复核）。
     if let Some((file, params)) = fallback.and_then(|fb| fb.resolve(uri.path())) {
         // 表内路径经过 canonicalize（macOS /var ↔ /private/var），对齐后再比对
         let file = file.canonicalize().unwrap_or(file);
-        match crate::routes::method_name(verb) {
+        let effective = if verb == "HEAD" {
+            Some("get")
+        } else {
+            crate::routes::method_name(verb)
+        };
+        match effective {
             Some(m) if !table.is_replaced(&file, m) => {
                 return run_route(
                     st,
                     headers,
                     body,
-                    verb,
+                    if verb == "HEAD" { "GET" } else { verb },
                     parse_query(uri.query()),
                     path_no_base.as_deref(),
                     uri.path(),
                     file,
                     params,
                     m.to_string(),
+                    verb == "HEAD",
                 )
                 .await;
             }
             Some(_) => {} // replaced → 404
-            None => return fail_response(405, &format!("method {verb} not mapped")),
+            None => {
+                let mut r = fail_response(405, &format!("method {verb} not mapped"));
+                r.headers_mut().insert(
+                    axum::http::header::ALLOW,
+                    axum::http::HeaderValue::from_static(
+                        "DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT",
+                    ),
+                );
+                return r;
+            }
         }
     }
     // 同 prefix 配对 web（规则 2）：api 优先已由顺序保证；该 web **不开** SPA 回落

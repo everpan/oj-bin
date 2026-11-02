@@ -13,6 +13,7 @@ pub(crate) async fn run_route(
     file: PathBuf,
     params: HashMap<String, String>,
     handler: String,
+    mirror_head: bool,
 ) -> Response {
     // v0.1.38（ABI 10）：multipart + blob 已配置 → **流式**解析（文件字段直落 blob，
     // 内存恒定；大文件不再受 max_upload 硬顶约束，单文件上限 blob_upload_max）；
@@ -60,15 +61,68 @@ pub(crate) async fn run_route(
     )
     .await
     {
-        Ok(cap) => {
+        Ok(mut cap) => {
+            // OJ-11 HEAD 镜像：体在 **Capture 层**空化——流式体（finish()）可能无限，
+            // 转 Response 后 to_bytes 会挂死；CL 规则经 head_mirror_cl 单一出处。
+            if mirror_head {
+                let is_stream = cap.stream.is_some();
+                let body_len = (!is_stream).then(|| cap.body.len());
+                let status = StatusCode::from_u16(cap.status as u16).unwrap_or(StatusCode::OK);
+                cap.body = Vec::new();
+                cap.stream = None;
+                // 直接在 cap.headers（Vec，保多值 Set-Cookie）上操作：先摘除自带 CL，
+                // 再按规则决定是否显式回填（覆盖语义天然成立）。
+                let keep = head_mirror_keep(status, body_len);
+                cap.headers
+                    .retain(|(k, _)| !k.eq_ignore_ascii_case("content-length"));
+                if keep
+                    && let Some(len) = body_len
+                {
+                    cap.headers.push(("Content-Length".into(), len.to_string()));
+                }
+            }
             let mut resp = capture_response(cap);
             apply_custom_headers(&mut resp, &st.static_opts.response_headers);
             resp
         }
         // 准入拒绝（401/400）/ 超时熔断（408）/ 执行失败（500）：fail 语义与
         // 拆分前一致（这些路径从不施加自定义响应头）。
-        Err(e) => fail_response(i32::from(e.status), &e.msg),
+        Err(e) => {
+            let mut resp = fail_response(i32::from(e.status), &e.msg);
+            if mirror_head {
+                apply_head_mirror(&mut resp).await;
+            }
+            resp
+        }
     }
+}
+
+/// HEAD 镜像 CL 判定（单一出处，RFC 9110 §9.3.2/§8.6）：缓冲体且 status ∉ {1xx,204}
+/// 才显式保留 CL；流式无「原值」、204/1xx MUST NOT 携带。
+pub(crate) fn head_mirror_keep(status: StatusCode, buffered_len: Option<usize>) -> bool {
+    buffered_len.is_some() && !status.is_informational() && status != StatusCode::NO_CONTENT
+}
+
+/// HEAD 镜像 CL 规则应用于 HeaderMap（RunFail 腿）。
+pub(crate) fn head_mirror_cl(headers: &mut HeaderMap, status: StatusCode, buffered_len: Option<usize>) {
+    if head_mirror_keep(status, buffered_len)
+        && let Some(len) = buffered_len
+        && let Ok(v) = HeaderValue::from_str(&len.to_string())
+    {
+        headers.insert(axum::http::header::CONTENT_LENGTH, v);
+    } else {
+        headers.remove(axum::http::header::CONTENT_LENGTH);
+    }
+}
+
+/// HEAD 镜像统一空化（RunFail 腿——不经 Capture 的直造 Response）：体置空、状态码与
+/// 全部头保留、CL 按 head_mirror_cl 规则。
+pub(crate) async fn apply_head_mirror(r: &mut Response) {
+    let status = r.status();
+    let (mut parts, body) = std::mem::take(r).into_parts();
+    let buffered = axum::body::to_bytes(body, 64 * 1024 * 1024).await.ok().map(|b| b.len());
+    head_mirror_cl(&mut parts.headers, status, buffered);
+    *r = Response::from_parts(parts, axum::body::Body::empty());
 }
 
 /// 合成准入失败的 RunFail（401/400 信封体很小，直接读出 msg 供 MCP isError 使用）。

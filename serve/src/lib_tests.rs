@@ -2445,3 +2445,105 @@ async fn cors_absent_means_no_headers() {
         "{ok}"
     );
 }
+
+// ---- OJ-11 HEAD 镜像（v0.1.116） ----
+
+use axum::body::Body;
+
+/// Given 缓冲 200 体 5B / 204
+/// When apply_head_mirror
+/// Then CL=5 空体；204 无 CL（流式「无 CL」保证在 Ok 腿 Capture 层——
+/// head_mirror_keep(status, None)，见 head_mirror_cl_rule 第三例；本助手契约域为缓冲体）
+#[tokio::test(flavor = "current_thread")]
+async fn apply_head_mirror_rules() {
+    // 缓冲 200
+    let mut r = Response::new(Body::from("hello"));
+    apply_head_mirror(&mut r).await;
+    assert_eq!(r.status(), 200);
+    let cl = r.headers().get(axum::http::header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).map(String::from);
+    assert_eq!(cl.as_deref(), Some("5"), "按原体长显式 CL");
+    let b = axum::body::to_bytes(std::mem::take(&mut r).into_body(), 1024).await.unwrap();
+    assert!(b.is_empty(), "体置空");
+
+    // 204 MUST NOT 携带 CL（RFC 9110 §8.6）
+    let mut r = Response::builder().status(StatusCode::NO_CONTENT).body(Body::from("x")).unwrap();
+    apply_head_mirror(&mut r).await;
+    assert_eq!(r.headers().get(axum::http::header::CONTENT_LENGTH), None);
+}
+
+/// Given CL 规则单一出处
+/// When head_mirror_cl
+/// Then 缓冲∧非1xx/204 → 显式 CL；204/流式 → 移除 CL（含 handler 自带值）
+#[test]
+fn head_mirror_cl_rule() {
+    let mut h = axum::http::HeaderMap::new();
+    h.insert(axum::http::header::CONTENT_LENGTH, HeaderValue::from_static("99"));
+    head_mirror_cl(&mut h, StatusCode::OK, Some(5));
+    assert_eq!(h.get(axum::http::header::CONTENT_LENGTH).unwrap(), "5");
+    let mut h = axum::http::HeaderMap::new();
+    h.insert(axum::http::header::CONTENT_LENGTH, HeaderValue::from_static("99"));
+    head_mirror_cl(&mut h, StatusCode::NO_CONTENT, Some(1));
+    assert_eq!(h.get(axum::http::header::CONTENT_LENGTH), None);
+    let mut h = axum::http::HeaderMap::new();
+    head_mirror_cl(&mut h, StatusCode::OK, None);
+    assert_eq!(h.get(axum::http::header::CONTENT_LENGTH), None);
+}
+
+/// OJ-11 集成（真表真 JS）：GET-only 镜像空体同 CL / POST-only 405+Allow /
+/// 显式 head 优先 / 镜像以 GET 语义运行 handler。
+#[tokio::test(flavor = "current_thread")]
+async fn head_mirror_integration_real_table() {
+    let t = routes(&[
+        (
+            "m/api.ts",
+            r#"export default { get() { return json.ok({ verb: http.method }); } };"#,
+        ),
+        ("p/api.ts", r#"export default { post() { return json.ok({}); } };"#),
+        (
+            "h/api.ts",
+            r#"export default {
+                get() { return json.ok({}); },
+                head() { return json.fail(418, "explicit-head"); }
+            };"#,
+        ),
+        (
+            "g/api.ts",
+            r#"export default {
+                get() { return http.method === "GET" ? json.fail(418, "saw-get") : json.ok({}); }
+            };"#,
+        ),
+    ]);
+    let addr = spawn_server("/v1/api", t.0.clone(), true, None).await;
+    // GET 基线 + HEAD 镜像：同 200、同 CL、空体
+    let get_raw = raw_http(addr, "GET /v1/api/m/ HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n").await;
+    assert!(get_raw.starts_with("HTTP/1.1 200"), "{get_raw}");
+    let cl = get_raw
+        .lines()
+        .find(|l| l.to_lowercase().starts_with("content-length"))
+        .unwrap()
+        .split(':')
+        .nth(1)
+        .unwrap()
+        .trim()
+        .to_string();
+    let head = raw_http(addr, "HEAD /v1/api/m/ HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n").await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(
+        head.to_lowercase().contains(&format!("content-length: {cl}")),
+        "HEAD 保留 GET 原值 CL: {head}"
+    );
+    assert!(head.ends_with("\r\n\r\n"), "HEAD 空体");
+    // POST-only → 405 + Allow（RFC 9110 §15.5.5）
+    let h405 = raw_http(addr, "HEAD /v1/api/p/ HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n").await;
+    assert!(h405.starts_with("HTTP/1.1 405"), "{h405}");
+    assert!(h405.to_lowercase().contains("allow:"), "{h405}");
+    assert!(h405.to_lowercase().contains("post"), "{h405}");
+    // 显式 head 优先（418 而非镜像 200），GET 不受影响
+    let hexp = raw_http(addr, "HEAD /v1/api/h/ HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n").await;
+    assert!(hexp.starts_with("HTTP/1.1 418"), "显式 head 优先: {hexp}");
+    let gexp = raw_http(addr, "GET /v1/api/h/ HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n").await;
+    assert!(gexp.starts_with("HTTP/1.1 200"), "{gexp}");
+    // 镜像 GET 语义贯穿：handler 内 http.method === "GET"
+    let hg = raw_http(addr, "HEAD /v1/api/g/ HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n").await;
+    assert!(hg.starts_with("HTTP/1.1 418"), "镜像以 GET 语义运行 handler: {hg}");
+}
