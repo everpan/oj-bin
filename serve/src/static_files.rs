@@ -36,9 +36,13 @@ pub(crate) async fn serve_web(
             // 的 br/gzip 变体以弱 ETag 服务（spec D7，变体选择先于 INM 校验）。
             let etag = (!is_html).then(|| etag_of(&m)).flatten();
             let weak = compressible && enc != Encoding::Identity;
-            let served_etag = etag
-                .as_deref()
-                .map(|e| if weak { format!("W/{e}") } else { e.to_string() });
+            let served_etag = etag.as_deref().map(|e| {
+                if weak {
+                    format!("W/{e}")
+                } else {
+                    e.to_string()
+                }
+            });
             if let Some(e) = &served_etag
                 && if_none_match_hit(headers, e)
             {
@@ -82,7 +86,8 @@ pub(crate) async fn serve_web(
                     r.headers_mut().insert(axum::http::header::ETAG, v);
                 }
                 if let Ok(v) = axum::http::HeaderValue::from_str(&out_len.to_string()) {
-                    r.headers_mut().insert(axum::http::header::CONTENT_LENGTH, v);
+                    r.headers_mut()
+                        .insert(axum::http::header::CONTENT_LENGTH, v);
                 }
                 finish_static_headers(st, w, &mut r, compressible, &file);
                 return r;
@@ -126,7 +131,10 @@ pub(crate) async fn serve_web(
                 Encoding::Identity
             };
             let compressible = opts.is_some_and(|o| is_compressible("html", body_len, o));
-            if compressible && enc != Encoding::Identity && let Some(o) = opts {
+            if compressible
+                && enc != Encoding::Identity
+                && let Some(o) = opts
+            {
                 compress_response(&mut r, enc, o).await;
             }
             finish_static_headers(st, w, &mut r, compressible, &idx);
@@ -174,8 +182,10 @@ fn merge_vary_ae(r: &mut Response) {
             }
         }
         None => {
-            r.headers_mut()
-                .insert(axum::http::header::VARY, HeaderValue::from_static("Accept-Encoding"));
+            r.headers_mut().insert(
+                axum::http::header::VARY,
+                HeaderValue::from_static("Accept-Encoding"),
+            );
         }
     }
 }
@@ -251,8 +261,7 @@ fn default_cache_control(file: &Path) -> &'static str {
 /// 默认缓存兜底（spec D8/D10）：显式头缺席时按两档制补 Cache-Control；
 /// `none` 策略 = 全不加（v0.1.115 行为）。
 fn apply_default_cache_control(r: &mut Response, file: &Path, policy: &CachePolicy) {
-    if *policy == CachePolicy::None_
-        || r.headers().contains_key(axum::http::header::CACHE_CONTROL)
+    if *policy == CachePolicy::None_ || r.headers().contains_key(axum::http::header::CACHE_CONTROL)
     {
         return;
     }
@@ -482,8 +491,9 @@ pub(crate) fn if_none_match_hit(headers: &HeaderMap, etag: &str) -> bool {
 
 /// 硬排除地板集（防呆不可关，`compress_types` 列了也不压）：原生已压缩/图格式，
 /// 压缩无收益甚至变大。
-pub(crate) const COMPRESS_FLOOR: [&str; 9] =
-    ["png", "jpg", "jpeg", "gif", "webp", "avif", "ico", "pdf", "woff2"];
+pub(crate) const COMPRESS_FLOOR: [&str; 9] = [
+    "png", "jpg", "jpeg", "gif", "webp", "avif", "ico", "pdf", "woff2",
+];
 
 /// 内置可压缩集（`compress_types` 缺省时的默认判定集）。
 pub(crate) const COMPRESS_BUILTIN: [&str; 15] = [
@@ -661,12 +671,13 @@ static INFLIGHT: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// 全局压缩并发钳（防冷缓存风暴，spec D13）；permits = 可用并行度。
-static COMPRESS_SEM: std::sync::LazyLock<tokio::sync::Semaphore> =
-    std::sync::LazyLock::new(|| {
-        tokio::sync::Semaphore::new(
-            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2),
-        )
-    });
+static COMPRESS_SEM: std::sync::LazyLock<tokio::sync::Semaphore> = std::sync::LazyLock::new(|| {
+    tokio::sync::Semaphore::new(
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2),
+    )
+});
 
 /// 缓存键 `{sha1(abs)}-{ino:x}-{mtime_ns:x}-{len:x}-{br|gz}{q}`：任一失效输入变化
 /// 自然换代（ino 防 mtime 保留式替换，spec D14）。
@@ -684,7 +695,11 @@ fn cache_key(
         &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
         file.to_string_lossy().as_bytes(),
     );
-    let sha1 = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let sha1 = digest
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
     #[cfg(unix)]
     let ino = std::os::unix::fs::MetadataExt::ino(meta);
     #[cfg(not(unix))]

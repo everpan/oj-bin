@@ -2813,7 +2813,7 @@ mounts:
 | 规则 | 说明 |
 |---|---|
 | api 挂载 | 服务该目录的模块路由；目录缺失启动报错。内建 `/health`、`/plugins`、`/blob/{key}` 跟各自 api 挂载前缀走（与既往部署零 URL 变化） |
-| web 挂载 | 前缀根 → `index.html`；穿越段（含 `%2F`）404；无 Range/ETag（经前置反代补）；**仅 GET/HEAD**（其余方法 405） |
+| web 挂载 | 前缀根 → `index.html`；穿越段（含 `%2F`）404；无 Range；**仅 GET/HEAD**（其余方法 405）。v0.1.116 起：非 HTML 资产带强 ETag（可 304）、HTML 带 meta 注入；压缩与两档制缓存策略默认开（`server.static:` 子段，见配置参考）——未哈希资产默认 `no-cache` 恒校验，要长缓存用 `mounts[].headers` 显式配 |
 | `spa: true` | 静态未命中 + 无扩展名 + `Accept` 含 `text/html`/`*/*`/缺失 → 送**本挂载根** `index.html`。默认 false（静默把 404 变 200 会掩盖错配）；要求同前缀无 api 挂载（嵌套 api 挂载经最长前缀命中本来就吞不掉） |
 | 同前缀重复 | 同类（api×api / web×web）报错；一条 api + 一条 web 合法（配对，api 优先） |
 | 根 `/` | 允许：api 挂载路由 `/<module>`；web 挂载全路径兜底 |
@@ -2858,6 +2858,7 @@ mounts:
 | `html_meta` | 无 | （v0.1.20）**构建期** per-route meta 目录名（相对各 web 挂载根）：送 HTML 前读 `<挂载根>/<dir>/<path>.json`，把 `title`/`description`/`canonical`/`og:*`/`twitter:*` 注入 `<head>`（值 HTML 转义、**不注入脚本**；目录自身不可公开访问）。只覆盖构建期已知路由 |
 | `html_meta_handler` | 无 | （v0.1.25）**动态** meta 源 = 业务 handler 的路由路径，见下「静态站点与 per-route meta」。静态 JSON 打底、动态按 key 覆盖；装配期校验它必须命中一个 **GET** 路由（拼错启动即报错） |
 | `html_cache_control` | 无 | （v0.1.25）HTML 响应的 `Cache-Control`（**只管 HTML**，js/css/图片不受影响）。动态 handler 返回的 `cache_control` 优先；两项都没有 = 不加头 |
+| `static` | 全默认 | （v0.1.116）静态层压缩与默认缓存策略子段，七键：`compression: true`（false = 不协商不压缩，连 Vary 也不加，逐字节同 v0.1.115）/ `compress_min_length: 1024` / `compress_types: []`（缺省=内置集 html/htm/css/js/mjs/json/map/txt/md/svg/xml/yaml/yml/woff/ttf；给出=全量替换）/ `brotli_quality: 5`（1..=11 越界启动报错）/ `gzip_level: 6`（1..=9）/ `compress_cache_dir`（未配置=`<config_dir>/compress-cache`；显式 `""`=纯内存直压；相对→相对 config 目录；**目录是派生数据可整删**）/ `web_cache_policy: auto`（`auto`=两档制：文件名哈希段→`immutable` 一年、**其余一律 `no-cache` 恒校验**；`none`=不加任何 Cache-Control）。图片/pdf/woff2 硬排除即列 `compress_types` 也不压。压缩协商 br>gzip、压缩产物落盘缓存 + single-flight 并发钳、可压资源恒带 `Vary: Accept-Encoding`（identity 变体亦带）、ETag 弱化 `W/` + 弱比较 304。默认行为变更见 CHANGELOG v0.1.116 |
 | `logs_dir` | 无（= config 目录下 `./logs`） | 日志目录（终端输出完整镜像落盘；每次启动新建文件 `server-<启动秒>_<pid>.log`，按 `logs_max_m` 滚动、保留 `logs_keep_files` 个）；不存在自动创建 |
 | `logs_max_m` | `100` | 单个日志文件大小上限（单位 M；**<100 按 100 生效**），超过滚动为 `base.1.log` 依次后移 |
 | `logs_keep_files` | `10` | 日志文件保留个数（含活动文件，超出删除；最小生效值 2） |
@@ -3789,7 +3790,9 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | 跨模块别名必须声明 `deps` | 别名跨模块引用省略 `manifest.deps` → S008 fail（既有**相对**跨模块引用不追溯） |
 | `manifest.yaml` 只能出现在模块根 | 嵌套声明会改写 `#` 别名的锚点 → S008 fail |
 | tasks 池禁用别名 / 不得越池根 | 任务池是非版本化资产（只镜像 `dist/<tasks.dir>/`），无法绑定模块版本 |
-| web 挂载无目录列表 / Range / ETag | 未知扩展名按 `application/octet-stream`；SPA 深链回落需挂载显式 `spa: true`（v0.1.58 起逐挂载，默认关——静默把 404 变 200 会掩盖错配，见 `scenarios.md` 场景 2）；HTML 缓存头可配 `server.html_cache_control`（v0.1.25，只作用于 HTML）；Range/ETag 经前置反代补；web 挂载仅 GET/HEAD（其余方法 405） |
+| web 挂载无目录列表 / Range | 未知扩展名按 `application/octet-stream`；SPA 深链回落需挂载显式 `spa: true`（v0.1.58 起逐挂载，默认关——静默把 404 变 200 会掩盖错配，见 `scenarios.md` 场景 2）；HTML 缓存头可配 `server.html_cache_control`（v0.1.25，只作用于 HTML）；ETag/压缩/默认缓存 v0.1.116 起内建（见 `server.static:` 配置参考与限制表）；Range 仍经前置反代补；web 挂载仅 GET/HEAD（其余方法 405） |
+| 静态压缩与默认缓存（v0.1.116 OJ-9/10） | 默认开：br>gzip 协商 + 压缩产物落盘缓存（`server.static.compress_cache_dir`，派生数据可整删；只读根设 `""` 走纯内存直压）+ 两档制缓存（哈希段→immutable 一年、**其余 no-cache 恒校验**——`config-production.js` 类纯字母词不会被误钉）。前端缓存层/CDN **必须按 `Vary: Accept-Encoding` 分键**，不能确认就 `server.static.compression: false` 让前置层独揽压缩。`off`/`none` 逐字节回退 v0.1.115 |
+| API HEAD 镜像 GET（v0.1.116 OJ-11） | 仅声明 `get()` 的端点 HEAD 不再 405：以 GET 语义贯穿（`http.method` 见 `"GET"`）、同状态码/同头/空体、显式 `head()` 恒优先、非安全方法 405（带 `Allow`）。**HEAD 真实执行 handler**——重查询/副作用随探针触发，探针选轻路由；按状态码族判活（401≠服务不可用；过期期 HEAD 同 403）；`HEAD /blob/{key}` 维持 404，下载型健康检查用 `/health` |
 | 多挂载（v0.1.58） | 同类前缀归一后重复 → 启动报错；挂载目录缺失/非目录 → 启动报错；命中挂载内 miss **不跨挂载**回落；`spa` 逐挂载显式（配对 web 恒无回落）；`html_meta`/`html_cache_control` 是全局键、按命中挂载根生效 |
 | search 引擎原生 FTS（v0.1.61） | sqlite trigram 对 **<3 字符查询静默零命中**（共享模块自动 LIKE 回退）；sqlite 实现仅支持整型自增 PK（外部内容表只认 rowid）；`sql_guard: deny` 模式与 FTS 裸查询互斥（deny 部署要么关守卫要么不用 search）；mysql InnoDB FULLTEXT 同事务可见性需实测（文档含糊区）；score 为引擎原始分不可跨引擎比较；`docs_fts*`/`oj_ver*` 影子表会进 `oj schema diff` 的 D002 噪音；pg 实现 v0.1.68 修复（自写 `$n` 与统一占位符计数校验冲突 + `ts_headline` 签名错——highlight 的 fragments 键为 `_doc` 文档级片段）；短词回退大小写三方言一致（pg 用 `ILIKE`，v0.1.68 起） |
 | 动态 meta 每次 HTML 请求**多派发一次 JS** | `server.html_meta_handler`（v0.1.25）：每次送 HTML 都调一次该 handler（无缓存层）。高流量站点请让 handler 只读缓存/轻查询，并用返回的 `cache_control` 让中间层替你挡住重复请求 |

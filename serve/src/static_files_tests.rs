@@ -3,7 +3,10 @@ use super::*;
 
 fn ae(v: &str) -> HeaderMap {
     let mut m = HeaderMap::new();
-    m.insert(axum::http::header::ACCEPT_ENCODING, HeaderValue::from_str(v).unwrap());
+    m.insert(
+        axum::http::header::ACCEPT_ENCODING,
+        HeaderValue::from_str(v).unwrap(),
+    );
     m
 }
 
@@ -28,8 +31,14 @@ fn negotiate_priority_and_q_values() {
     );
     assert_eq!(negotiate_encoding(&bad), Encoding::Identity);
     let mut multi = HeaderMap::new();
-    multi.append(axum::http::header::ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
-    multi.append(axum::http::header::ACCEPT_ENCODING, HeaderValue::from_static("br"));
+    multi.append(
+        axum::http::header::ACCEPT_ENCODING,
+        HeaderValue::from_static("gzip"),
+    );
+    multi.append(
+        axum::http::header::ACCEPT_ENCODING,
+        HeaderValue::from_static("br"),
+    );
     assert_eq!(negotiate_encoding(&multi), Encoding::Br);
 }
 
@@ -49,10 +58,24 @@ fn kernel_opts() -> StaticLayerOpts {
 async fn compress_body_shrinks_text_not_high_entropy() {
     let opts = kernel_opts();
     let text = " hello low-code ".repeat(220_000).into_bytes();
-    let br = compress_body(Encoding::Br, text.clone(), &opts).await.unwrap();
-    assert!(br.len() * 2 < text.len(), "br {} vs {}", br.len(), text.len());
-    let gz = compress_body(Encoding::Gzip, text.clone(), &opts).await.unwrap();
-    assert!(gz.len() * 2 < text.len(), "gz {} vs {}", gz.len(), text.len());
+    let br = compress_body(Encoding::Br, text.clone(), &opts)
+        .await
+        .unwrap();
+    assert!(
+        br.len() * 2 < text.len(),
+        "br {} vs {}",
+        br.len(),
+        text.len()
+    );
+    let gz = compress_body(Encoding::Gzip, text.clone(), &opts)
+        .await
+        .unwrap();
+    assert!(
+        gz.len() * 2 < text.len(),
+        "gz {} vs {}",
+        gz.len(),
+        text.len()
+    );
     let mut seed = 0x2545_F491_4F6C_DD1Du64;
     let hi: Vec<u8> = (0..8192)
         .map(|_| {
@@ -133,20 +156,38 @@ fn cache_key_changes_with_invalidation_inputs() {
     assert_eq!(cache_key(&f, &m, Encoding::Br, &opts), k, "同输入同键");
     // len 变
     std::fs::write(&f, vec![b'x'; 4096]).unwrap();
-    assert_ne!(cache_key(&f, &std::fs::metadata(&f).unwrap(), Encoding::Br, &opts), k);
+    assert_ne!(
+        cache_key(&f, &std::fs::metadata(&f).unwrap(), Encoding::Br, &opts),
+        k
+    );
     std::fs::write(&f, vec![b'x'; 2048]).unwrap();
     // mtime 变
     let t = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
-    std::fs::OpenOptions::new().write(true).open(&f).unwrap().set_modified(t).unwrap();
-    assert_ne!(cache_key(&f, &std::fs::metadata(&f).unwrap(), Encoding::Br, &opts), k);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&f)
+        .unwrap()
+        .set_modified(t)
+        .unwrap();
+    assert_ne!(
+        cache_key(&f, &std::fs::metadata(&f).unwrap(), Encoding::Br, &opts),
+        k
+    );
     // 算法/质量变
     assert_ne!(cache_key(&f, &m, Encoding::Gzip, &opts), k);
-    let q6 = StaticLayerOpts { brotli_quality: 6, ..repo_opts(None) };
+    let q6 = StaticLayerOpts {
+        brotli_quality: 6,
+        ..repo_opts(None)
+    };
     assert_ne!(cache_key(&f, &m, Encoding::Br, &q6), k);
     // 回归防护（canonicalize 事故）：原文删除后同 meta 同路径 → 键必须不变，
     // 否则「缓存命中腿」在原文缺席时拆出第二代键、永远 miss。
     std::fs::remove_file(&f).unwrap();
-    assert_eq!(cache_key(&f, &m, Encoding::Br, &opts), k, "删除原文后键必须稳定");
+    assert_eq!(
+        cache_key(&f, &m, Encoding::Br, &opts),
+        k,
+        "删除原文后键必须稳定"
+    );
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -161,12 +202,16 @@ async fn store_then_hit_serves_stored_bytes() {
     std::fs::write(&f, vec![b'a'; 4096]).unwrap();
     let opts = repo_opts(Some(cd.clone()));
     let m = std::fs::metadata(&f).unwrap();
-    let first = compressed_body_or_cache(&f, &m, Encoding::Br, &opts).await.unwrap();
+    let first = compressed_body_or_cache(&f, &m, Encoding::Br, &opts)
+        .await
+        .unwrap();
     assert!(first.len() < 4096, "首调现场压缩");
     let key = cache_key(&f, &m, Encoding::Br, &opts);
     std::fs::write(cd.join(&key), b"SENTINEL").unwrap();
     std::fs::remove_file(&f).unwrap();
-    let second = compressed_body_or_cache(&f, &m, Encoding::Br, &opts).await.unwrap();
+    let second = compressed_body_or_cache(&f, &m, Encoding::Br, &opts)
+        .await
+        .unwrap();
     assert_eq!(second, b"SENTINEL");
     let _ = (std::fs::remove_dir_all(&cd), std::fs::remove_dir_all(&wd));
 }
@@ -204,15 +249,31 @@ async fn new_key_prunes_same_prefix() {
     std::fs::write(&f, vec![b'c'; 4096]).unwrap();
     let opts5 = repo_opts(Some(cd.clone()));
     let m = std::fs::metadata(&f).unwrap();
-    compressed_body_or_cache(&f, &m, Encoding::Br, &opts5).await.unwrap();
+    compressed_body_or_cache(&f, &m, Encoding::Br, &opts5)
+        .await
+        .unwrap();
     // 同 sha1 前缀伪造旧代
-    let prefix = format!("{}-", cache_key(&f, &m, Encoding::Br, &opts5).split('-').next().unwrap());
+    let prefix = format!(
+        "{}-",
+        cache_key(&f, &m, Encoding::Br, &opts5)
+            .split('-')
+            .next()
+            .unwrap()
+    );
     let fake = cd.join(format!("{prefix}deadbeef-br5"));
     std::fs::write(&fake, b"old").unwrap();
-    let opts6 = StaticLayerOpts { brotli_quality: 6, ..repo_opts(Some(cd.clone())) };
-    compressed_body_or_cache(&f, &m, Encoding::Br, &opts6).await.unwrap();
+    let opts6 = StaticLayerOpts {
+        brotli_quality: 6,
+        ..repo_opts(Some(cd.clone()))
+    };
+    compressed_body_or_cache(&f, &m, Encoding::Br, &opts6)
+        .await
+        .unwrap();
     assert!(!fake.exists(), "旧代被清理");
-    assert!(cd.join(cache_key(&f, &m, Encoding::Br, &opts6)).exists(), "新键存在");
+    assert!(
+        cd.join(cache_key(&f, &m, Encoding::Br, &opts6)).exists(),
+        "新键存在"
+    );
     let _ = (std::fs::remove_dir_all(&cd), std::fs::remove_dir_all(&wd));
 }
 
@@ -296,8 +357,11 @@ fn t5_dirs(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
     (cd, wd)
 }
 
-fn hdr<'r>(r: &'r Response, k: &axum::http::HeaderName) -> Option<String> {
-    r.headers().get(k).and_then(|v| v.to_str().ok()).map(|s| s.to_string())
+fn hdr(r: &Response, k: &axum::http::HeaderName) -> Option<String> {
+    r.headers()
+        .get(k)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
 }
 
 /// Given 100KB js + Accept-Encoding: br + 缓存目录
@@ -310,11 +374,24 @@ async fn br_negotiation_serves_compressed_with_vary() {
     let (st, mount) = comp_state(&wd, Some(layer_opts(Some(cd.clone()))), CachePolicy::Auto);
     let r = get(&st, &mount, "/app.js", "br").await;
     assert_eq!(r.status(), 200);
-    assert_eq!(hdr(&r, &axum::http::header::CONTENT_ENCODING).as_deref(), Some("br"));
-    let cl = hdr(&r, &axum::http::header::CONTENT_LENGTH).unwrap().parse::<usize>().unwrap();
+    assert_eq!(
+        hdr(&r, &axum::http::header::CONTENT_ENCODING).as_deref(),
+        Some("br")
+    );
+    let cl = hdr(&r, &axum::http::header::CONTENT_LENGTH)
+        .unwrap()
+        .parse::<usize>()
+        .unwrap();
     assert!(cl < 102_400);
-    assert!(hdr(&r, &axum::http::header::ETAG).unwrap().starts_with("W/"));
-    assert_eq!(hdr(&r, &axum::http::header::VARY).as_deref(), Some("Accept-Encoding"));
+    assert!(
+        hdr(&r, &axum::http::header::ETAG)
+            .unwrap()
+            .starts_with("W/")
+    );
+    assert_eq!(
+        hdr(&r, &axum::http::header::VARY).as_deref(),
+        Some("Accept-Encoding")
+    );
     assert_eq!(std::fs::read_dir(&cd).unwrap().count(), 1, "缓存落盘 1 代");
     let _ = (std::fs::remove_dir_all(&cd), std::fs::remove_dir_all(&wd));
 }
@@ -332,7 +409,10 @@ async fn compressible_identity_still_varies() {
     assert_eq!(hdr(&r, &axum::http::header::CONTENT_ENCODING), None);
     let etag = hdr(&r, &axum::http::header::ETAG).unwrap();
     assert!(!etag.starts_with("W/"), "identity 恒强 ETag");
-    assert_eq!(hdr(&r, &axum::http::header::VARY).as_deref(), Some("Accept-Encoding"));
+    assert_eq!(
+        hdr(&r, &axum::http::header::VARY).as_deref(),
+        Some("Accept-Encoding")
+    );
     let _ = (std::fs::remove_dir_all(&cd), std::fs::remove_dir_all(&wd));
 }
 
@@ -348,11 +428,20 @@ async fn weak_etag_inm_hits_304() {
     let etag = hdr(&r1, &axum::http::header::ETAG).unwrap();
     assert!(etag.starts_with("W/"));
     let mut h = HeaderMap::new();
-    h.insert(axum::http::header::ACCEPT_ENCODING, HeaderValue::from_static("br"));
-    h.insert(axum::http::header::IF_NONE_MATCH, HeaderValue::from_str(&etag).unwrap());
+    h.insert(
+        axum::http::header::ACCEPT_ENCODING,
+        HeaderValue::from_static("br"),
+    );
+    h.insert(
+        axum::http::header::IF_NONE_MATCH,
+        HeaderValue::from_str(&etag).unwrap(),
+    );
     let r2 = serve_web(&st, &mount, "/app.js", "GET", true, &h).await;
     assert_eq!(r2.status(), 304);
-    assert_eq!(hdr(&r2, &axum::http::header::VARY).as_deref(), Some("Accept-Encoding"));
+    assert_eq!(
+        hdr(&r2, &axum::http::header::VARY).as_deref(),
+        Some("Accept-Encoding")
+    );
     let _ = (std::fs::remove_dir_all(&cd), std::fs::remove_dir_all(&wd));
 }
 
@@ -397,13 +486,26 @@ async fn off_switch_byte_identical() {
 #[tokio::test(flavor = "current_thread")]
 async fn html_compressed_but_never_cached() {
     let (cd, wd) = t5_dirs("html");
-    std::fs::write(wd.join("index.html"), format!("<html><head></head><body>{}</body></html>", "x".repeat(4096))).unwrap();
+    std::fs::write(
+        wd.join("index.html"),
+        format!(
+            "<html><head></head><body>{}</body></html>",
+            "x".repeat(4096)
+        ),
+    )
+    .unwrap();
     let (mut st, mount) = comp_state(&wd, Some(layer_opts(Some(cd.clone()))), CachePolicy::Auto);
     st.static_opts.html_meta = Some("__meta".into());
     let r = get(&st, &mount, "/", "br").await;
     assert_eq!(r.status(), 200);
-    assert_eq!(hdr(&r, &axum::http::header::CONTENT_ENCODING).as_deref(), Some("br"));
-    assert_eq!(hdr(&r, &axum::http::header::VARY).as_deref(), Some("Accept-Encoding"));
+    assert_eq!(
+        hdr(&r, &axum::http::header::CONTENT_ENCODING).as_deref(),
+        Some("br")
+    );
+    assert_eq!(
+        hdr(&r, &axum::http::header::VARY).as_deref(),
+        Some("Accept-Encoding")
+    );
     assert_eq!(std::fs::read_dir(&cd).unwrap().count(), 0, "HTML 不落缓存");
     let _ = (std::fs::remove_dir_all(&cd), std::fs::remove_dir_all(&wd));
 }
@@ -416,10 +518,7 @@ async fn html_compressed_but_never_cached() {
 #[test]
 fn default_cache_control_two_tier_table() {
     let cc = |name: &str| default_cache_control(Path::new(name));
-    assert_eq!(
-        cc("app-B2R7x9cW.js"),
-        "public, max-age=31536000, immutable"
-    );
+    assert_eq!(cc("app-B2R7x9cW.js"), "public, max-age=31536000, immutable");
     assert_eq!(
         cc("main.1a2b3c4d.js"),
         "public, max-age=31536000, immutable"
@@ -443,15 +542,24 @@ async fn spa_fallback_meta_not_cross_contaminated() {
     std::fs::write(wd.join("__meta/b.json"), r#"{"title":"B 页"}"#).unwrap();
     std::fs::write(
         wd.join("index.html"),
-        format!("<html><head><title>t</title></head><body>{}</body></html>", "y".repeat(4096)),
+        format!(
+            "<html><head><title>t</title></head><body>{}</body></html>",
+            "y".repeat(4096)
+        ),
     )
     .unwrap();
     let (mut st, mount) = comp_state(&wd, Some(layer_opts(Some(cd.clone()))), CachePolicy::Auto);
     st.static_opts.html_meta = Some("__meta".into());
     let ra = get(&st, &mount, "/a", "br").await;
     let rb = get(&st, &mount, "/b", "br").await;
-    let ba = axum::body::to_bytes(ra.into_body(), 1 << 20).await.unwrap().to_vec();
-    let bb = axum::body::to_bytes(rb.into_body(), 1 << 20).await.unwrap().to_vec();
+    let ba = axum::body::to_bytes(ra.into_body(), 1 << 20)
+        .await
+        .unwrap()
+        .to_vec();
+    let bb = axum::body::to_bytes(rb.into_body(), 1 << 20)
+        .await
+        .unwrap()
+        .to_vec();
     // 注入内容各自正确（经 br 解码验证不串内容）
     let da = decompress_br(&ba);
     let db = decompress_br(&bb);
@@ -481,7 +589,10 @@ async fn explicit_mount_headers_override_default() {
         hdr(&r, &axum::http::header::CACHE_CONTROL).as_deref(),
         Some("public, max-age=60")
     );
-    assert_eq!(hdr(&r, &axum::http::header::CONTENT_ENCODING).as_deref(), Some("br"));
+    assert_eq!(
+        hdr(&r, &axum::http::header::CONTENT_ENCODING).as_deref(),
+        Some("br")
+    );
     let _ = (std::fs::remove_dir_all(&cd), std::fs::remove_dir_all(&wd));
 }
 
@@ -491,11 +602,18 @@ async fn explicit_mount_headers_override_default() {
 #[tokio::test(flavor = "current_thread")]
 async fn html_cache_control_still_wins() {
     let (cd, wd) = t5_dirs("hcc");
-    std::fs::write(wd.join("index.html"), format!("<html><body>{}</body></html>", "z".repeat(4096))).unwrap();
+    std::fs::write(
+        wd.join("index.html"),
+        format!("<html><body>{}</body></html>", "z".repeat(4096)),
+    )
+    .unwrap();
     let (mut st, mount) = comp_state(&wd, Some(layer_opts(None)), CachePolicy::Auto);
     st.static_opts.html_cache_control = Some("no-store".into());
     let r = get(&st, &mount, "/", "br").await;
-    assert_eq!(hdr(&r, &axum::http::header::CACHE_CONTROL).as_deref(), Some("no-store"));
+    assert_eq!(
+        hdr(&r, &axum::http::header::CACHE_CONTROL).as_deref(),
+        Some("no-store")
+    );
     let _ = (std::fs::remove_dir_all(&cd), std::fs::remove_dir_all(&wd));
 }
 
@@ -506,11 +624,18 @@ async fn html_cache_control_still_wins() {
 async fn policy_none_no_cache_control() {
     let (cd, wd) = t5_dirs("none");
     std::fs::write(wd.join("app.js"), vec![b'a'; 4096]).unwrap();
-    std::fs::write(wd.join("index.html"), format!("<html><body>{}</body></html>", "w".repeat(4096))).unwrap();
+    std::fs::write(
+        wd.join("index.html"),
+        format!("<html><body>{}</body></html>", "w".repeat(4096)),
+    )
+    .unwrap();
     let (st, mount) = comp_state(&wd, Some(layer_opts(None)), CachePolicy::None_);
     let r = get(&st, &mount, "/app.js", "br").await;
     assert_eq!(hdr(&r, &axum::http::header::CACHE_CONTROL), None);
-    assert_eq!(hdr(&r, &axum::http::header::VARY).as_deref(), Some("Accept-Encoding"));
+    assert_eq!(
+        hdr(&r, &axum::http::header::VARY).as_deref(),
+        Some("Accept-Encoding")
+    );
     let r = get(&st, &mount, "/", "br").await;
     assert_eq!(hdr(&r, &axum::http::header::CACHE_CONTROL), None);
     let _ = (std::fs::remove_dir_all(&cd), std::fs::remove_dir_all(&wd));
@@ -531,8 +656,14 @@ async fn cache_control_on_304() {
     );
     let etag = hdr(&r1, &axum::http::header::ETAG).unwrap();
     let mut h = HeaderMap::new();
-    h.insert(axum::http::header::ACCEPT_ENCODING, HeaderValue::from_static("br"));
-    h.insert(axum::http::header::IF_NONE_MATCH, HeaderValue::from_str(&etag).unwrap());
+    h.insert(
+        axum::http::header::ACCEPT_ENCODING,
+        HeaderValue::from_static("br"),
+    );
+    h.insert(
+        axum::http::header::IF_NONE_MATCH,
+        HeaderValue::from_str(&etag).unwrap(),
+    );
     let r2 = serve_web(&st, &mount, "/app-B2R7x9cW.js", "GET", true, &h).await;
     assert_eq!(r2.status(), 304);
     assert_eq!(

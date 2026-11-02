@@ -777,7 +777,7 @@ pub(crate) fn static_opts_of(
         other => {
             return Err(format!(
                 "server.static.web_cache_policy: {other:?} 非法（合法 auto|none）"
-            ))
+            ));
         }
     };
     if !sc.compression {
@@ -807,7 +807,10 @@ pub(crate) fn static_opts_of(
         && let Err(e) = std::fs::create_dir_all(d)
     {
         // 不 panic：运行期写缓存时 fail-open（T4 仓库层回退纯内存直压）。
-        eprintln!("warn: server.static.compress_cache_dir 创建失败（{e}）：{}——将回退纯内存直压", d.display());
+        eprintln!(
+            "warn: server.static.compress_cache_dir 创建失败（{e}）：{}——将回退纯内存直压",
+            d.display()
+        );
     }
     Ok((
         Some(serve::StaticLayerOpts {
@@ -815,7 +818,12 @@ pub(crate) fn static_opts_of(
             compress_types: if sc.compress_types.is_empty() {
                 None
             } else {
-                Some(sc.compress_types.iter().map(|s| s.to_ascii_lowercase()).collect())
+                Some(
+                    sc.compress_types
+                        .iter()
+                        .map(|s| s.to_ascii_lowercase())
+                        .collect(),
+                )
             },
             brotli_quality: sc.brotli_quality,
             gzip_level: sc.gzip_level,

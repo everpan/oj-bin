@@ -66,8 +66,8 @@ pub(crate) async fn run_route(
             // 转 Response 后 to_bytes 会挂死；CL 规则经 head_mirror_cl 单一出处。
             if mirror_head {
                 let is_stream = cap.stream.is_some();
-                let body_len = (!is_stream).then(|| cap.body.len());
-                let status = StatusCode::from_u16(cap.status as u16).unwrap_or(StatusCode::OK);
+                let body_len = (!is_stream).then_some(cap.body.len());
+                let status = StatusCode::from_u16(cap.status).unwrap_or(StatusCode::OK);
                 cap.body = Vec::new();
                 cap.stream = None;
                 // 直接在 cap.headers（Vec，保多值 Set-Cookie）上操作：先摘除自带 CL，
@@ -75,9 +75,7 @@ pub(crate) async fn run_route(
                 let keep = head_mirror_keep(status, body_len);
                 cap.headers
                     .retain(|(k, _)| !k.eq_ignore_ascii_case("content-length"));
-                if keep
-                    && let Some(len) = body_len
-                {
+                if keep && let Some(len) = body_len {
                     cap.headers.push(("Content-Length".into(), len.to_string()));
                 }
             }
@@ -104,7 +102,11 @@ pub(crate) fn head_mirror_keep(status: StatusCode, buffered_len: Option<usize>) 
 }
 
 /// HEAD 镜像 CL 规则应用于 HeaderMap（RunFail 腿）。
-pub(crate) fn head_mirror_cl(headers: &mut HeaderMap, status: StatusCode, buffered_len: Option<usize>) {
+pub(crate) fn head_mirror_cl(
+    headers: &mut HeaderMap,
+    status: StatusCode,
+    buffered_len: Option<usize>,
+) {
     if head_mirror_keep(status, buffered_len)
         && let Some(len) = buffered_len
         && let Ok(v) = HeaderValue::from_str(&len.to_string())
@@ -120,7 +122,10 @@ pub(crate) fn head_mirror_cl(headers: &mut HeaderMap, status: StatusCode, buffer
 pub(crate) async fn apply_head_mirror(r: &mut Response) {
     let status = r.status();
     let (mut parts, body) = std::mem::take(r).into_parts();
-    let buffered = axum::body::to_bytes(body, 64 * 1024 * 1024).await.ok().map(|b| b.len());
+    let buffered = axum::body::to_bytes(body, 64 * 1024 * 1024)
+        .await
+        .ok()
+        .map(|b| b.len());
     head_mirror_cl(&mut parts.headers, status, buffered);
     *r = Response::from_parts(parts, axum::body::Body::empty());
 }

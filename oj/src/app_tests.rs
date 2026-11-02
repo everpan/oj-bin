@@ -973,17 +973,29 @@ fn static_opts_of_validates_and_three_state_dir() {
         brotli_quality: 12,
         ..Default::default()
     };
-    assert!(static_opts_of(&sc, &dir).unwrap_err().contains("brotli_quality"));
+    assert!(
+        static_opts_of(&sc, &dir)
+            .unwrap_err()
+            .contains("brotli_quality")
+    );
     let sc = config::StaticConf {
         gzip_level: 0,
         ..Default::default()
     };
-    assert!(static_opts_of(&sc, &dir).unwrap_err().contains("gzip_level"));
+    assert!(
+        static_opts_of(&sc, &dir)
+            .unwrap_err()
+            .contains("gzip_level")
+    );
     let sc = config::StaticConf {
         web_cache_policy: "fast".into(),
         ..Default::default()
     };
-    assert!(static_opts_of(&sc, &dir).unwrap_err().contains("web_cache_policy"));
+    assert!(
+        static_opts_of(&sc, &dir)
+            .unwrap_err()
+            .contains("web_cache_policy")
+    );
     let sc = config::StaticConf {
         compression: false,
         ..Default::default()
@@ -999,10 +1011,20 @@ fn static_opts_of_validates_and_three_state_dir() {
         compress_cache_dir: Some(String::new()),
         ..Default::default()
     };
-    assert!(static_opts_of(&sc, &dir).unwrap().0.unwrap().cache_dir.is_none());
+    assert!(
+        static_opts_of(&sc, &dir)
+            .unwrap()
+            .0
+            .unwrap()
+            .cache_dir
+            .is_none()
+    );
     let sc = config::StaticConf {
         web_cache_policy: "none".into(),
         ..Default::default()
     };
-    assert_eq!(static_opts_of(&sc, &dir).unwrap().1, serve::CachePolicy::None_);
+    assert_eq!(
+        static_opts_of(&sc, &dir).unwrap().1,
+        serve::CachePolicy::None_
+    );
 }

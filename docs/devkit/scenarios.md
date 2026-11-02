@@ -4542,3 +4542,40 @@ export default {
 | 取消后 sqlite 上 rows=0 / 网络库 rows>0 | sqlite 全单事务：cancel/fail 整回滚；PG/MySQL 每批事务：已提交批保留。按 state 分流，勿假设 rows>0 |
 | 大 CSV 把内存吃爆 | blob 源走 `read_range` 1MiB 窗口流式读，缓冲有界；别用内联 `rows` 传大数据（`max_rows` 100 万 / `max_bytes` 512MiB 配额，超限登记前/中途拒，点名键不静默截断） |
 | 想拿 `samples` 的 line 当「第 N 条数据」 | line 是源文件绝对行号（csv header 计 1）——给运营指原文件行定位；换算数据条数自行减 header 偏移 |
+
+## 场景 69：零配置静态站优化——压缩、两档缓存与 HEAD 探针（v0.1.116）
+
+**需求**：`oj serve` 单进程出 API + SPA 静态，无前置 nginx 也要有 gzip/brotli 压缩与
+正确缓存策略；uptime 探针不再吃 405。
+
+**配置（零配置即生效，以下是全量可调面）**：
+
+```yaml
+server:
+  static:                      # 全默认 = 压缩与策略双开
+    compression: true          # false = 不协商不压缩（逐字节回退 v0.1.115）
+    compress_min_length: 1024
+    brotli_quality: 5          # 1..=11；高首页延迟敏感就别拉满
+    gzip_level: 6              # 1..=9
+    compress_cache_dir:        # 缺省 <config_dir>/compress-cache；"" = 内存直压
+    web_cache_policy: auto     # auto | none
+```
+
+**代码（什么都不用写）**：`dist` 里是任意 SPA 构建产物（Vite/webpack 均可）。
+
+**验证**：
+
+```bash
+curl -sI -H 'Accept-Encoding: br' https://host/assets/index-B2R7x9cW.js | grep -iE 'content-encoding|vary|cache-control|etag'
+# content-encoding: br / vary: Accept-Encoding / cache-control: public, max-age=31536000, immutable / etag: W/"…"
+curl -sI https://host/ | grep -i cache-control        # → no-cache（HTML 恒校验）
+curl -sI https://host/modules.json | grep -i cache-control  # → no-cache（清单恒校验）
+curl -I https://host/v1/api/some-get-only/            # → 200 空体（HEAD 镜像 GET），不再 405
+```
+
+**常见坑**：
+- 未哈希文件名（`antd.js`、`config-production.js`）**不会**被 immutable——恒 `no-cache`
+  恒校验，升版即生效；要长缓存给该挂载 `mounts[].headers` 显式配 `Cache-Control`。
+- 前置 CDN 必须按 `Vary: Accept-Encoding` 分键；确认不了 → `compression: false`。
+- HEAD 探针**真实执行 handler**：选轻路由；受保护端点无 token 探针得 401 属正常语义。
+- 只读根部署（distroless 等）：`compress_cache_dir: ""` 或指 tmpfs，写失败自动回退内存直压。

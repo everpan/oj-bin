@@ -16,6 +16,32 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.116
+
+**feat（serve，OJ-9/10/11 前端性能专项）**：静态层压缩 + 默认缓存策略 + API HEAD 镜像。
+**本版含三处默认行为变更**（存量部署升级后响应头面即变，详见下）。
+
+- **OJ-9 静态层按需压缩（默认开）**：web 挂载 GET/HEAD 按 `Accept-Encoding` 协商输出
+  br>gzip（`Vary: Accept-Encoding` 恒随可压资源，identity 变体亦带——防中间缓存变体互串）。
+  压缩产物**落盘缓存**（缺省 `<config_dir>/compress-cache`，派生数据可整删；缓存键含
+  mtime+len+inode+算法+质量，任一变化自然换代；写新清旧恒一代），single-flight + 信号量
+  钳并发防冷缓存 CPU 风暴；压缩后 ≥ 原文回 identity；ETag 弱化 `W/` + `If-None-Match`
+  弱比较（304 跨编码正确）；HTML（meta 注入/动态 handler）恒内存直压不落缓存。
+  关闭：`server.static.compression: false`。
+- **OJ-10 两档制默认缓存策略（默认开）**：文件名哈希段（`[-._]` 分隔末段 ≥8 且含数字与
+  字母）→ `immutable` 一年；**其余一律 `no-cache` 恒校验**（未哈希资产不误钉；要长缓存
+  用 `mounts[].headers` 显式配）。304 与 200 同策略（带 Cache-Control/Vary）。
+  关闭：`server.static.web_cache_policy: none`。
+- **OJ-11 API HEAD 自动镜像 GET**：仅声明 `get()` 的端点 HEAD 不再 405——以 GET 语义
+  贯穿运行（guard/`http.method` 均见 `"GET"`），同状态码/同头/**空体**，`Content-Length`
+  保留 GET 原值（流式与 204/1xx 不带 CL）；显式 `head()` 恒优先；非安全方法仍 405
+  （现补 `Allow` 头，RFC 9110 §15.5.5）；证书过期门扩及 HEAD。**HEAD 不再是无副作用
+  空操作**——探针真实执行 handler，重查询/副作用随探针触发，探针请选轻路由。
+- **配置**：新增 `server.static:` 子段七键（`compression`/`compress_min_length`/
+  `compress_types`/`brotli_quality`/`gzip_level`/`compress_cache_dir`/`web_cache_policy`）；
+  越界/非法值装配期 fail-fast；启动时打一行 INFO（默认生效项 + 关闭键名）。
+- **硬排除地板集**（列出也不压）：png/jpeg/gif/webp/avif/ico/pdf/woff2。
+
 ## v0.1.115
 
 **feat（db，REQ-12 批量导入三件套）**：`db.import` / `db.importStatus` / `db.importCancel`。
