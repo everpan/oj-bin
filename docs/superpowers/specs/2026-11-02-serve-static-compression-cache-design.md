@@ -2,7 +2,7 @@
 
 - 日期：2026-11-02 · 状态：四路评审（架构/性能/网络/builder-check）意见已合入；
   两处偏离原 PR 文本的裁决（D10 两档制、D9 砍伴生直服）**提出方已确认**；
-  §9 复核意见：网络已回并合入（CL 三例外/统一空化点/探针成本/Allow），架构待回
+  §9 复核意见：网络、架构均已回并合入，**四路评审全部收口**
 - 基线：oj v0.1.115 · 来源：oj-module 提出的 OJ-9（PR-8）/ OJ-10（PR-9）/ OJ-11（PR-10）诉求文本
 - 一句话：`oj serve` 的 web 静态挂载零配置获得「br>gzip 传输压缩（产物落盘缓存）」与
   「内容哈希 immutable、其余恒校验」的正确默认，外加 API 路由 HEAD 镜像 GET；
@@ -160,8 +160,10 @@ br quality / gzip level / cache dir（None=内存直压）。启动时 web 挂�
 7. 缓存策略两档：哈希段 immutable；`config-production.js` 落 no-cache；点分 hex 命中；
    SPA 深链接回落 → no-cache；`none` 全无；显式头覆盖兜底；`html_cache_control` 仍胜。
 8. HEAD：静态 HEAD 压缩且显式 CL=压缩后长度；API 镜像 GET-only 同状态码/头/空体；
-   GET 204 → HEAD 无 CL；`finish()` 流式 → HEAD 无 CL；admit 失败腿（401）体空头保留；
-   显式 head() 覆盖；POST-only 405 且带 `Allow`；302 端点 Location 保留；dev/release 两腿。
+   公共端点 HEAD 无 token → 200 空体（`http.method` 见 "GET"）；GET 204 → HEAD 无 CL；
+   `finish()` 流式 → HEAD 无 CL；admit 失败腿（401）体空头保留；显式 head() 覆盖；
+   POST-only 405 且带 `Allow`；二次 lookup Conflict → 500；302 端点 Location 保留；
+   证书过期期 HEAD 403；blob HEAD 仍 404；dev/release 两腿。
 9. off 逐字节现状。
 
 ## 7. 留给实现者
@@ -183,12 +185,24 @@ brotli/flate2 API 用法、single-flight 实现细节（`tokio::sync` 原语选�
 意图：仅声明 `get()` 的 API 端点收到 HEAD（uptime 探针 / LB 健康检查）不再 405，
 免去每工程手写 `head()` 镜像 handler；显式 `head()` 恒优先。
 
-设计：
-- **R1 镜像点（两腿同规则）**：release 腿——HEAD 得 `MethodNotAllowed` 时对同 path 二次
-  `lookup(path, "GET")`，命中即以 GET handler 链运行并标记 `mirror_head`；dev 兜底腿——
-  verb==HEAD 且 head 方法未注册而 get 已注册时同理。判定与 405 同源（启动期契约表）。
-- **R2 显式优先**：HEAD 先走精确命中（注册了 head 链即原样运行）。
+设计（总原则，架构复核钉死：**HEAD 的响应 = 同 URL GET 本会得到的响应**）：
+- **R1 表腿镜像**：HEAD 得 `MethodNotAllowed` 时对同 path 二次 `lookup(path, "GET")`，
+  结果复用第一段 match 的同一映射——Hit→以**表内 get 链**（`Hit.handler`，组路由
+  `"cccc.get"` 现成）运行并标记 `mirror_head`；Conflict→500 原文案（不谎报 405）；
+  其余维持 405。
+- **dev 兜底腿**：dev 的 GET-only 路由本就在表内（目录镜像 pattern 注册），常规路径由
+  表腿覆盖；兜底腿（表外文件）HEAD 一律折成 "get" 链走兜底（模块缺 get 与 GET 请求
+  同错同文案）；导出了 head 的文件在表内，显式优先天然由表命中承担。
+- **R2 显式优先**：HEAD 先走精确命中（注册了 head 链即原样运行，不镜像）。
 - **R3 非安全方法不动**：POST/PUT/DELETE/PATCH 仍 405。
+- **GET 语义贯穿**：镜像请求 `guard.verify` 与 `RequestInfo.method` 均传 `"GET"`
+  （镜像契约 = 「当这个 HEAD 是 GET」）——按方法设规则的 oj-auth 对公共 GET 端点的
+  无 token HEAD 探针放行（免配置探针正是本诉求头号用例）；不透传 "HEAD"。
+- **副作用声明**：镜像真实执行 handler（含副作用——发通知/写审计会被 HEAD 触发），
+  幂等责任在 handler 作者；有副作用的「GET」应显式声明 POST 或自写 head() 顶掉镜像。
+- **已知限制**：`/blob` 腿不做镜像（门是 `verb=="GET"`；做全需 blob 轴加 metadata 方法
+  = ABI bump，不值）——HEAD on /blob 维持 404，下载型健康检查用 `/health`；
+  证书过期门扩为 GET|HEAD（一行，过期期 HEAD 也 403，保探针判活真实性）。
 - **体剥离与 Content-Length（D18 + 网络复核）**：镜像走完整前置管线与 handler（鉴权一致：
   受保护端点 HEAD 无 token → 401）；空化点在 `run_route` 转出 Response 的**统一出口**
   （成功捕获与 admit 失败 `RunFail` 两路汇合处，覆盖两腿）。状态码与全部头保留；
@@ -200,7 +214,8 @@ brotli/flate2 API 用法、single-flight 实现细节（`tokio::sync` 原语选�
   空操作——探针执行完整 handler，重查询/副作用会随探针触发」）；SKILL.md 陷阱：探针选
   轻路由、按状态码族判活；残余 405 顺修补 `Allow` 头（RFC 9110 §15.5.5 MUST，release 表
   与 dev 兜底各一处）；部署提示：LB 常把 3xx 判探针失败。
-- **验收**：PR §5 三条 + 受保护端点 HEAD 未带 token → 401（进 SKILL.md 陷阱速查）。
+- **验收**：PR §5 三条 + 受保护端点 HEAD 无 token → 401 + **公共 GET 端点 HEAD 无 token
+  → 200 空体**（进 SKILL.md 陷阱速查）。
 - **测试**：见 §6.8。
 
 ## 10. 评审记录（2026-11-02）
@@ -209,6 +224,7 @@ brotli/flate2 API 用法、single-flight 实现细节（`tokio::sync` 原语选�
 共识合入：HTML 缓存隔离（D3）、两档缓存策略（D10）、弱比较+变体选择序+304 完整头（D7/D11）、
 single-flight（D13）、inode 键+代际清理（D14）、`server.static:` 子段（D15）、
 `*`→gzip（D16）、stat 先行懒读（D17）。分歧已裁：伴生直服砍除（D9，架构/网络二比一，
-提出方确认）。§9 网络复核 5 条已合入：CL 三例外（缓冲体∧非 1xx/204 才显式 set）、
-空化点统一出口（覆盖 RunFail 腿）、探针成本进文档、残余 405 补 `Allow`。
-遗留：§9 架构复核待回。
+提出方确认）。§9 网络 5 条 + 架构 5 条复核均已合入：CL 三例外、统一空化点、
+GET 语义贯穿（guard/RequestInfo 均传 "GET"）、二次 lookup 复用同一映射、
+dev 兜底腿折 "get" 链、证书过期门扩 GET|HEAD、/blob 不镜像进已知限制、
+副作用声明、405 补 `Allow`。**评审闭环，无遗留。**
