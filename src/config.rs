@@ -160,6 +160,46 @@ pub struct RpcCfg {
     pub allow_anonymous: bool,
 }
 
+/// web 静态层压缩与默认缓存策略（v0.1.116 OJ-9/10，`server.static:` 子段）。
+/// 值校验（quality 范围 / policy 枚举 / cache_dir 路径解析）在装配层 fail-fast——
+/// config 层只存原文。
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct StaticConf {
+    /// 静态压缩总开关：false = 不协商不压缩（连 Vary 也不加，逐字节同 v0.1.115）。
+    pub compression: bool,
+    /// 压缩最小体积（字节）；小于该长度原样出。
+    pub compress_min_length: u64,
+    /// 可压缩扩展名**全量替换**内置集；空 = 内置集（见 serve 侧 COMPRESS_BUILTIN；
+    /// 硬排除地板集图片/pdf/woff2 列了也不压）。
+    pub compress_types: Vec<String>,
+    /// brotli 质量档（1..=11），默认 5——过高会拉长首压延迟（CPU 尖峰防线之一）。
+    pub brotli_quality: u8,
+    /// gzip level（1..=9），默认 6。
+    pub gzip_level: u8,
+    /// 压缩缓存目录**三态**：未配置（Default `""`）= `<config_dir>/compress-cache`；
+    /// 显式 `""` = 关闭落盘（纯内存直压）；其余 = 目录路径（相对 → 相对 config 目录，
+    /// `logs_dir` 同款）。目录内容是派生数据，可整目录删除。
+    pub compress_cache_dir: String,
+    /// web 挂载默认缓存策略：`auto`（默认，哈希→immutable / 其余→no-cache）| `none`
+    /// （不加任何 Cache-Control，v0.1.115 行为）。
+    pub web_cache_policy: String,
+}
+
+impl Default for StaticConf {
+    fn default() -> Self {
+        Self {
+            compression: true,
+            compress_min_length: 1024,
+            compress_types: Vec::new(),
+            brotli_quality: 5,
+            gzip_level: 6,
+            compress_cache_dir: String::new(),
+            web_cache_policy: "auto".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ServerCfg {
@@ -187,6 +227,10 @@ pub struct ServerCfg {
     /// 动态 handler 返回的 `cache_control` 优先于本项。
     #[serde(default)]
     pub html_cache_control: Option<String>,
+    /// 静态层压缩与默认缓存策略（v0.1.116 OJ-9/10，`server.static:` 子段；`static`
+    /// 是 Rust 关键字，serde rename 进出）。缺席 = 全默认（压缩与策略均开）。
+    #[serde(default, rename = "static")]
+    pub static_conf: StaticConf,
     /// 时长字符串（如 "30s"），parse_duration 解析。
     pub timeout: String,
     pub pool_size: u32,
@@ -272,6 +316,7 @@ impl Default for ServerCfg {
             html_meta: None,
             html_meta_handler: None,
             html_cache_control: None,
+            static_conf: StaticConf::default(),
             timeout: "30s".into(),
             pool_size: 4,
             max_upload_bytes: 10 * 1024 * 1024,

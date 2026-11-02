@@ -1,5 +1,37 @@
 use super::*;
 
+/// B2 共享 fixture（OJ-9/10 计划）：最小合法 server 段 + 追加片段。
+fn base_server_yaml(extra: &str) -> String {
+    format!(
+        "server:\n  host: \"0.0.0.0\"\n  port: 9778\n  timeout: 30s\n  pool_size: 1\n  \
+         max_upload_bytes: 1048576\n  logs_max_m: 10\n  logs_keep_files: 2\n{extra}"
+    )
+}
+
+/// server.static 子段（v0.1.116 OJ-9/10）：部分覆盖未提及键取默认；段缺席全默认。
+#[test]
+fn static_conf_defaults_and_parse() {
+    // Given: base_yaml 追加 static 段，仅覆盖 web_cache_policy 与 brotli_quality
+    // When: 反序列化 Config
+    // Then: 覆盖键生效；未覆盖键取默认（compression=true、min_length=1024、cache_dir=""）
+    let c: Config = serde_yaml::from_str(&base_server_yaml(
+        "  static:\n    web_cache_policy: none\n    brotli_quality: 9\n",
+    ))
+    .unwrap();
+    assert_eq!(c.server.static_conf.web_cache_policy, "none");
+    assert_eq!(c.server.static_conf.brotli_quality, 9);
+    assert!(c.server.static_conf.compression);
+    assert_eq!(c.server.static_conf.compress_min_length, 1024);
+    assert_eq!(c.server.static_conf.compress_cache_dir, "");
+    assert!(c.server.static_conf.compress_types.is_empty());
+
+    // Given: base_yaml 不含 static 段
+    // When: 反序列化 Config
+    // Then: 整段 == StaticConf::default()
+    let c2: Config = serde_yaml::from_str(&base_server_yaml("")).unwrap();
+    assert_eq!(c2.server.static_conf, StaticConf::default());
+}
+
 /// http_sso 校验矩阵（v0.1.61）：kind 白名单 / form 必 success_when / cas2 必两 URL /
 /// name 禁 `:` / 缺省拒 http，allow_http 放行。
 #[test]
