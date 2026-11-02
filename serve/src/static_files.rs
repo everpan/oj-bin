@@ -265,16 +265,125 @@ pub(crate) fn etag_of(m: &std::fs::Metadata) -> Option<String> {
     Some(format!(r#""{nanos:x}-{len:x}""#))
 }
 
-/// If-None-Match 命中判定（弱比较，务实口径）：`*` 或值列表包含本 ETag 即命中。
+/// If-None-Match 命中判定（**弱比较**，v0.1.116 起剥 `W/` 比较 opaque——压缩变体
+/// 发弱 ETag 后客户端原样回传，精确串比较会永久 miss；RFC 9110 §8.8.3.2）。
 pub(crate) fn if_none_match_hit(headers: &HeaderMap, etag: &str) -> bool {
+    fn opaque(e: &str) -> &str {
+        e.trim().strip_prefix("W/").unwrap_or(e.trim())
+    }
+    let target = opaque(etag);
     match headers.get(axum::http::header::IF_NONE_MATCH) {
         Some(v) => match v.to_str() {
             Ok(s) if s.trim() == "*" => true,
-            Ok(s) => s.split(',').any(|t| t.trim() == etag),
+            Ok(s) => s.split(',').any(|t| opaque(t) == target),
             Err(_) => false,
         },
         None => false,
     }
+}
+
+// —— 压缩内核（v0.1.116 OJ-9）——
+
+/// 硬排除地板集（防呆不可关，`compress_types` 列了也不压）：原生已压缩/图格式，
+/// 压缩无收益甚至变大。
+pub(crate) const COMPRESS_FLOOR: [&str; 9] =
+    ["png", "jpg", "jpeg", "gif", "webp", "avif", "ico", "pdf", "woff2"];
+
+/// 内置可压缩集（`compress_types` 缺省时的默认判定集）。
+pub(crate) const COMPRESS_BUILTIN: [&str; 15] = [
+    "html", "htm", "css", "js", "mjs", "json", "map", "txt", "md", "svg", "xml", "yaml", "yml",
+    "woff", "ttf",
+];
+
+/// 协商结果（br > gzip 固定优先级，spec R1/D16——不看 q 值高低）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Encoding {
+    Br,
+    Gzip,
+    Identity,
+}
+
+/// Accept-Encoding 协商：`get_all` 合并（HTTP/2 多值头合法）、token 小写化、
+/// `;q=` 解析（缺省 1.0，q=0 排除）；仅认显式 `br`/`gzip`，`*` 视为仅提供 gzip；
+/// 坏头/无头/未知码 → Identity。
+pub(crate) fn negotiate_encoding(headers: &HeaderMap) -> Encoding {
+    let mut br = 0.0f32;
+    let mut gz = 0.0f32;
+    for v in headers.get_all(axum::http::header::ACCEPT_ENCODING) {
+        let Ok(s) = v.to_str() else {
+            return Encoding::Identity;
+        };
+        for part in s.split(',') {
+            let (tok, q) = match part.split_once(';') {
+                Some((t, p)) => (
+                    t,
+                    p.trim()
+                        .strip_prefix("q=")
+                        .and_then(|q| q.trim().parse::<f32>().ok())
+                        .unwrap_or(1.0),
+                ),
+                None => (part, 1.0),
+            };
+            match tok.trim().to_ascii_lowercase().as_str() {
+                "br" if q > 0.0 => br = br.max(q),
+                "gzip" if q > 0.0 => gz = gz.max(q),
+                "*" if q > 0.0 => gz = gz.max(q),
+                _ => {}
+            }
+        }
+    }
+    if br > 0.0 {
+        Encoding::Br
+    } else if gz > 0.0 {
+        Encoding::Gzip
+    } else {
+        Encoding::Identity
+    }
+}
+
+/// 扩展名是否可压：min_length 门 → 地板集恒拦 → 内置/替换集判定。
+pub(crate) fn is_compressible(ext: &str, len: u64, opts: &StaticLayerOpts) -> bool {
+    if len < opts.compress_min_length {
+        return false;
+    }
+    let e = ext.to_ascii_lowercase();
+    if COMPRESS_FLOOR.contains(&e.as_str()) {
+        return false;
+    }
+    match &opts.compress_types {
+        None => COMPRESS_BUILTIN.contains(&e.as_str()),
+        Some(set) => set.contains(&e),
+    }
+}
+
+/// 压缩（spawn_blocking 内执行，防 CPU 尖峰占 runtime 线程）；None = 压缩后 ≥ 原文
+/// （spec D6 负收益防线，调用方出 identity）。br：quality/lgwin=22；gzip：level。
+pub(crate) async fn compress_body(
+    enc: Encoding,
+    body: Vec<u8>,
+    opts: &StaticLayerOpts,
+) -> Option<Vec<u8>> {
+    let (q_br, q_gz) = (opts.brotli_quality as u32, opts.gzip_level as u32);
+    tokio::task::spawn_blocking(move || match enc {
+        Encoding::Br => {
+            use std::io::Write;
+            let mut out = Vec::with_capacity(body.len() / 4);
+            let mut w = brotli::CompressorWriter::new(&mut out, 4096, q_br, 22);
+            w.write_all(&body).ok()?;
+            drop(w); // drop 触发 flush 收尾
+            (out.len() < body.len()).then_some(out)
+        }
+        Encoding::Gzip => {
+            use std::io::Write;
+            let mut w = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(q_gz));
+            w.write_all(&body).ok()?;
+            w.finish().ok().filter(|o| o.len() < body.len())
+        }
+        Encoding::Identity => None,
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 pub(crate) fn file_response(file: &Path, body: Vec<u8>) -> Response {
@@ -347,3 +456,7 @@ pub(crate) fn site_headers<'a>(st: &'a AppState, site: &'a WebMount) -> Vec<(Str
     }
     out
 }
+
+#[cfg(test)]
+#[path = "static_files_tests.rs"]
+pub(crate) mod tests;
