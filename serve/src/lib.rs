@@ -809,6 +809,26 @@ use crate::meta_inject::*;
 use crate::multipart::*;
 use crate::static_files::*;
 
+/// 带 oj 模块加载器的 actor（project_root = 路由根：api 文件全在其下，clamp 可达）。
+/// lib.rs 级 cfg(test) 助手——lib_tests 与 static_files_tests 共享（DRY）。
+#[cfg(test)]
+pub(crate) fn make_actor(root: PathBuf, ts: bool) -> JsActor {
+    use only_js::bridge::{Extras, InMemoryKV, LoaderShared, SchemaRegistry};
+    JsActor::new(move || {
+        only_js::bridge::Bridge::with_dbs_and_loader(
+            HashMap::new(),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            Some(Arc::new(LoaderShared {
+                project_root: root.clone(),
+                ts,
+            })),
+            Extras::default(),
+        )
+    })
+}
+
 #[cfg(test)]
 #[path = "lib_tests.rs"]
 pub(crate) mod tests;

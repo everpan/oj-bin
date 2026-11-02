@@ -73,23 +73,6 @@ impl Drop for TempRoutes {
     }
 }
 
-/// 带 oj 模块加载器的 actor（project_root = 路由根：api 文件全在其下，clamp 可达）。
-pub(crate) fn make_actor(root: PathBuf, ts: bool) -> JsActor {
-    JsActor::new(move || {
-        Bridge::with_dbs_and_loader(
-            HashMap::new(),
-            Arc::new(InMemoryKV::new()),
-            SchemaRegistry::new(),
-            false,
-            Some(Arc::new(LoaderShared {
-                project_root: root.clone(),
-                ts,
-            })),
-            Extras::default(),
-        )
-    })
-}
-
 pub(crate) async fn spawn_server(
     base: &str,
     dir: PathBuf,

@@ -21,36 +21,95 @@ pub(crate) async fn serve_web(
             .extension()
             .and_then(|e| e.to_str())
             .is_some_and(|e| e.eq_ignore_ascii_case("html"));
-        // 条件请求（perf F9，非 HTML 资产）：ETag(mtime-len) 命中 If-None-Match →
-        // 304 免读盘免传输。HTML 不做——体经 meta 注入后与文件不再逐字节一致，
-        // 且缓存策略本就归 `html_cache_control` 管。
-        let etag = if is_html {
-            None
-        } else {
-            tokio::fs::metadata(&file)
-                .await
-                .ok()
-                .and_then(|m| etag_of(&m))
-        };
-        if let Some(etag) = &etag
-            && if_none_match_hit(headers, etag)
-        {
-            let mut r = Response::new(axum::body::Body::empty());
-            *r.status_mut() = StatusCode::NOT_MODIFIED;
-            if let Ok(v) = axum::http::HeaderValue::from_str(etag) {
-                r.headers_mut().insert(axum::http::header::ETAG, v);
-            }
-            return r;
-        }
-        if let Ok(body) = tokio::fs::read(&file).await {
-            let mut r = static_page(st, &w.root, rel_path, &file, body).await;
-            if let Some(etag) = &etag
-                && let Ok(v) = axum::http::HeaderValue::from_str(etag)
+        // stat 先行（spec D17）：ETag / min_length 门控 / 缓存键同一次 metadata 取齐，
+        // 原文只在需要的腿懒读（缓存命中腿不读盘）。
+        if let Ok(m) = tokio::fs::metadata(&file).await {
+            let opts = st.static_opts.static_layer.as_ref();
+            let enc = if opts.is_some() {
+                negotiate_encoding(headers)
+            } else {
+                Encoding::Identity
+            };
+            let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let compressible = opts.is_some_and(|o| is_compressible(ext, m.len(), o));
+            // 非 HTML 才有 ETag（HTML 体经 meta 注入后与文件不再逐字节一致）；可压资源
+            // 的 br/gzip 变体以弱 ETag 服务（spec D7，变体选择先于 INM 校验）。
+            let etag = (!is_html).then(|| etag_of(&m)).flatten();
+            let weak = compressible && enc != Encoding::Identity;
+            let served_etag = etag
+                .as_deref()
+                .map(|e| if weak { format!("W/{e}") } else { e.to_string() });
+            if let Some(e) = &served_etag
+                && if_none_match_hit(headers, e)
             {
-                r.headers_mut().insert(axum::http::header::ETAG, v);
+                let mut r = Response::new(axum::body::Body::empty());
+                *r.status_mut() = StatusCode::NOT_MODIFIED;
+                if let Ok(v) = axum::http::HeaderValue::from_str(e) {
+                    r.headers_mut().insert(axum::http::header::ETAG, v);
+                }
+                finish_static_headers(st, w, &mut r, compressible, &file);
+                return r;
             }
-            apply_custom_headers(&mut r, &site_headers(st, w));
-            return r;
+            // 压缩腿（仅非 HTML）：缓存直出或现场压——原文不读（懒读收益腿）。
+            if !is_html
+                && compressible
+                && enc != Encoding::Identity
+                && let Some(o) = opts
+                && let Some(out) = compressed_body_or_cache(&file, &m, enc, o).await
+            {
+                let out_len = out.len();
+                tracing::debug!(
+                    target: "serve::static",
+                    algo = if enc == Encoding::Br { "br" } else { "gzip" },
+                    from = m.len(), to = out_len, file = %file.display()
+                );
+                let mut r = Response::new(axum::body::Body::from(out));
+                r.headers_mut().insert(
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::HeaderValue::from_str(mime_of(&file)).expect("valid mime"),
+                );
+                r.headers_mut().insert(
+                    axum::http::header::CONTENT_ENCODING,
+                    axum::http::HeaderValue::from_static(match enc {
+                        Encoding::Br => "br",
+                        Encoding::Gzip => "gzip",
+                        Encoding::Identity => "identity",
+                    }),
+                );
+                if let Some(e) = &served_etag
+                    && let Ok(v) = axum::http::HeaderValue::from_str(e)
+                {
+                    r.headers_mut().insert(axum::http::header::ETAG, v);
+                }
+                if let Ok(v) = axum::http::HeaderValue::from_str(&out_len.to_string()) {
+                    r.headers_mut().insert(axum::http::header::CONTENT_LENGTH, v);
+                }
+                finish_static_headers(st, w, &mut r, compressible, &file);
+                return r;
+            }
+            // identity / 无收益 / HTML：读原文（懒读兜底腿）。
+            if let Ok(body) = tokio::fs::read(&file).await {
+                let mut r = if is_html {
+                    static_page(st, &w.root, rel_path, &file, body).await
+                } else {
+                    file_response(&file, body)
+                };
+                // HTML 压缩只在内存（注入后的体 ≠ 文件字节，不落缓存，spec D3）。
+                if is_html
+                    && compressible
+                    && enc != Encoding::Identity
+                    && let Some(o) = opts
+                {
+                    compress_response(&mut r, enc, o).await;
+                }
+                if let Some(e) = &served_etag
+                    && let Ok(v) = axum::http::HeaderValue::from_str(e)
+                {
+                    r.headers_mut().insert(axum::http::header::ETAG, v);
+                }
+                finish_static_headers(st, w, &mut r, compressible, &file);
+                return r;
+            }
         }
     }
     // SPA 深链接回落（挂载 `spa: true`，v0.1.20 语义）：未命中 + 无扩展名 +
@@ -58,12 +117,125 @@ pub(crate) async fn serve_web(
     if w.spa && accept_html && !has_extension(rel_path) {
         let idx = w.root.join("index.html");
         if let Ok(body) = tokio::fs::read(&idx).await {
+            let body_len = body.len() as u64;
             let mut r = static_page(st, &w.root, rel_path, &idx, body).await;
-            apply_custom_headers(&mut r, &site_headers(st, w));
+            let opts = st.static_opts.static_layer.as_ref();
+            let enc = if opts.is_some() {
+                negotiate_encoding(headers)
+            } else {
+                Encoding::Identity
+            };
+            let compressible = opts.is_some_and(|o| is_compressible("html", body_len, o));
+            if compressible && enc != Encoding::Identity && let Some(o) = opts {
+                compress_response(&mut r, enc, o).await;
+            }
+            finish_static_headers(st, w, &mut r, compressible, &idx);
             return r;
         }
     }
     fail_response(404, "no route matched")
+}
+
+/// 静态腿统一收尾（200/304 共用，DRY）：显式头（先写，兜底可被其缺席检查挡住，
+/// spec D8/R2）→ Vary 合并（可压资源恒带，与选中编码无关，spec D11）→
+/// 默认缓存策略兜底（T6 两档制）。
+fn finish_static_headers(
+    st: &AppState,
+    w: &WebMount,
+    r: &mut Response,
+    compressible: bool,
+    file: &Path,
+) {
+    apply_custom_headers(r, &site_headers(st, w));
+    if compressible {
+        merge_vary_ae(r);
+    }
+    apply_default_cache_control(r, file, &st.static_opts.web_cache_policy);
+}
+
+/// Vary 合并（spec D11/网络复核）：既有值 `*` 独占不追加；已含 accept-encoding 幂等；
+/// 否则逗号合并（不clobber CORS 等写入的既有 Vary）。
+fn merge_vary_ae(r: &mut Response) {
+    let existing = r
+        .headers()
+        .get(axum::http::header::VARY)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    match existing.as_deref() {
+        Some("*") => {}
+        Some(v) => {
+            let has = v
+                .split(',')
+                .any(|p| p.trim().eq_ignore_ascii_case("accept-encoding"));
+            if !has
+                && let Ok(nv) = axum::http::HeaderValue::from_str(&format!("{v}, Accept-Encoding"))
+            {
+                r.headers_mut().insert(axum::http::header::VARY, nv);
+            }
+        }
+        None => {
+            r.headers_mut()
+                .insert(axum::http::header::VARY, HeaderValue::from_static("Accept-Encoding"));
+        }
+    }
+}
+
+/// 静态腿体上限（防御 cap；体均出自本层自建的缓冲响应）。
+const STATIC_BODY_LIMIT: usize = 1 << 30;
+
+/// 内存直压（HTML 腿：meta 注入后的体 ≠ 文件字节，不落缓存不吃伴生，spec D3）；
+/// None（无收益）原样放回。压缩成功：CE + 显式 CL + ETag 弱化（体已 ≠ 文件）。
+async fn compress_response(r: &mut Response, enc: Encoding, opts: &StaticLayerOpts) -> bool {
+    let (mut parts, body) = std::mem::take(r).into_parts();
+    let bytes = match axum::body::to_bytes(body, STATIC_BODY_LIMIT).await {
+        Ok(b) => b,
+        Err(_) => {
+            *r = Response::from_parts(parts, axum::body::Body::empty());
+            return false;
+        }
+    };
+    let Some(out) = compress_body(enc, bytes.to_vec(), opts).await else {
+        *r = Response::from_parts(parts, axum::body::Body::from(bytes));
+        return false;
+    };
+    tracing::debug!(
+        target: "serve::static",
+        algo = if enc == Encoding::Br { "br" } else { "gzip" },
+        from = bytes.len(), to = out.len()
+    );
+    parts.headers.insert(
+        axum::http::header::CONTENT_ENCODING,
+        HeaderValue::from_static(match enc {
+            Encoding::Br => "br",
+            Encoding::Gzip => "gzip",
+            Encoding::Identity => "identity",
+        }),
+    );
+    if let Ok(v) = HeaderValue::from_str(&out.len().to_string()) {
+        parts.headers.insert(axum::http::header::CONTENT_LENGTH, v);
+    }
+    if let Some(e) = parts
+        .headers
+        .get(axum::http::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_owned())
+        && !e.starts_with("W/")
+        && let Ok(v) = HeaderValue::from_str(&format!("W/{e}"))
+    {
+        parts.headers.insert(axum::http::header::ETAG, v);
+    }
+    *r = Response::from_parts(parts, axum::body::Body::from(out));
+    true
+}
+
+/// 默认缓存兜底（spec D8/D10）：显式头缺席时按两档制补 Cache-Control。
+/// 本任务先接通调用点与缺席检查；两档启发式在 T6 落地。
+fn apply_default_cache_control(r: &mut Response, _file: &Path, policy: &CachePolicy) {
+    if *policy == CachePolicy::None_
+        || r.headers().contains_key(axum::http::header::CACHE_CONTROL)
+    {
+        return;
+    }
 }
 
 /// 路由命中 → 前置管线（鉴权/租户/上传上限/multipart）→ 执行 handler → Capture 回写。

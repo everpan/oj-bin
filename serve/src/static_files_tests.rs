@@ -232,3 +232,178 @@ async fn unwritable_dir_falls_back_memory() {
     assert!(out.is_some());
     let _ = std::fs::remove_dir_all(&wd);
 }
+
+// —— T5 serve_web 组装（B1 fixture） ——
+
+/// B1 共享 fixture：tempdir web root + AppState（静态层可配）。
+fn comp_state(
+    root: &Path,
+    layer: Option<StaticLayerOpts>,
+    policy: CachePolicy,
+) -> (AppState, WebMount) {
+    let st = AppState {
+        mounts: Vec::new(),
+        actor: make_actor(PathBuf::from("."), false),
+        timeout: None,
+        static_opts: StaticOpts {
+            static_layer: layer,
+            web_cache_policy: policy,
+            ..Default::default()
+        },
+        pipeline: Pipeline::default(),
+        certificate_status: Arc::new(RwLock::new(CertificateStatus::Valid)),
+        certificate_valid_until: Arc::new(RwLock::new(None)),
+        plugins: Arc::default(),
+        exec_registry: None,
+    };
+    let mount = WebMount {
+        prefix: "/".into(),
+        root: root.to_path_buf(),
+        headers: Vec::new(),
+        spa: true,
+    };
+    (st, mount)
+}
+
+fn layer_opts(dir: Option<std::path::PathBuf>) -> StaticLayerOpts {
+    StaticLayerOpts {
+        compress_min_length: 1024,
+        compress_types: None,
+        brotli_quality: 5,
+        gzip_level: 6,
+        cache_dir: dir,
+    }
+}
+
+/// B1 薄封装：带 Accept-Encoding 的 GET。
+async fn get(st: &AppState, w: &WebMount, rel: &str, ae: &str) -> Response {
+    let mut h = HeaderMap::new();
+    if !ae.is_empty() {
+        h.insert(
+            axum::http::header::ACCEPT_ENCODING,
+            HeaderValue::from_str(ae).unwrap(),
+        );
+    }
+    serve_web(st, w, rel, "GET", true, &h).await
+}
+
+fn t5_dirs(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let cd = std::env::temp_dir().join(format!("oj-t5-{}-cd-{}", tag, std::process::id()));
+    let wd = std::env::temp_dir().join(format!("oj-t5-{}-wd-{}", tag, std::process::id()));
+    let _ = (std::fs::remove_dir_all(&cd), std::fs::remove_dir_all(&wd));
+    std::fs::create_dir_all(&cd).unwrap();
+    std::fs::create_dir_all(&wd).unwrap();
+    (cd, wd)
+}
+
+fn hdr<'r>(r: &'r Response, k: &axum::http::HeaderName) -> Option<String> {
+    r.headers().get(k).and_then(|v| v.to_str().ok()).map(|s| s.to_string())
+}
+
+/// Given 100KB js + Accept-Encoding: br + 缓存目录
+/// When GET
+/// Then 200 + Content-Encoding: br + CL=压缩后 + ETag 弱化 + Vary + 缓存目录 +1 文件
+#[tokio::test(flavor = "current_thread")]
+async fn br_negotiation_serves_compressed_with_vary() {
+    let (cd, wd) = t5_dirs("br");
+    std::fs::write(wd.join("app.js"), vec![b'a'; 102_400]).unwrap();
+    let (st, mount) = comp_state(&wd, Some(layer_opts(Some(cd.clone()))), CachePolicy::Auto);
+    let r = get(&st, &mount, "/app.js", "br").await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(hdr(&r, &axum::http::header::CONTENT_ENCODING).as_deref(), Some("br"));
+    let cl = hdr(&r, &axum::http::header::CONTENT_LENGTH).unwrap().parse::<usize>().unwrap();
+    assert!(cl < 102_400);
+    assert!(hdr(&r, &axum::http::header::ETAG).unwrap().starts_with("W/"));
+    assert_eq!(hdr(&r, &axum::http::header::VARY).as_deref(), Some("Accept-Encoding"));
+    assert_eq!(std::fs::read_dir(&cd).unwrap().count(), 1, "缓存落盘 1 代");
+    let _ = (std::fs::remove_dir_all(&cd), std::fs::remove_dir_all(&wd));
+}
+
+/// Given 可压资源 + Accept-Encoding: identity
+/// When GET
+/// Then 无 Content-Encoding、强 ETag、**有 Vary**（变体互串防线）
+#[tokio::test(flavor = "current_thread")]
+async fn compressible_identity_still_varies() {
+    let (cd, wd) = t5_dirs("idv");
+    std::fs::write(wd.join("app.js"), vec![b'a'; 4096]).unwrap();
+    let (st, mount) = comp_state(&wd, Some(layer_opts(None)), CachePolicy::Auto);
+    let r = get(&st, &mount, "/app.js", "identity").await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(hdr(&r, &axum::http::header::CONTENT_ENCODING), None);
+    let etag = hdr(&r, &axum::http::header::ETAG).unwrap();
+    assert!(!etag.starts_with("W/"), "identity 恒强 ETag");
+    assert_eq!(hdr(&r, &axum::http::header::VARY).as_deref(), Some("Accept-Encoding"));
+    let _ = (std::fs::remove_dir_all(&cd), std::fs::remove_dir_all(&wd));
+}
+
+/// Given br 首取的弱 ETag
+/// When 带 If-None-Match 再请求
+/// Then 304 且带 Vary（弱比较命中）
+#[tokio::test(flavor = "current_thread")]
+async fn weak_etag_inm_hits_304() {
+    let (cd, wd) = t5_dirs("304");
+    std::fs::write(wd.join("app.js"), vec![b'a'; 4096]).unwrap();
+    let (st, mount) = comp_state(&wd, Some(layer_opts(None)), CachePolicy::Auto);
+    let r1 = get(&st, &mount, "/app.js", "br").await;
+    let etag = hdr(&r1, &axum::http::header::ETAG).unwrap();
+    assert!(etag.starts_with("W/"));
+    let mut h = HeaderMap::new();
+    h.insert(axum::http::header::ACCEPT_ENCODING, HeaderValue::from_static("br"));
+    h.insert(axum::http::header::IF_NONE_MATCH, HeaderValue::from_str(&etag).unwrap());
+    let r2 = serve_web(&st, &mount, "/app.js", "GET", true, &h).await;
+    assert_eq!(r2.status(), 304);
+    assert_eq!(hdr(&r2, &axum::http::header::VARY).as_deref(), Some("Accept-Encoding"));
+    let _ = (std::fs::remove_dir_all(&cd), std::fs::remove_dir_all(&wd));
+}
+
+/// Given 100B js（< min_length）
+/// When GET br
+/// Then 无 Vary 无 Content-Encoding（不可压资源无协商面）
+#[tokio::test(flavor = "current_thread")]
+async fn small_file_no_vary_no_encoding() {
+    let (cd, wd) = t5_dirs("small");
+    std::fs::write(wd.join("tiny.js"), b"hi").unwrap();
+    let (st, mount) = comp_state(&wd, Some(layer_opts(None)), CachePolicy::Auto);
+    let r = get(&st, &mount, "/tiny.js", "br").await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(hdr(&r, &axum::http::header::CONTENT_ENCODING), None);
+    assert_eq!(hdr(&r, &axum::http::header::VARY), None);
+    let _ = (std::fs::remove_dir_all(&cd), std::fs::remove_dir_all(&wd));
+}
+
+/// Given static_layer None
+/// When GET br
+/// Then 逐字节现状：无三头、强 ETag、原体
+#[tokio::test(flavor = "current_thread")]
+async fn off_switch_byte_identical() {
+    let (cd, wd) = t5_dirs("off");
+    std::fs::write(wd.join("app.js"), vec![b'a'; 4096]).unwrap();
+    let (st, mount) = comp_state(&wd, None, CachePolicy::None_);
+    let r = get(&st, &mount, "/app.js", "br").await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(hdr(&r, &axum::http::header::CONTENT_ENCODING), None);
+    assert_eq!(hdr(&r, &axum::http::header::VARY), None);
+    assert_eq!(hdr(&r, &axum::http::header::CACHE_CONTROL), None);
+    let etag = hdr(&r, &axum::http::header::ETAG).unwrap();
+    assert!(!etag.starts_with("W/"));
+    let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+    assert_eq!(&body[..], &[b'a'; 4096][..]);
+    let _ = (std::fs::remove_dir_all(&cd), std::fs::remove_dir_all(&wd));
+}
+
+/// Given index.html 配 html_meta 注入 + br 请求
+/// When GET
+/// Then 体被压缩但缓存目录无新增文件（HTML 恒内存直压）
+#[tokio::test(flavor = "current_thread")]
+async fn html_compressed_but_never_cached() {
+    let (cd, wd) = t5_dirs("html");
+    std::fs::write(wd.join("index.html"), format!("<html><head></head><body>{}</body></html>", "x".repeat(4096))).unwrap();
+    let (mut st, mount) = comp_state(&wd, Some(layer_opts(Some(cd.clone()))), CachePolicy::Auto);
+    st.static_opts.html_meta = Some("__meta".into());
+    let r = get(&st, &mount, "/", "br").await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(hdr(&r, &axum::http::header::CONTENT_ENCODING).as_deref(), Some("br"));
+    assert_eq!(hdr(&r, &axum::http::header::VARY).as_deref(), Some("Accept-Encoding"));
+    assert_eq!(std::fs::read_dir(&cd).unwrap().count(), 0, "HTML 不落缓存");
+    let _ = (std::fs::remove_dir_all(&cd), std::fs::remove_dir_all(&wd));
+}
