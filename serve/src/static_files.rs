@@ -457,6 +457,166 @@ pub(crate) fn site_headers<'a>(st: &'a AppState, site: &'a WebMount) -> Vec<(Str
     out
 }
 
+// —— 压缩缓存仓库层（v0.1.116 OJ-9）——
+
+/// 同键压缩 single-flight 登记表（键 = cache_key；进程级）。
+static INFLIGHT: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Notify>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// 全局压缩并发钳（防冷缓存风暴，spec D13）；permits = 可用并行度。
+static COMPRESS_SEM: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| {
+        tokio::sync::Semaphore::new(
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2),
+        )
+    });
+
+/// 缓存键 `{sha1(abs)}-{ino:x}-{mtime_ns:x}-{len:x}-{br|gz}{q}`：任一失效输入变化
+/// 自然换代（ino 防 mtime 保留式替换，spec D14）。
+fn cache_key(
+    file: &Path,
+    meta: &std::fs::Metadata,
+    enc: Encoding,
+    opts: &StaticLayerOpts,
+) -> String {
+    // 键用**传入路径原文**——canonicalize 随文件存在性变化（存在→/private/var 解析、
+    // 删除→原样），会把同一文件拆成两代键（macOS 实测）；调用方传入的已是挂载根
+    // 拼接的稳定路径。
+    // SHA1 仅作缓存键指纹（非安全面；ring 0.17 的 LEGACY 命名即此用途）。
+    let digest = ring::digest::digest(
+        &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
+        file.to_string_lossy().as_bytes(),
+    );
+    let sha1 = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect::<String>();
+    #[cfg(unix)]
+    let ino = std::os::unix::fs::MetadataExt::ino(meta);
+    #[cfg(not(unix))]
+    let ino = 0u64;
+    let mtime_ns = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    format!(
+        "{sha1}-{ino:x}-{mtime_ns:x}-{:x}-{}{}",
+        meta.len(),
+        match enc {
+            Encoding::Br => "br",
+            Encoding::Gzip => "gz",
+            Encoding::Identity => "id",
+        },
+        match enc {
+            Encoding::Br => opts.brotli_quality,
+            Encoding::Gzip => opts.gzip_level,
+            Encoding::Identity => 0,
+        }
+    )
+}
+
+/// leader 退出即清登记并唤醒 follower（notify_waiters + follower 端 leader 存在性
+/// 复查闭环竞态——先注册再等，醒来重查缓存）。
+struct InflightGuard(String);
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        if let Some(n) = INFLIGHT.lock().unwrap().remove(&self.0) {
+            n.notify_waiters();
+        }
+    }
+}
+
+/// 取压缩体（spec D3/D13/D14）：缓存命中直读（不读原文不压缩）→ miss 经 single-flight
+/// 成为 leader：信号量限流下读原文压缩、原子落盘（tmp+rename，Windows 先 remove）、
+/// 删同 `{sha1}-` 前缀旧代；cache_dir 未配或写失败 → 纯内存直压（fail-open）。
+/// None = 压缩无收益（D6），调用方出 identity。
+pub(crate) async fn compressed_body_or_cache(
+    file: &Path,
+    meta: &std::fs::Metadata,
+    enc: Encoding,
+    opts: &StaticLayerOpts,
+) -> Option<Vec<u8>> {
+    let dir = opts.cache_dir.as_deref();
+    let key = cache_key(file, meta, enc, opts);
+    async fn cached(d: Option<&Path>, k: &str) -> Option<Vec<u8>> {
+        match d {
+            Some(d) => tokio::fs::read(d.join(k)).await.ok(),
+            None => None,
+        }
+    }
+    if let Some(b) = cached(dir, &key).await {
+        return Some(b);
+    }
+    let wait = {
+        let mut m = INFLIGHT.lock().unwrap();
+        match m.get(&key) {
+            Some(n) => n.clone(),
+            None => {
+                let n = std::sync::Arc::new(tokio::sync::Notify::new());
+                m.insert(key.clone(), n.clone());
+                n
+            }
+        }
+    };
+    let is_leader = {
+        let m = INFLIGHT.lock().unwrap();
+        m.get(&key)
+            .map(|n| std::sync::Arc::ptr_eq(n, &wait))
+            .unwrap_or(false)
+    };
+    if !is_leader {
+        // follower：注册后循环（缓存 → 领导者在否 → 等通知）
+        loop {
+            if let Some(b) = cached(dir, &key).await {
+                return Some(b);
+            }
+            let fut = wait.notified();
+            tokio::pin!(fut);
+            if INFLIGHT.lock().unwrap().contains_key(&key) {
+                fut.await;
+            } else {
+                // leader 已完成且缓存未命中（无收益路径）→ 同答 None
+                return None;
+            }
+        }
+    }
+    let _guard = InflightGuard(key.clone());
+    let _permit = COMPRESS_SEM.acquire().await;
+    // 双查：等 permit 期间同键可能已被别的 leader 写入
+    if let Some(b) = cached(dir, &key).await {
+        return Some(b);
+    }
+    let body = tokio::fs::read(file).await.ok()?;
+    let out = match compress_body(enc, body, opts).await {
+        Some(o) => o,
+        None => {
+            eprintln!("DBG compress none");
+            return None;
+        }
+    };
+    if let Some(d) = dir {
+        let tmp = d.join(format!("{}.tmp-{}", key, std::process::id()));
+        if tokio::fs::write(&tmp, &out).await.is_ok() {
+            #[cfg(target_os = "windows")]
+            let _ = tokio::fs::remove_file(d.join(&key)).await;
+            if tokio::fs::rename(&tmp, d.join(&key)).await.is_ok() {
+                let prefix = format!("{}-", key.split('-').next().unwrap_or(""));
+                let mut rd = match tokio::fs::read_dir(d).await {
+                    Ok(rd) => rd,
+                    Err(_) => return Some(out),
+                };
+                while let Ok(Some(e)) = rd.next_entry().await {
+                    let name = e.file_name();
+                    if name != *key && name.to_string_lossy().starts_with(&prefix) {
+                        let _ = tokio::fs::remove_file(e.path()).await;
+                    }
+                }
+            }
+        } // 写失败静默：缓存是优化不是正确性依赖
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 #[path = "static_files_tests.rs"]
 pub(crate) mod tests;
