@@ -252,15 +252,12 @@ async fn new_key_prunes_same_prefix() {
     compressed_body_or_cache(&f, &m, Encoding::Br, &opts5)
         .await
         .unwrap();
-    // 同 sha1 前缀伪造旧代
-    let prefix = format!(
-        "{}-",
-        cache_key(&f, &m, Encoding::Br, &opts5)
-            .split('-')
-            .next()
-            .unwrap()
-    );
-    let fake = cd.join(format!("{prefix}deadbeef-br5"));
+    // 同「路径×算法」前缀伪造旧代（spec D14 代际语义：base 含到算法段）
+    let prefix = cache_key(&f, &m, Encoding::Br, &opts5)
+        .rsplit_once('-')
+        .map(|(b, _)| b.to_string())
+        .unwrap();
+    let fake = cd.join(format!("{prefix}-br9"));
     std::fs::write(&fake, b"old").unwrap();
     let opts6 = StaticLayerOpts {
         brotli_quality: 6,
@@ -669,6 +666,44 @@ async fn cache_control_on_304() {
     assert_eq!(
         hdr(&r2, &axum::http::header::CACHE_CONTROL).as_deref(),
         Some("public, max-age=31536000, immutable")
+    );
+    let _ = (std::fs::remove_dir_all(&cd), std::fs::remove_dir_all(&wd));
+}
+
+/// 终局复审 Important#1 回归：Given 同文件 br 与 gzip 两代缓存共存
+/// When 任一算法 store 新代
+/// Then 另一算法缓存不被逐出（spec D14：每路径×算法恒一代）
+#[tokio::test(flavor = "current_thread")]
+async fn br_and_gzip_coexist_same_cache() {
+    let cd = tmp_dir("mix-cd");
+    let wd = tmp_dir("mix-wd");
+    let f = wd.join("mix.js");
+    std::fs::write(&f, vec![b'm'; 4096]).unwrap();
+    let opts = repo_opts(Some(cd.clone()));
+    let m = std::fs::metadata(&f).unwrap();
+    compressed_body_or_cache(&f, &m, Encoding::Br, &opts)
+        .await
+        .unwrap();
+    compressed_body_or_cache(&f, &m, Encoding::Gzip, &opts)
+        .await
+        .unwrap();
+    let br_key = cache_key(&f, &m, Encoding::Br, &opts);
+    let gz_key = cache_key(&f, &m, Encoding::Gzip, &opts);
+    assert!(cd.join(&br_key).exists(), "br 代在");
+    assert!(cd.join(&gz_key).exists(), "gz 代在");
+    // gz 换 quality 新代 → 只逐 gz 旧代，br 不动
+    let gz7 = StaticLayerOpts {
+        gzip_level: 7,
+        ..repo_opts(Some(cd.clone()))
+    };
+    compressed_body_or_cache(&f, &m, Encoding::Gzip, &gz7)
+        .await
+        .unwrap();
+    assert!(cd.join(&br_key).exists(), "br 缓存不被 gz 换代逐出");
+    assert!(!cd.join(&gz_key).exists(), "gz 旧代被清");
+    assert!(
+        cd.join(cache_key(&f, &m, Encoding::Gzip, &gz7)).exists(),
+        "gz 新代在"
     );
     let _ = (std::fs::remove_dir_all(&cd), std::fs::remove_dir_all(&wd));
 }

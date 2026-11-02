@@ -665,9 +665,12 @@ pub(crate) fn site_headers<'a>(st: &'a AppState, site: &'a WebMount) -> Vec<(Str
 
 // —— 压缩缓存仓库层（v0.1.116 OJ-9）——
 
-/// 同键压缩 single-flight 登记表（键 = cache_key；进程级）。
+/// 同键压缩 single-flight 登记表（键 = cache_key；进程级）。值 = watch sender：
+/// follower subscribe() 后的 send 必醒（无 notify_waiters 丢唤醒竞态）。
 static INFLIGHT: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Notify>>>,
+    std::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Arc<tokio::sync::watch::Sender<()>>>,
+    >,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// 全局压缩并发钳（防冷缓存风暴，spec D13）；permits = 可用并行度。
@@ -726,13 +729,13 @@ fn cache_key(
     )
 }
 
-/// leader 退出即清登记并唤醒 follower（notify_waiters + follower 端 leader 存在性
-/// 复查闭环竞态——先注册再等，醒来重查缓存）。
+/// leader 退出即清登记并广播收尾（先 remove 后 send：follower 端 map 查空即返回，
+/// 已订阅者经 watch 版本号必醒——notify_waiters 的「注册先于通知」竞态已废弃）。
 struct InflightGuard(String);
 impl Drop for InflightGuard {
     fn drop(&mut self) {
-        if let Some(n) = INFLIGHT.lock().unwrap().remove(&self.0) {
-            n.notify_waiters();
+        if let Some(tx) = INFLIGHT.lock().unwrap().remove(&self.0) {
+            let _ = tx.send(());
         }
     }
 }
@@ -763,9 +766,10 @@ pub(crate) async fn compressed_body_or_cache(
         match m.get(&key) {
             Some(n) => n.clone(),
             None => {
-                let n = std::sync::Arc::new(tokio::sync::Notify::new());
-                m.insert(key.clone(), n.clone());
-                n
+                let (tx, _) = tokio::sync::watch::channel(());
+                let tx = std::sync::Arc::new(tx);
+                m.insert(key.clone(), tx.clone());
+                tx
             }
         }
     };
@@ -776,18 +780,24 @@ pub(crate) async fn compressed_body_or_cache(
             .unwrap_or(false)
     };
     if !is_leader {
-        // follower：注册后循环（缓存 → 领导者在否 → 等通知）
+        // follower：循环「查缓存 → 领导者在否 → watch 等收尾」。watch 版本号语义
+        // 免 notify_waiters 的丢唤醒竞态：subscribe() 后的 send 必醒；每轮重新
+        // subscribe（换代/新 leader 自动跟随）；sender 撤走 changed() 返 Err 亦回环。
+        let mut rx = wait.subscribe();
         loop {
             if let Some(b) = cached(dir, &key).await {
                 return Some(b);
             }
-            let fut = wait.notified();
-            tokio::pin!(fut);
-            if INFLIGHT.lock().unwrap().contains_key(&key) {
-                fut.await;
-            } else {
-                // leader 已完成且缓存未命中（无收益路径）→ 同答 None
-                return None;
+            // guard 不能横跨 await（!Send 污染 future）：clone Arc 即放锁
+            let cur = INFLIGHT.lock().unwrap().get(&key).cloned();
+            match cur {
+                None => return None, // leader 已收尾且缓存未命中（无收益路径）→ 同答 None
+                Some(cur) => {
+                    if !cur.same_channel(&wait) {
+                        rx = cur.subscribe(); // 换代：改盯当前 sender
+                    }
+                    let _ = rx.changed().await;
+                }
             }
         }
     }
@@ -798,12 +808,8 @@ pub(crate) async fn compressed_body_or_cache(
         return Some(b);
     }
     let body = tokio::fs::read(file).await.ok()?;
-    let out = match compress_body(enc, body, opts).await {
-        Some(o) => o,
-        None => {
-            eprintln!("DBG compress none");
-            return None;
-        }
+    let Some(out) = compress_body(enc, body, opts).await else {
+        return None; // 无收益（D6）：调用方出 identity
     };
     if let Some(d) = dir {
         let tmp = d.join(format!("{}.tmp-{}", key, std::process::id()));
@@ -811,7 +817,17 @@ pub(crate) async fn compressed_body_or_cache(
             #[cfg(target_os = "windows")]
             let _ = tokio::fs::remove_file(d.join(&key)).await;
             if tokio::fs::rename(&tmp, d.join(&key)).await.is_ok() {
-                let prefix = format!("{}-", key.split('-').next().unwrap_or(""));
+                // 代际前缀取到**算法段**（spec D14：每路径×算法恒一代）——只取 sha1
+                // 段会让 br/gz 互换逐出，混合编码流量下缓存永久打穿（终局复审 I1）。
+                let base = key.rsplit_once('-').map(|(b, _)| b).unwrap_or(&key);
+                let prefix = format!(
+                    "{base}-{}",
+                    if matches!(enc, Encoding::Br) {
+                        "br"
+                    } else {
+                        "gz"
+                    }
+                );
                 let mut rd = match tokio::fs::read_dir(d).await {
                     Ok(rd) => rd,
                     Err(_) => return Some(out),
