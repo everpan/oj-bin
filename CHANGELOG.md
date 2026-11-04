@@ -16,7 +16,36 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
-## v0.1.120（未打标签）
+## v0.1.121
+
+**feat（seed，按方言选文件）**：模块 seed 此前只认 `seed.sql` 一个文件名，一旦内容带
+MySQL 专有写法（如裸写保留字列 `key` + `INSERT IGNORE`），同一份文件在 sqlite/pg 上必炸；
+反之写成 sqlite 惯用法下发 MySQL 也会 1064（源需求：oj-module 根级方言副本与模块内通用件
+长期漂移，`docs/migration/oj-requirement-seed-dialect.md`）。现与迁移文件的方言覆盖语义对齐。
+
+- **选择语义**：`seed.<tag>.sql`（tag = `sqlite` / `mysql` / `pg`，同 `migrate::dialect_tag`）
+  存在即**胜出**，`seed.sql` 只做兜底，**绝不双跑**。扫描按文件名**精确匹配**，不依赖
+  `is_file` 的大小写不敏感行为（macOS/Windows 上 `SEED.MYSQL.SQL` 会被命中并执行，Linux 不会）。
+- **不再静默**：模块只有别的方言的 seed 且无通用件 → 启动 warn 点名（聚合一条，列出全部文件）；
+  标签拼错（`seed.postgres.sql` / `Seed.Sql` / `seed..sql`）→ warn 提示规范名并忽略，
+  `oj check` 报 S006。成功日志补 `file=` 与 `dialect=`，一眼可核对实际跑的是哪份。
+- **静态检查跟进**：S003 的跨模块 SQL 扫描与 S006 幂等门禁覆盖全部变体；幂等判据改为
+  **按文件所属方言**取白名单（sqlite：`OR IGNORE` / `OR REPLACE` / `ON CONFLICT`；
+  mysql：`OR IGNORE` / `INSERT IGNORE` / `ON DUPLICATE KEY`；pg：`OR IGNORE` / `ON CONFLICT`），
+  通用件仍走三方言并集。`migrate_cmd` 与 `load_fixtures` 复用同一函数时传 `None` 保持原判据。
+- **顺带收紧（可能由绿变红）**：幂等判定先剥 `--` / `/* */` 注释与 `'…'` / `"…"` 字面量，
+  再按 token 相邻匹配——只在注释或字符串里提到 `ON CONFLICT` 的语句不再算幂等。
+- **门控前置**：「无 default 库」的 warn 现在只在工程**确实有 seed**（含方言件与错名件）时打，
+  零 seed 的静态站/纯 KV 工程不再每次启动刷一条无关告警。
+- **回归用例**：seed 单测 8 条（方言件胜出 / 无通用件也能跑 / 不匹配告警 / 多文件聚合告警 /
+  错名标签含大写 / 零候选 `any_seed` / 畸形文件名不 panic / 候选枚举），checks 单测 3 条
+  （S006 逐变体点名真实文件 / 三分方言正反例含注释与字符串反例 / 错名文件报错），
+  build 用例补 `seed.mysql.sql` 进 dist 的字节一致断言。
+- **文档**：api-manual「seed.sql / seed.<方言>.sql」小节、三层 SQL 文件表、S001–S008 段、
+  部署清单、热更表、限制表；db-guide 种子行；oj-test-guide 生命周期与 fixtures/seed 纪律表；
+  SKILL 陷阱速查；devkit README v0.1.121 落地段。
+
+## v0.1.120
 
 **fix（db，mysql 两步取 id 跨连接）**：`insert(...).returning(["id"])` 在 mysql 上取回的
 自增 id 可能是**别的连接**上一次插入的值（源需求：oj-module `docs/prd/framework-verification-playbook.md`

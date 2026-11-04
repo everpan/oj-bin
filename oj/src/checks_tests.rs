@@ -258,6 +258,141 @@ fn s006_rejects_ddl_nonidempotent_insert_and_foreign_tables() {
 }
 
 #[test]
+fn s006_scans_every_seed_variant_and_names_the_real_file() {
+    let t = fixture("s006-dialect");
+    write(
+        &t.join("src/order/seed.sql"),
+        "INSERT OR IGNORE INTO orders VALUES (1);\n",
+    );
+    // 方言件写 mysql 原生幂等写法 → 合法；pg 件里的 DDL → 必须报且点名该文件。
+    write(
+        &t.join("src/order/seed.mysql.sql"),
+        "INSERT IGNORE INTO orders VALUES (2);\n",
+    );
+    write(&t.join("src/order/seed.pg.sql"), "CREATE TABLE x (a);\n");
+    let e = run(
+        &t.join("src"),
+        &["order".to_string()],
+        &BTreeMap::new(),
+        only_js::bridge::SqlGuard::Off,
+        None,
+    )
+    .unwrap_err();
+    assert!(e.contains("S006") && e.contains("CREATE"), "{e}");
+    assert!(e.contains("seed.pg.sql"), "报错须点名真实文件：{e}");
+    assert!(
+        !e.contains("seed.mysql.sql"),
+        "INSERT IGNORE 是幂等的，不应报：{e}"
+    );
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+#[test]
+fn insert_is_idempotent_accepts_native_dialect_forms() {
+    // 通用件 / 未指明方言：保守口径，mysql 原生写法不认（它在 sqlite/pg 上是语法错）。
+    for s in [
+        "INSERT OR IGNORE INTO t VALUES (1)",
+        "INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING",
+        "INSERT INTO t VALUES (1) ON DUPLICATE KEY UPDATE a = 1",
+        "INSERT OR REPLACE INTO t VALUES (1)",
+        // 注释/字符串里的关键字不算数：判据只看代码 token。
+        "-- 建议改 INSERT IGNORE\nINSERT OR IGNORE INTO t VALUES (1)",
+        "INSERT OR IGNORE INTO t VALUES ('INSERT IGNORE')",
+        // 关键字被注释拆开也算（PG 允许注释出现在任意空白处）。
+        "INSERT OR/*c*/IGNORE INTO t VALUES (1)",
+        "INSERT INTO t VALUES (1) ON/*c*/CONFLICT DO NOTHING",
+    ] {
+        assert!(insert_is_idempotent(s), "{s}");
+    }
+    for s in [
+        "INSERT INTO t VALUES (1)",
+        // 前缀串不是关键字。
+        "INSERT IGNORED INTO t VALUES (1)",
+        "INSERT OR IGNORED INTO t VALUES (1)",
+        "INSERT INTO t SELECT * FROM u",
+        // mysql 原生写法在通用件上放行 = 起服才炸，必须拒绝。
+        "INSERT IGNORE INTO t VALUES (1)",
+        // 只在注释里出现 → 不能放行（重放会翻倍）。
+        "INSERT INTO t VALUES (1) -- 可改 INSERT IGNORE",
+        // 只在字符串字面量里出现 → 同理（单/双引号都是字面量，双引号在 mysql 默认模式是字符串）。
+        "INSERT INTO t VALUES (\"OR IGNORE\")",
+        "INSERT INTO t VALUES ('ON CONFLICT DO NOTHING')",
+    ] {
+        assert!(!insert_is_idempotent(s), "{s}");
+    }
+    // mysql 方言件：原生 INSERT IGNORE / ON DUPLICATE KEY 合法；它没有 ON CONFLICT。
+    for s in [
+        "INSERT IGNORE INTO t VALUES (1)",
+        "INSERT IGNORE\nINTO t VALUES (1)",
+        "INSERT INTO t VALUES (1) ON DUPLICATE KEY UPDATE a = 1",
+        "INSERT OR IGNORE INTO t VALUES (1)",
+    ] {
+        assert!(
+            insert_is_idempotent_in(s, Some(Dialect::MySql)),
+            "mysql 方言件应认：{s}"
+        );
+    }
+    for s in [
+        "INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING",
+        "INSERT OR REPLACE INTO t VALUES (1)",
+    ] {
+        assert!(
+            !insert_is_idempotent_in(s, Some(Dialect::MySql)),
+            "mysql 方言件不该认：{s}"
+        );
+    }
+    // pg 方言件：ON CONFLICT 合法；INSERT IGNORE / ON DUPLICATE KEY / OR REPLACE 不合法。
+    assert!(insert_is_idempotent_in(
+        "INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING",
+        Some(Dialect::Postgres)
+    ));
+    for s in [
+        "INSERT IGNORE INTO t VALUES (1)",
+        "INSERT INTO t VALUES (1) ON DUPLICATE KEY UPDATE a = 1",
+        "INSERT OR REPLACE INTO t VALUES (1)",
+    ] {
+        assert!(
+            !insert_is_idempotent_in(s, Some(Dialect::Postgres)),
+            "pg 方言件不该认：{s}"
+        );
+    }
+    // sqlite 方言件：OR REPLACE 合法；mysql 的两种写法都不合法。
+    assert!(insert_is_idempotent_in(
+        "INSERT OR REPLACE INTO t VALUES (1)",
+        Some(Dialect::Sqlite)
+    ));
+    for s in [
+        "INSERT IGNORE INTO t VALUES (1)",
+        "INSERT INTO t VALUES (1) ON DUPLICATE KEY UPDATE a = 1",
+    ] {
+        assert!(
+            !insert_is_idempotent_in(s, Some(Dialect::Sqlite)),
+            "sqlite 方言件不该认：{s}"
+        );
+    }
+}
+
+#[test]
+fn s006_rejects_misnamed_dialect_seed_file() {
+    let t = fixture("s006-tag");
+    write(
+        &t.join("src/order/seed.postgres.sql"),
+        "INSERT OR IGNORE INTO orders VALUES (1);\n",
+    );
+    let e = run(
+        &t.join("src"),
+        &["order".to_string()],
+        &BTreeMap::new(),
+        only_js::bridge::SqlGuard::Off,
+        None,
+    )
+    .unwrap_err();
+    assert!(e.contains("S006") && e.contains("postgres"), "{e}");
+    assert!(e.contains("seed.pg.sql"), "须给出正确标签：{e}");
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+#[test]
 fn s002_reports_only_conflicts_touching_checked_modules() {
     let t = fixture("s002");
     // 第三方模块 other 与 user 冲突；只查 order → 不报；全查 → 报。

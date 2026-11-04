@@ -1,7 +1,10 @@
-//! 模块级种子重放（spec P0）：`<module>/seed.sql`，三方言 default 库随启动重放。
+//! 模块级种子重放（spec P0）：`<module>/seed.<dialect>.sql` 优先、`<module>/seed.sql`
+//! 兜底，三方言 default 库随启动重放（与迁移的 `{seq}__{desc}.{dialect}.sql` 同一套
+//! 方言覆盖语义：方言件胜出、通用件兜底，**绝不双跑**）。
 //! 幂等 SQL、按 `;` 朴素切分（语句内不得含分号字面量，§2.1）；执行顺序 = 模块目录名
 //! 排序。幂等写法以 sqlite 惯用法为源（`INSERT OR IGNORE`），引擎按目标方言自动改写
-//! 关键字（mysql → `INSERT IGNORE`、pg → 句尾 `ON CONFLICT DO NOTHING`）。
+//! 关键字（mysql → `INSERT IGNORE`、pg → 句尾 `ON CONFLICT DO NOTHING`）；方言件写
+//! 原生语法（`INSERT IGNORE` / `ON CONFLICT DO NOTHING`）则原样透传。
 //! 每条语句的执行与结果（受影响行数）记 tracing 日志（server 落 logs/，CLI 落 stderr）。
 //! S002：同一张表被两处 `CREATE TABLE` → 启动 fail-fast，不静默合并（§8-1）。
 //! fixtures/ 不重放（演示数据，由 `oj test fixture` 灌入）。
@@ -13,25 +16,149 @@ use std::sync::Arc;
 
 use only_js::bridge::{DataAccessor, Dialect, ModuleIndex};
 
-/// 模块种子文件名。
-const SEED_FILE: &str = "seed.sql";
+/// 通用种子文件名（方言件的兜底）。
+pub(crate) const SEED_GENERIC: &str = "seed.sql";
+/// 方言件前缀（`seed.<tag>.sql`）。与 `SEED_GENERIC` 同源，避免多处字面量漂移。
+const SEED_PREFIX: &str = "seed.";
+const SEED_EXT: &str = ".sql";
 
-/// 收集各模块的 `seed.sql`（dev: `src/<m>/`，release: `dist/<m>-<v>/`），按模块名排序。
-/// 返回 (模块标签=模块名, 文件路径)。
-///
-/// `index` 覆盖 `dir` 时按索引定位模块根（模块根可不在首层，首层扫会**静默漏掉种子**——
-/// 评审（丁）：种子不灌且无报错比启动失败更坏）；否则今日语义（首层子目录）。
-/// 复用 `manifest::discover` 而非自己扫目录：模块集合的判定只应有一处。
-pub fn collect(dir: &Path, index: Option<&ModuleIndex>) -> Vec<(String, PathBuf)> {
-    if let Some(idx) = index {
-        let mut out = Vec::new();
-        for (name, e) in &idx.modules {
-            let p = e.root.join(SEED_FILE);
-            if p.is_file() {
-                out.push((name.clone(), p));
-            }
+/// 已知方言文件名（顺序即 [`scan`] 的候选返回序）。
+const DIALECTS: [Dialect; 3] = [Dialect::Sqlite, Dialect::MySql, Dialect::Postgres];
+
+/// 当前方言的种子文件名：`seed.<tag>.sql`，标签与迁移的 `{desc}.{dialect}.sql` 同一套
+/// （`migrate::dialect_tag`：sqlite / mysql / pg）。
+fn seed_name(d: Dialect) -> String {
+    format!("{SEED_PREFIX}{}{SEED_EXT}", crate::migrate::dialect_tag(d))
+}
+
+/// 一次目录扫描的产物：规范候选 + 命名不规范的 seed 文件。
+pub struct SeedSet {
+    /// 实际存在的规范候选，顺序固定：通用件 → sqlite → mysql → pg。
+    pub candidates: Vec<PathBuf>,
+    /// (标签, 路径)：标签未知（`seed.postgres.sql`）或大小写不符（`SEED.MYSQL.SQL`）。
+    pub misnamed: Vec<(String, PathBuf)>,
+}
+
+/// 扫一个模块目录，按**文件名精确匹配**取候选（不靠 `is_file` 的大小写不敏感行为：
+/// macOS / Windows 上 `SEED.MYSQL.SQL` 会被 `is_file("seed.mysql.sql")` 命中并执行，
+/// Linux 上不会——规范化判定必须跨平台一致）。
+/// 运行时选择（[`collect`]）与静态检查（S003/S006）共用这一份结果。
+pub fn scan(root: &Path) -> SeedSet {
+    let mut set = SeedSet {
+        candidates: Vec::new(),
+        misnamed: Vec::new(),
+    };
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return set;
+    };
+    let mut files: Vec<(String, PathBuf)> = rd
+        .flatten()
+        .filter(|e| e.path().is_file())
+        .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
+        .collect();
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let canonical: Vec<String> = std::iter::once(SEED_GENERIC.to_string())
+        .chain(DIALECTS.iter().map(|d| seed_name(*d)))
+        .collect();
+    for want in &canonical {
+        if let Some((_, p)) = files.iter().find(|(n, _)| n == want) {
+            set.candidates.push(p.clone());
         }
-        return out;
+    }
+    for (name, path) in files {
+        if set.candidates.iter().any(|p| p == &path) {
+            continue;
+        }
+        let lower = name.to_ascii_lowercase();
+        // 通用件没有标签，单独判（`strip_prefix("seed.")` 得到的是 "sql"，不是空串）。
+        let stem = if lower == SEED_GENERIC {
+            String::new()
+        } else {
+            let Some(s) = lower
+                .strip_prefix(SEED_PREFIX)
+                .and_then(|s| s.strip_suffix(SEED_EXT))
+            else {
+                continue;
+            };
+            s.to_string()
+        };
+        // `seed.sql` 的大小写变体（空 stem）没有标签可说：tag 置空，调用方提示「应为全小写」。
+        // 该分支同时保证下面的字节切片区间非空，不会在短名字上反转 panic。
+        let tag = if stem.is_empty() {
+            String::new()
+        } else {
+            name[SEED_PREFIX.len()..name.len() - SEED_EXT.len()].to_string()
+        };
+        set.misnamed.push((tag, path));
+    }
+    set
+}
+
+/// 一个模块目录下**实际存在**的规范 seed 候选（通用件 + 三个方言件）。
+pub fn seed_candidates(root: &Path) -> Vec<PathBuf> {
+    scan(root).candidates
+}
+
+/// 从文件名推断该 seed 件的方言：`seed.sql` → `None`（通用件，三方言都必须能跑）。
+pub fn seed_dialect_of(p: &Path) -> Option<Dialect> {
+    let name = p.file_name()?.to_string_lossy();
+    let stem = name
+        .strip_prefix(SEED_PREFIX)
+        .and_then(|s| s.strip_suffix(SEED_EXT))?;
+    DIALECTS
+        .into_iter()
+        .find(|d| crate::migrate::dialect_tag(*d) == stem)
+}
+
+/// 按方言选文件：方言件存在即胜出，通用件只兜底（绝不双跑）。
+struct Pick {
+    /// 实际执行的文件。
+    chosen: Option<PathBuf>,
+    /// 已知方言件里与当前方言不匹配的那些（仅在无可用文件时非空）。
+    skipped: Vec<PathBuf>,
+    /// 方言标签写错的 seed 文件（任何情况下都报告）。
+    misnamed: Vec<(String, PathBuf)>,
+}
+
+fn pick(root: &Path, dialect: Dialect) -> Pick {
+    let set = scan(root);
+    let specific = root.join(seed_name(dialect));
+    let generic = root.join(SEED_GENERIC);
+    let mut chosen = None;
+    let mut skipped = Vec::new();
+    if set.candidates.contains(&specific) {
+        chosen = Some(specific);
+    } else if set.candidates.contains(&generic) {
+        chosen = Some(generic);
+    } else {
+        skipped = set.candidates;
+    }
+    Pick {
+        chosen,
+        skipped,
+        misnamed: set.misnamed,
+    }
+}
+
+/// seed 收集结果。
+pub struct Collected {
+    /// (模块名, 实际要执行的文件)，已按模块名排序。
+    pub files: Vec<(String, PathBuf)>,
+    /// (模块名, 因方言不匹配而跳过的文件)：模块只有别的方言件且无通用件 → 起服要 warn。
+    pub skipped: Vec<(String, PathBuf)>,
+    /// (模块名, 标签, 文件)：文件名标签拼错 → 起服要 warn、`oj check` 要报错。
+    pub misnamed: Vec<(String, String, PathBuf)>,
+}
+
+/// 模块根清单：`index` 覆盖 `dir` 时按索引（模块根可不在首层），否则首层子目录。
+/// 复用 `manifest::discover` 的集合判定，不另扫一套。
+fn module_roots(dir: &Path, index: Option<&ModuleIndex>) -> Vec<(String, PathBuf)> {
+    if let Some(idx) = index {
+        return idx
+            .modules
+            .iter()
+            .map(|(name, e)| (name.clone(), e.root.clone()))
+            .collect();
     }
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -42,11 +169,40 @@ pub fn collect(dir: &Path, index: Option<&ModuleIndex>) -> Vec<(String, PathBuf)
         .filter(|p| p.is_dir())
         .collect();
     dirs.sort();
-    let mut out = Vec::new();
-    for d in dirs {
-        let p = d.join(SEED_FILE);
-        if p.is_file() {
-            out.push((d.file_name().unwrap().to_string_lossy().into_owned(), p));
+    dirs.into_iter()
+        .map(|d| (d.file_name().unwrap().to_string_lossy().into_owned(), d))
+        .collect()
+}
+
+/// 是否存在**任何** seed 候选（用于「无 default 库」的告警判定：零 seed 的工程
+/// 不该因为没配库而每次启动都刷一条 warn）。
+fn any_seed(dir: &Path, index: Option<&ModuleIndex>) -> bool {
+    module_roots(dir, index).iter().any(|(_, root)| {
+        let set = scan(root);
+        !set.candidates.is_empty() || !set.misnamed.is_empty()
+    })
+}
+
+/// 收集各模块的 seed（dev: `src/<m>/`，release: `dist/<m>-<v>/`），按模块名排序。
+///
+/// 模块根由 [`module_roots`] 定位（`index` 覆盖时模块根可不在首层，首层扫会**静默漏掉
+/// 种子**——评审（丁）：种子不灌且无报错比启动失败更坏）。
+pub fn collect(dir: &Path, index: Option<&ModuleIndex>, dialect: Dialect) -> Collected {
+    let mut out = Collected {
+        files: Vec::new(),
+        skipped: Vec::new(),
+        misnamed: Vec::new(),
+    };
+    for (name, root) in module_roots(dir, index) {
+        let p = pick(&root, dialect);
+        if let Some(f) = p.chosen {
+            out.files.push((name.clone(), f));
+        }
+        for f in p.skipped {
+            out.skipped.push((name.clone(), f));
+        }
+        for (tag, f) in p.misnamed {
+            out.misnamed.push((name.clone(), tag, f));
         }
     }
     out
@@ -185,8 +341,10 @@ pub fn translate_insert<'a>(stmt: &'a str, d: Dialect) -> Cow<'a, str> {
     }
 }
 
-/// 启动重放（from_config 调用）：各模块 `seed.sql`（目录名排序）。
-/// 无种子文件 → 静默返回；有种子但 default 库缺失 → warn 跳过。
+/// 启动重放（from_config 调用）：各模块按当前方言取 `seed.<tag>.sql` / `seed.sql`
+/// （目录名排序，方言件胜出、通用件兜底）。
+/// 无种子文件 → 静默返回；有种子但 default 库缺失 → warn 跳过；模块只有别的方言件
+/// 且无通用件 → warn 点名（该模块本轮无种子）。
 /// 三方言都重放（幂等靠 S006 门禁 + 方言改写 + SQL 自身）；先全量冲突检查（S002）
 /// 再执行——失败不落任何副作用。
 pub async fn replay_all(
@@ -194,23 +352,74 @@ pub async fn replay_all(
     dir: &Path,
     index: Option<&ModuleIndex>,
 ) -> Result<(), String> {
-    let modules = collect(dir, index);
-    if modules.is_empty() {
-        return Ok(());
-    }
     let Some(db) = default else {
-        tracing::warn!("seed skipped: no default db");
-        eprintln!("warn: seed skipped (no default db)");
+        // 零 seed 的工程（静态站 / 纯 kv API）不该因为没配库而每次启动刷 warn。
+        if any_seed(dir, index) {
+            tracing::warn!("seed skipped: no default db");
+            eprintln!("warn: seed skipped (no default db)");
+        }
         return Ok(());
     };
     // 门控（T8）：未知方言（不在 builder-known 子集）一律 fail-loud，错误文本点名方言，
     // 绝不回落 Sqlite。复用 db_error::unsupported 构造器渲染文本。
+    // 顺序：门控**先于**收集——零 seed 的工程同样要拦（否则方言选文件无从谈起）。
     let dialect_name = db.dialect_info().name.clone();
-    if Dialect::known(&dialect_name).is_none() {
+    let Some(dialect) = Dialect::known(&dialect_name) else {
         return Err(only_js::bridge::db_error::unsupported(&dialect_name, "seed").message);
+    };
+    let plan = collect(dir, index, dialect);
+    // 缺口告警：模块只有**别的**方言的 seed 件、且没有通用件 → 该模块本轮没有种子。
+    // 「模块没有 seed」是常态（业务模块大多不灌），不能全量 warn，只在这一种情形提示。
+    if !plan.skipped.is_empty() {
+        let missing = seed_name(dialect);
+        // 按模块分组：同一模块可能同时放着两份别的方言件，一条 warn 报全。
+        let mut by_module: std::collections::BTreeMap<&str, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for (name, p) in &plan.skipped {
+            by_module.entry(name.as_str()).or_default().push(show(p));
+        }
+        for (name, files) in by_module {
+            let list = files.join(", ");
+            tracing::warn!(
+                module = name,
+                files = %list,
+                dialect = dialect.as_str(),
+                "seed skipped: no matching dialect file"
+            );
+            eprintln!(
+                "warn: seed skipped: {name} 只有 {list}，当前方言 {} 需要 {missing} 或 {SEED_GENERIC}",
+                dialect.as_str()
+            );
+        }
+    }
+    // 文件名标签拼错（如 seed.postgres.sql）→ 永远不会被执行，必须点名。
+    for (name, tag, p) in &plan.misnamed {
+        let why = if tag.is_empty() {
+            "文件名大小写不符（只认全小写 seed.sql）".to_string()
+        } else {
+            let hint = if tag.eq_ignore_ascii_case("postgres") {
+                "（postgres 要写成 pg）"
+            } else {
+                ""
+            };
+            format!("方言标签 {tag:?} 未知{hint}——只认 sqlite / mysql / pg（全小写）")
+        };
+        tracing::warn!(
+            module = name,
+            file = %show(p),
+            tag = tag.as_str(),
+            "seed skipped: unknown dialect tag in file name"
+        );
+        eprintln!(
+            "warn: seed skipped: {name} 的 {} {why}，本轮不会执行",
+            show(p)
+        );
+    }
+    if plan.files.is_empty() {
+        return Ok(());
     }
     let mut texts = Vec::new();
-    for (name, p) in &modules {
+    for (name, p) in &plan.files {
         let t = std::fs::read_to_string(p).map_err(|e| format!("read {}: {e}", show(p)))?;
         texts.push((name.as_str(), p.clone(), t));
     }
@@ -234,7 +443,7 @@ pub async fn replay_all(
     for (name, p, t) in &texts {
         let mut applied = 0usize;
         for (i, stmt) in split_statements(t).into_iter().enumerate() {
-            let sql = translate_insert(stmt, db.dialect());
+            let sql = translate_insert(stmt, dialect);
             if let Err(e) = db.exec_with_params(&sql, &[]).await {
                 tracing::error!(
                     module = name,
@@ -243,11 +452,17 @@ pub async fn replay_all(
                     stmt = %crate::migrate::log_snip(stmt),
                     "seed failed: {e}"
                 );
-                return Err(format!("seed {}: {e}", show(p)));
+                return Err(format!("seed {} (seq {i}): {e}", show(p)));
             }
             applied += 1;
         }
-        tracing::info!(module = name, file = %show(p), stmts = applied, "seed ok");
+        tracing::info!(
+            module = name,
+            file = %show(p),
+            dialect = dialect.as_str(),
+            stmts = applied,
+            "seed ok"
+        );
     }
     Ok(())
 }
@@ -407,6 +622,140 @@ mod tests {
     fn write(p: PathBuf, s: &str) {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, s).unwrap();
+    }
+
+    fn tmp(tag: &str) -> PathBuf {
+        let t = std::env::temp_dir().join(format!("oj-seed-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        t
+    }
+
+    /// 方言件存在即胜出：通用件里的建表**不得**执行（证明确实没双跑）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn dialect_seed_wins_over_generic() {
+        let t = tmp("win");
+        write(t.join("src/u/seed.sql"), "CREATE TABLE generic_t (x);");
+        write(
+            t.join("src/u/seed.sqlite.sql"),
+            "CREATE TABLE specific_t (x);",
+        );
+        let tables = replay(&t, &t.join("src")).await.unwrap();
+        let names: Vec<&str> = tables.iter().filter_map(|r| r["name"].as_str()).collect();
+        assert_eq!(names, vec!["specific_t"], "{names:?}");
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// 没有通用件时，方言件单独可用。
+    #[tokio::test(flavor = "current_thread")]
+    async fn dialect_seed_runs_without_generic() {
+        let t = tmp("solo");
+        write(t.join("src/u/seed.sqlite.sql"), "CREATE TABLE only_t (x);");
+        let tables = replay(&t, &t.join("src")).await.unwrap();
+        let names: Vec<&str> = tables.iter().filter_map(|r| r["name"].as_str()).collect();
+        assert_eq!(names, vec!["only_t"], "{names:?}");
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// 只有别的方言件 → 该模块本轮无种子，且**报告**出来（起服 warn 的来源）。
+    #[test]
+    fn unmatched_dialect_seed_is_reported_not_silent() {
+        let t = tmp("miss");
+        write(
+            t.join("src/u/seed.mysql.sql"),
+            "INSERT IGNORE INTO t VALUES (1);",
+        );
+        let plan = collect(&t.join("src"), None, Dialect::Sqlite);
+        assert!(plan.files.is_empty(), "{:?}", plan.files);
+        assert_eq!(plan.skipped.len(), 1, "{:?}", plan.skipped);
+        assert_eq!(plan.skipped[0].0, "u");
+        assert!(plan.skipped[0].1.ends_with("seed.mysql.sql"));
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// 两份别的方言件并存 → 都要报（不能只说「只有 mysql」）。
+    #[test]
+    fn all_mismatched_dialect_seeds_are_reported() {
+        let t = tmp("miss2");
+        write(
+            t.join("src/u/seed.mysql.sql"),
+            "INSERT IGNORE INTO t VALUES (1);",
+        );
+        write(t.join("src/u/seed.pg.sql"), "INSERT INTO t VALUES (1);");
+        let plan = collect(&t.join("src"), None, Dialect::Sqlite);
+        let files: Vec<String> = plan
+            .skipped
+            .iter()
+            .map(|(_, p)| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(files, vec!["seed.mysql.sql", "seed.pg.sql"]);
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// 标签写错（`postgres` 而非 `pg`）或大小写不符 → 永远不会被执行，必须点名。
+    #[test]
+    fn misnamed_dialect_tag_is_reported() {
+        let t = tmp("tag");
+        write(
+            t.join("src/u/seed.postgres.sql"),
+            "INSERT OR IGNORE INTO t VALUES (1);",
+        );
+        write(
+            t.join("src/u/SEED.MYSQL.SQL"),
+            "INSERT IGNORE INTO t VALUES (1);",
+        );
+        let plan = collect(&t.join("src"), None, Dialect::Postgres);
+        assert!(plan.files.is_empty(), "{:?}", plan.files);
+        let tags: Vec<&str> = plan
+            .misnamed
+            .iter()
+            .map(|(_, tag, _)| tag.as_str())
+            .collect();
+        assert!(tags.contains(&"postgres"), "{tags:?}");
+        assert!(tags.contains(&"MYSQL"), "{tags:?}");
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// 零 seed 的工程不该因为没配 default 库而告警（any_seed 是那条告警的闸门）。
+    #[test]
+    fn any_seed_is_false_without_any_candidate() {
+        let t = tmp("anys");
+        std::fs::create_dir_all(t.join("src/u")).unwrap();
+        assert!(!any_seed(&t.join("src"), None));
+        write(t.join("src/u/seed.sql"), "x;");
+        assert!(any_seed(&t.join("src"), None));
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// 命名边界：`.bak` 后缀与目录不算 seed；`Seed.Sql` / `seed..sql` 不 panic，
+    /// 且都不进候选（`scan` 按文件名精确匹配，行为跨平台一致）。
+    #[test]
+    fn scan_ignores_non_seed_names_and_never_panics() {
+        let t = tmp("scan-edge");
+        std::fs::create_dir_all(t.join("src/u/seed.foo.sql")).unwrap();
+        write(t.join("src/u/seed.sql.bak"), "x;");
+        write(t.join("src/u/seed.mysql.sql.bak"), "x;");
+        write(t.join("src/u/Seed.Sql"), "x;");
+        write(t.join("src/u/seed..sql"), "x;");
+        let set = scan(&t.join("src/u"));
+        assert!(set.candidates.is_empty(), "{:?}", set.candidates);
+        let tags: Vec<&str> = set.misnamed.iter().map(|(tag, _)| tag.as_str()).collect();
+        assert_eq!(tags, vec!["", ""], "{tags:?}"); // 仅两个大小写/空标签变体被点名
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// 候选清单只列实际存在的文件，四类名一次给全（S003/S006 与运行时共用）。
+    #[test]
+    fn seed_candidates_list_existing_variants() {
+        let t = tmp("cand");
+        write(t.join("src/u/seed.sql"), "x;");
+        write(t.join("src/u/seed.pg.sql"), "x;");
+        let names: Vec<String> = seed_candidates(&t.join("src/u"))
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["seed.sql", "seed.pg.sql"]);
+        assert!(seed_candidates(&t.join("src/none")).is_empty());
+        let _ = std::fs::remove_dir_all(&t);
     }
 
     #[tokio::test(flavor = "current_thread")]

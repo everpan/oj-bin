@@ -331,7 +331,9 @@ pub fn load_migrations(dir: &Path, dialect: Dialect) -> Result<Vec<Migration>, S
     Ok(out)
 }
 
-fn dialect_tag(d: Dialect) -> &'static str {
+/// 方言文件名标签：迁移的 `{seq}__{desc}.{tag}.sql` 与 seed 的 `seed.{tag}.sql` 共用
+/// 这一份映射（两处各写一套字符串迟早漂移）。
+pub(crate) fn dialect_tag(d: Dialect) -> &'static str {
     match d {
         Dialect::Sqlite => "sqlite",
         Dialect::MySql => "mysql",

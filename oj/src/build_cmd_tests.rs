@@ -1132,6 +1132,12 @@ async fn build_copies_module_sql_and_excludes_fixtures() {
         "INSERT OR IGNORE INTO account VALUES (1, 'neo');\n",
     )
     .unwrap();
+    // 方言 seed 也是普通 .sql：与通用件一样原样进 dist（运行时再按方言二选一）。
+    std::fs::write(
+        t.join("src/user/seed.mysql.sql"),
+        "INSERT IGNORE INTO account VALUES (2, 'trinity');\n",
+    )
+    .unwrap();
     std::fs::write(
         t.join("src/user/schema.yaml"),
         "tables:\n  account:\n    pk: id\n    columns:\n      id: { type: integer }\n",
@@ -1155,6 +1161,10 @@ async fn build_copies_module_sql_and_excludes_fixtures() {
     assert_eq!(
         std::fs::read(vd.join("seed.sql")).unwrap(),
         b"INSERT OR IGNORE INTO account VALUES (1, 'neo');\n"
+    );
+    assert_eq!(
+        std::fs::read(vd.join("seed.mysql.sql")).unwrap(),
+        b"INSERT IGNORE INTO account VALUES (2, 'trinity');\n"
     );
     assert!(vd.join("schema.yaml").is_file());
     assert!(vd.join("migrations/0001__init.sql").is_file());

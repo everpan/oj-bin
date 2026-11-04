@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use only_js::bridge::import_scan::specifier_spans;
-use only_js::bridge::{ModuleIndex, stray_manifests};
+use only_js::bridge::{Dialect, ModuleIndex, stray_manifests};
 
 use crate::manifest::{self, Manifest};
 
@@ -114,13 +114,12 @@ pub fn run(
             ));
         }
 
-        // S003：模块 SQL（.ts 源码字符串 + seed.sql）引用他模块表且未声明 deps。
+        // S003：模块 SQL（.ts 源码字符串 + 全部 seed 变体）引用他模块表且未声明 deps。
+        // seed 按方言分文件（`seed.sql` 通用 + `seed.<tag>.sql`），每个变体都要查——
+        // 只看通用件会让方言件里的跨模块引用漏网。
         let mut files: Vec<PathBuf> = collect_ts(&mdir);
-        let seed = mdir.join("seed.sql");
-        let has_seed = seed.is_file();
-        if has_seed {
-            files.push(seed.clone());
-        }
+        let seeds = crate::seed::scan(&mdir);
+        files.extend(seeds.candidates.iter().cloned());
         for f in &files {
             let text =
                 std::fs::read_to_string(f).map_err(|e| format!("read {}: {e}", f.display()))?;
@@ -231,9 +230,12 @@ pub fn run(
             }
         }
 
-        // S006：seed.sql 禁 DDL / 禁非幂等 INSERT / 只碰本模块表与 deps 模块表。
-        if has_seed {
-            let text = std::fs::read_to_string(&seed)
+        // S006：seed 禁 DDL / 禁非幂等 INSERT / 只碰本模块表与 deps 模块表。
+        // 逐变体检查（通用件 + 各方言件），报错点名真实文件；幂等判据按该文件的方言放宽
+        // （mysql 件可写原生 `INSERT IGNORE`，通用件写它是语法错，不放行）。
+        for seed in &seeds.candidates {
+            let dialect = crate::seed::seed_dialect_of(seed);
+            let text = std::fs::read_to_string(seed)
                 .map_err(|e| format!("read {}: {e}", seed.display()))?;
             for stmt in text.split(';').map(str::trim).filter(|s| !s.is_empty()) {
                 let head = lead_word(stmt);
@@ -242,15 +244,15 @@ pub fn run(
                     "CREATE" | "ALTER" | "DROP" | "TRUNCATE" | "RENAME" | "GRANT" | "COMMENT"
                 ) {
                     v.push(format!(
-                        "S006: {}：seed.sql 含 DDL（{head} …）\n  \
+                        "S006: {}：seed 含 DDL（{head} …）\n  \
                          下一步：结构演进写 migrations/NNNN__desc.sql 或 schema.yaml 声明",
                         seed.display()
                     ));
                 }
-                if head == "INSERT" && !insert_is_idempotent(stmt) {
+                if head == "INSERT" && !insert_is_idempotent_in(stmt, dialect) {
                     v.push(format!(
-                        "S006: {}：seed.sql 含非幂等 INSERT（seed 随启动重放）\n  \
-                         下一步：改 INSERT OR IGNORE / ON CONFLICT DO UPDATE / OR REPLACE",
+                        "S006: {}：seed 含非幂等 INSERT（seed 随启动重放）\n  \
+                         下一步：改 INSERT OR IGNORE / INSERT IGNORE / ON CONFLICT DO UPDATE / OR REPLACE",
                         seed.display()
                     ));
                 }
@@ -261,12 +263,33 @@ pub fn run(
                     && !deps.contains_key(o)
                 {
                     v.push(format!(
-                        "S006: {}：seed.sql 写入他模块表 {table:?}（属于 {o}）\n  \
+                        "S006: {}：seed 写入他模块表 {table:?}（属于 {o}）\n  \
                          下一步：种子数据移到 {o} 模块（归属模块自持种子）",
                         seed.display()
                     ));
                 }
             }
+        }
+
+        // S006：方言文件名标签写错（如 `seed.postgres.sql`——框架方言名正是 postgres，
+        // 文件名标签却是 pg）→ 既不在候选里、也不会被执行，必须报错而不是静默。
+        for (tag, p) in &seeds.misnamed {
+            let why = if tag.is_empty() {
+                "seed 文件名大小写不符（只认全小写 seed.sql）".to_string()
+            } else {
+                format!("seed 文件名的方言标签 {tag:?} 未知（只认 sqlite / mysql / pg，全小写）")
+            };
+            let hint = if tag.eq_ignore_ascii_case("postgres") {
+                "seed.pg.sql".to_string()
+            } else if tag.is_empty() {
+                crate::seed::SEED_GENERIC.to_string()
+            } else {
+                format!("seed.{tag}.sql")
+            };
+            v.push(format!(
+                "S006: {}：{why}\n  下一步：改名 {hint}，或并入通用 seed.sql",
+                p.display()
+            ));
         }
     }
 
@@ -415,12 +438,98 @@ pub(crate) fn lead_word(stmt: &str) -> String {
 
 /// INSERT 幂等判据（S006 seed 与 `load_fixtures` 门禁共用同一口径）：两者都随启动/
 /// 重复灌放，必须可重放。
+///
+/// 不传方言 = 保守口径（只认跨方言/多方言通用的四种形态）：
+/// `OR IGNORE` / `OR REPLACE`（sqlite 惯用法，引擎会按方言改写）、`ON CONFLICT`（pg/sqlite）、
+/// `ON DUPLICATE KEY`（mysql）。
 pub(crate) fn insert_is_idempotent(stmt: &str) -> bool {
-    let u = stmt.to_ascii_uppercase();
-    u.contains("OR IGNORE")
-        || u.contains("OR REPLACE")
-        || u.contains("ON CONFLICT")
-        || u.contains("ON DUPLICATE KEY")
+    insert_is_idempotent_in(stmt, None)
+}
+
+/// 同上，但按**该文件实际要跑的方言**收敛：方言件写错方言的幂等形态（mysql 件写
+/// `ON CONFLICT`、pg 件写 `ON DUPLICATE KEY`、非 sqlite 件写 `OR REPLACE`）会放行到
+/// 起服才 1064——静态门禁应当早报。
+/// `OR IGNORE` 任何方言都收：`translate_insert` 会按目标方言改写成 `INSERT IGNORE` /
+/// `ON CONFLICT DO NOTHING`。
+pub(crate) fn insert_is_idempotent_in(stmt: &str, dialect: Option<Dialect>) -> bool {
+    let t = code_tokens(stmt);
+    let has = |seq: &[&str]| t.len() >= seq.len() && t.windows(seq.len()).any(|w| w == seq);
+    let or_ignore = has(&["OR", "IGNORE"]);
+    let or_replace = has(&["OR", "REPLACE"]);
+    let on_conflict = has(&["ON", "CONFLICT"]);
+    let on_duplicate = has(&["ON", "DUPLICATE", "KEY"]);
+    let insert_ignore = has(&["INSERT", "IGNORE"]);
+    match dialect {
+        // 通用件：维持既有口径（不新收紧，避免既有工程由绿变红）。
+        None => or_ignore || or_replace || on_conflict || on_duplicate,
+        Some(Dialect::Sqlite) => or_ignore || or_replace || on_conflict,
+        Some(Dialect::MySql) => or_ignore || insert_ignore || on_duplicate,
+        Some(Dialect::Postgres) => or_ignore || on_conflict,
+    }
+}
+
+/// SQL 关键字 token（大写）：剥 `--` 行注释、`/* */` 块注释与 `'…'` 字符串字面量，
+/// 只留标识符/数字。幂等判据按 token 相邻匹配，避免「注释里提到 INSERT IGNORE」
+/// 「字符串值里出现 ON CONFLICT」这类误判。
+fn code_tokens(sql: &str) -> Vec<String> {
+    fn flush(out: &mut Vec<String>, cur: &mut String) {
+        if !cur.is_empty() {
+            out.push(std::mem::take(cur));
+        }
+    }
+    /// 跳过 `q` 包裹的字面量（`""` / `''` 为转义）；未闭合则吃到结尾。
+    fn skip_quoted(b: &[u8], mut i: usize, q: u8) -> usize {
+        i += 1;
+        while i < b.len() {
+            if b[i] == q {
+                if b.get(i + 1) == Some(&q) {
+                    i += 2;
+                    continue;
+                }
+                return i + 1;
+            }
+            i += 1;
+        }
+        i
+    }
+    let b = sql.as_bytes();
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                flush(&mut out, &mut cur);
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                flush(&mut out, &mut cur);
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(b.len());
+            }
+            // 单引号字符串；双引号在 mysql 默认模式下也是字符串（pg/sqlite 是标识符）——
+            // 两种解释下内容都不是可供匹配的关键字，统一跳过。
+            q @ (b'\'' | b'"') => {
+                flush(&mut out, &mut cur);
+                i = skip_quoted(b, i, q);
+            }
+            c if c.is_ascii_alphanumeric() || c == b'_' || c == b'$' => {
+                cur.push(c.to_ascii_uppercase() as char);
+                i += 1;
+            }
+            _ => {
+                flush(&mut out, &mut cur);
+                i += 1;
+            }
+        }
+    }
+    flush(&mut out, &mut cur);
+    out
 }
 
 /// SQL 表名提取（口径统一 guard::extract_tables）。.ts 源码先抠 JS 字符串/
