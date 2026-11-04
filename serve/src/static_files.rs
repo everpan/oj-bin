@@ -729,6 +729,42 @@ fn cache_key(
     )
 }
 
+/// 分层缓存路径（v0.1.119）：`<dir>/<key 前 2 hex>/<key>`——键首段即 sha1 hex，
+/// 256 个子目录摊薄单目录条目数；落盘/命中/逐出扫描都只碰本键所在的子目录。
+fn cache_path(dir: &Path, key: &str) -> std::path::PathBuf {
+    dir.join(&key[..2]).join(key)
+}
+
+/// v0.1.118 及更早的平铺缓存一次性迁移（v0.1.119 分层）：启动期把 `<dir>` 顶层的
+/// 键文件 rename 进 `<dir>/<键前 2 hex>/`，遗留 `.tmp-` 残件删除。缓存是派生数据，
+/// 任何一步失败静默放过（fail-open：下次 miss 现压重写）；已分层的目录顶层只剩
+/// 子目录，本函数空跑（is_file 过滤）。
+pub fn migrate_flat_cache(dir: &Path) {
+    let is_hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if !p.is_file() {
+            continue;
+        }
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if name.contains(".tmp-") {
+            let _ = std::fs::remove_file(&p);
+            continue;
+        }
+        let b = name.as_bytes();
+        // 键形下限：40 hex sha1 + 起码的 ino/mtime/len/算法段；前 2 字节全 hex
+        // 才迁移（同时保证 &name[..2] 切片在字符边界上）。
+        if b.len() > 42 && b[..2].iter().all(|&c| is_hex(c)) {
+            let _ = std::fs::create_dir_all(dir.join(&name[..2]));
+            let _ = std::fs::rename(&p, cache_path(dir, &name));
+        }
+    }
+}
+
 /// leader 退出即清登记并广播收尾（先 remove 后 send：follower 端 map 查空即返回，
 /// 已订阅者经 watch 版本号必醒——notify_waiters 的「注册先于通知」竞态已废弃）。
 struct InflightGuard(String);
@@ -742,7 +778,7 @@ impl Drop for InflightGuard {
 
 /// 取压缩体（spec D3/D13/D14）：缓存命中直读（不读原文不压缩）→ miss 经 single-flight
 /// 成为 leader：信号量限流下读原文压缩、原子落盘（tmp+rename，Windows 先 remove）、
-/// 删同 `{sha1}-` 前缀旧代；cache_dir 未配或写失败 → 纯内存直压（fail-open）。
+/// 在本键子目录内删同 `{sha1}-` 前缀旧代；cache_dir 未配或写失败 → 纯内存直压（fail-open）。
 /// None = 压缩无收益（D6），调用方出 identity。
 pub(crate) async fn compressed_body_or_cache(
     file: &Path,
@@ -754,7 +790,7 @@ pub(crate) async fn compressed_body_or_cache(
     let key = cache_key(file, meta, enc, opts);
     async fn cached(d: Option<&Path>, k: &str) -> Option<Vec<u8>> {
         match d {
-            Some(d) => tokio::fs::read(d.join(k)).await.ok(),
+            Some(d) => tokio::fs::read(cache_path(d, k)).await.ok(),
             None => None,
         }
     }
@@ -812,11 +848,14 @@ pub(crate) async fn compressed_body_or_cache(
         return None; // 无收益（D6）：调用方出 identity
     };
     if let Some(d) = dir {
-        let tmp = d.join(format!("{}.tmp-{}", key, std::process::id()));
-        if tokio::fs::write(&tmp, &out).await.is_ok() {
+        let shard = d.join(&key[..2]);
+        let tmp = shard.join(format!("{}.tmp-{}", key, std::process::id()));
+        if tokio::fs::create_dir_all(&shard).await.is_ok()
+            && tokio::fs::write(&tmp, &out).await.is_ok()
+        {
             #[cfg(target_os = "windows")]
-            let _ = tokio::fs::remove_file(d.join(&key)).await;
-            if tokio::fs::rename(&tmp, d.join(&key)).await.is_ok() {
+            let _ = tokio::fs::remove_file(cache_path(d, &key)).await;
+            if tokio::fs::rename(&tmp, cache_path(d, &key)).await.is_ok() {
                 // 代际前缀取到**算法段**（spec D14：每路径×算法恒一代）——只取 sha1
                 // 段会让 br/gz 互换逐出，混合编码流量下缓存永久打穿（终局复审 I1）。
                 let base = key.rsplit_once('-').map(|(b, _)| b).unwrap_or(&key);
@@ -828,7 +867,7 @@ pub(crate) async fn compressed_body_or_cache(
                         "gz"
                     }
                 );
-                let mut rd = match tokio::fs::read_dir(d).await {
+                let mut rd = match tokio::fs::read_dir(&shard).await {
                     Ok(rd) => rd,
                     Err(_) => return Some(out),
                 };

@@ -207,7 +207,7 @@ async fn store_then_hit_serves_stored_bytes() {
         .unwrap();
     assert!(first.len() < 4096, "首调现场压缩");
     let key = cache_key(&f, &m, Encoding::Br, &opts);
-    std::fs::write(cd.join(&key), b"SENTINEL").unwrap();
+    std::fs::write(cd.join(&key[..2]).join(&key), b"SENTINEL").unwrap();
     std::fs::remove_file(&f).unwrap();
     let second = compressed_body_or_cache(&f, &m, Encoding::Br, &opts)
         .await
@@ -234,7 +234,12 @@ async fn concurrent_misses_compress_once() {
     let outs = futures_util::future::join_all(js).await;
     let first = outs[0].clone().unwrap();
     assert!(outs.iter().all(|o| o.as_deref() == Some(first.as_slice())));
-    assert_eq!(std::fs::read_dir(&cd).unwrap().count(), 1, "恰一代缓存");
+    let key = cache_key(&f, &m, Encoding::Br, &opts);
+    assert_eq!(
+        std::fs::read_dir(cd.join(&key[..2])).unwrap().count(),
+        1,
+        "恰一代缓存"
+    );
     let _ = (std::fs::remove_dir_all(&cd), std::fs::remove_dir_all(&wd));
 }
 
@@ -257,7 +262,8 @@ async fn new_key_prunes_same_prefix() {
         .rsplit_once('-')
         .map(|(b, _)| b.to_string())
         .unwrap();
-    let fake = cd.join(format!("{prefix}-br9"));
+    let fake = cd.join(&prefix[..2]).join(format!("{prefix}-br9"));
+    std::fs::create_dir_all(cd.join(&prefix[..2])).unwrap();
     std::fs::write(&fake, b"old").unwrap();
     let opts6 = StaticLayerOpts {
         brotli_quality: 6,
@@ -268,7 +274,9 @@ async fn new_key_prunes_same_prefix() {
         .unwrap();
     assert!(!fake.exists(), "旧代被清理");
     assert!(
-        cd.join(cache_key(&f, &m, Encoding::Br, &opts6)).exists(),
+        cd.join(&prefix[..2])
+            .join(cache_key(&f, &m, Encoding::Br, &opts6))
+            .exists(),
         "新键存在"
     );
     let _ = (std::fs::remove_dir_all(&cd), std::fs::remove_dir_all(&wd));
@@ -289,6 +297,30 @@ async fn unwritable_dir_falls_back_memory() {
     let out = compressed_body_or_cache(&f, &m, Encoding::Br, &opts).await;
     assert!(out.is_some());
     let _ = std::fs::remove_dir_all(&wd);
+}
+
+/// Given v0.1.118 平铺布局的旧键文件 + `.tmp-` 残件 + 已分层的子目录
+/// When migrate_flat_cache
+/// Then 键文件迁入 `<2hex>/`（内容不变）；tmp 残件删除；子目录不动
+#[test]
+fn flat_cache_migrated_to_shards() {
+    let cd = tmp_dir("mig-cd");
+    // 键形下限（>42 且前 2 位 hex）的真实长度样例
+    let name = format!("ab{}", "9e3".repeat(17));
+    std::fs::write(cd.join(&name), b"OLD").unwrap();
+    std::fs::write(cd.join(format!("{name}.tmp-42")), b"t").unwrap();
+    std::fs::create_dir_all(cd.join("ab")).unwrap();
+    std::fs::write(cd.join("ab").join("kept"), b"kept").unwrap();
+    migrate_flat_cache(&cd);
+    assert_eq!(
+        std::fs::read(cd.join("ab").join(&name)).unwrap(),
+        b"OLD",
+        "平铺键文件迁入子目录且内容不变"
+    );
+    assert!(!cd.join(&name).exists());
+    assert!(!cd.join(format!("{name}.tmp-42")).exists(), "tmp 残件被清");
+    assert_eq!(std::fs::read(cd.join("ab").join("kept")).unwrap(), b"kept");
+    let _ = std::fs::remove_dir_all(&cd);
 }
 
 // —— T5 serve_web 组装（B1 fixture） ——
@@ -689,8 +721,10 @@ async fn br_and_gzip_coexist_same_cache() {
         .unwrap();
     let br_key = cache_key(&f, &m, Encoding::Br, &opts);
     let gz_key = cache_key(&f, &m, Encoding::Gzip, &opts);
-    assert!(cd.join(&br_key).exists(), "br 代在");
-    assert!(cd.join(&gz_key).exists(), "gz 代在");
+    // 同一文件两代共享同一 sha1 → 同一 `<2hex>/` 子目录
+    let shard = cd.join(&br_key[..2]);
+    assert!(shard.join(&br_key).exists(), "br 代在");
+    assert!(shard.join(&gz_key).exists(), "gz 代在");
     // gz 换 quality 新代 → 只逐 gz 旧代，br 不动
     let gz7 = StaticLayerOpts {
         gzip_level: 7,
@@ -699,10 +733,10 @@ async fn br_and_gzip_coexist_same_cache() {
     compressed_body_or_cache(&f, &m, Encoding::Gzip, &gz7)
         .await
         .unwrap();
-    assert!(cd.join(&br_key).exists(), "br 缓存不被 gz 换代逐出");
-    assert!(!cd.join(&gz_key).exists(), "gz 旧代被清");
+    assert!(shard.join(&br_key).exists(), "br 缓存不被 gz 换代逐出");
+    assert!(!shard.join(&gz_key).exists(), "gz 旧代被清");
     assert!(
-        cd.join(cache_key(&f, &m, Encoding::Gzip, &gz7)).exists(),
+        shard.join(cache_key(&f, &m, Encoding::Gzip, &gz7)).exists(),
         "gz 新代在"
     );
     let _ = (std::fs::remove_dir_all(&cd), std::fs::remove_dir_all(&wd));

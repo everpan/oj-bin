@@ -803,14 +803,16 @@ pub(crate) fn static_opts_of(
             Some(config_dir.join(p))
         }
     };
-    if let Some(d) = &cache_dir
-        && let Err(e) = std::fs::create_dir_all(d)
-    {
-        // 不 panic：运行期写缓存时 fail-open（T4 仓库层回退纯内存直压）。
-        eprintln!(
-            "warn: server.static.compress_cache_dir 创建失败（{e}）：{}——将回退纯内存直压",
-            d.display()
-        );
+    if let Some(d) = &cache_dir {
+        if let Err(e) = std::fs::create_dir_all(d) {
+            // 不 panic：运行期写缓存时 fail-open（T4 仓库层回退纯内存直压）。
+            eprintln!(
+                "warn: server.static.compress_cache_dir 创建失败（{e}）：{}——将回退纯内存直压",
+                d.display()
+            );
+        }
+        // v0.1.119 分层：把旧版平铺键文件迁入 <2hex>/ 子目录（静默 fail-open）。
+        serve::static_files::migrate_flat_cache(d);
     }
     Ok((
         Some(serve::StaticLayerOpts {

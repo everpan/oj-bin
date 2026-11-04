@@ -21,3 +21,6 @@ secrets-private.pem
 # git worktrees（superpowers 隔离工作区）
 .worktrees/
 /mutants.out*/
+
+# 静态压缩缓存目录（默认 <config_dir>/compress-cache，派生数据可整删）。
+compress-cache/

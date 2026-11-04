@@ -106,7 +106,7 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | 升级 v0.1.116 后响应多出 `Content-Encoding`/`Vary`/`Cache-Control` 头 / 静态资产被浏览器「永远」缓存 | v0.1.116 静态压缩与默认缓存**默认开**（CHANGELOG 行为变更）。回退：`server.static.compression: false` / `server.static.web_cache_policy: none`。未哈希资产（文件名无哈希段）恒 `no-cache` 是**特性**——要长缓存给 `mounts[].headers` 显式配；`config-production.js` 这类纯字母段名不会被误钉 immutable |
 | 前置 CDN/缓存层出现压缩体/明文体互串 | 缓存层没按 `Vary: Accept-Encoding` 分键（oj 恒带该头）。确认不了就 `server.static.compression: false` 让前置层独揽压缩；oj 之上再挂 nginx gzip 属双压冗余（nginx 见 `Content-Encoding` 会跳过，但缓存分键问题仍在） |
 | 升级后 HEAD 探针不再 405，但监控流量/副作用暴涨 | v0.1.116 起 HEAD **真实执行 GET handler**（含鉴权与副作用）——HEAD 不再是空操作。探针选轻路由、拉长间隔；按状态码族判活（受保护端点无 token → 401 是正常语义不是宕机；证书过期期 HEAD 同 403）。有副作用的「GET」应改成 POST 或自写 `head()` 顶掉镜像 |
-| 压缩缓存目录膨胀 | `<config_dir>/compress-cache` 是派生数据：可整目录删除按需重建；键含 mtime+len+inode+算法+质量，写新清旧恒一代。只读根/多实例：`compress_cache_dir: ""`（内存直压）或各实例指各自目录 |
+| 压缩缓存目录膨胀 | `<config_dir>/compress-cache` 是派生数据：可整目录删除按需重建；v0.1.119 起按键前 2 hex 分 `<2hex>/` 子目录落盘（旧平铺文件启动时自动迁入）。键含 mtime+len+inode+算法+质量，写新清旧恒一代。只读根/多实例：`compress_cache_dir: ""`（内存直压）或各实例指各自目录 |
 | 租户 scoped 表在 sql_guard 下 `db.import` 被拒（`import_under_guard` / `OJ_DB_UNSUPPORTED(capability="import_under_guard")`） | **守卫只能验「某参数=当前 tid」，无法证明导入的每一行都属于该租户**——已登记且 tenant-scoped 的表在 Warn/Deny 下 fail-closed 是刻意设计（放行绝不宽于等效裸 INSERT）。绕行：非 scoped 表导入，或逐行带 tenant 列的 upsert 等逐行租户强制的未来能力；别试图用未登记表绕——Deny 档未登记同样拒 |
 | 取消 sqlite 导入后 `importStatus.rows` 是 0、库也是空的 | sqlite append/upsert 走**全单事务**（性能关键）：cancel/fail = 整回滚。PG/MySQL 才是「已提交批保留（rows>0）」。跨方言代码勿假设取消后 rows>0，按 state 分流 |
 | 同一份 CSV `db.import` 跑两遍报主键冲突 | **append 不误称幂等**——重复导入撞约束是预期行为。要幂等用 `mode:"upsert"`（PG 任意唯一键 / MySQL 需表上有唯一键 / sqlite 仅 `conflictKeys:["rowid"]`）或 `mode:"replace"` |
