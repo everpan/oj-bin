@@ -2405,6 +2405,9 @@ curl -s http://localhost:9778/v1/platform/ojm-installer/   # {"code":0,"data":{"
 > `exec.run` 无 shell，argv 必须恰命中一条 `platform.exec.<模块>.allow` 授权模板；
 > **安全判定后置**——`tar -tzf` 预检只是快速失败优化，权威校验 = 解压后对目标目录
 > 全量 walk。手册 §6「exec」、§10「platform」。
+>
+> 跨平台：macOS / Linux / Windows 三端同一套模板可用——Windows 10 1803+ 自带 bsdtar
+> （`C:\Windows\System32\tar.exe`），裸名 `tar` 由 resolver 按 `PATHEXT` 补全（v0.1.117）。
 
 ### ① 配置（在场景 33 基础上给 exec 加 tar 模板）
 
@@ -2452,6 +2455,9 @@ async function post() {
   }
 
   // ② 解压到 .staging（jail 内；cwd 已钉在 fs.root，${path:} 值经路径校验）
+  //    tar -C 要求目标目录**已存在**（GNU tar / bsdtar 一致：不存在即 could not chdir 退出），
+  //    故先建目录——tar 不会替你创建 -C 的落点。
+  await fs.mkdir(staging, { recursive: true });
   await exec.run(["tar", "-xzf", archive, "-C", staging]);
 
   // ③ 权威校验：解压后对 staging 全量 walk——symlink/hardlink/设备零容忍 + 体积对账
@@ -2499,11 +2505,13 @@ ls data/dist/pkg-1.0.0
 | `NotCapable: … not authorized for exec` / `template mismatch` | 模块没进 `platform.exec` 授权表；或 argv 与模板 literal 不逐字 / token 数不齐 / `${raw:}` 收到 `-` 开头 token。**exec 授权 ≠ `platform.modules`**，两名单独立 |
 | `exec template ambiguous: argv matches N authorized templates` | 同一 argv 命中 ≥2 条模板（如 `tar -tzf ${path:a}` 与 `tar ${raw:x} ${path:a}` 都能吃 `tar -tzf a.tgz`）——收紧模板消除歧义，宿主不静默择一 |
 | `NotCapable: exec ${path:archive}: path outside fs.root and trusted_paths …` | 归档/目标路径越出 `fs.root ∪ trusted_paths`——把所在目录根加进 `trusted_paths`，或把文件挪进 jail |
-| `exec: command resolve failed for 'tar': … not found in PATH` | 部署机没有 tar——依赖由部署文档声明（macOS bsdtar / Linux GNU tar 方言差异被后置 walk 校验天然覆盖） |
+| `exec: command resolve failed for 'tar': … not found in PATH` | 部署机**确实没有** tar 可执行文件（不是编码 / 权限 / 模板问题）。Windows 10 1803+ 自带 bsdtar（`C:\Windows\System32\tar.exe`），裸名 `tar` 由 resolver 按 `PATHEXT` 补全为 `tar.exe` 后 spawn，**模板与业务代码零改动**；更老系统或精简镜像需自行安装，并确认其目录在**宿主进程**的 PATH 里（`platform.exec.env` 不影响解析，解析在 spawn 前完成）。macOS bsdtar / Linux GNU tar 的方言差异由后置 walk 校验天然覆盖 |
 | `exec output limit exceeded` / `exec timed out after N ms` | `tar -tzf` 大包成员列表可超 stdout 合计 10MB；大包解压超缺省 30s——显式调大 `timeoutMs`（硬上限 600s） |
 | 只做 `-tzf` 预检就信任归档 | 预检与解压之间归档可被同 jail 模块置换（TOCTOU）；**权威校验是解压后 walk**（symlink/hardlink/设备零容忍、组件级拒 `..`、体积对账）——三步一步都不能省 |
 | 给 `${raw:}` 传文件路径 | `${raw:}` 拒 `-` 开头与绝对形态（`/`、`\`、盘符起手），传路径请用 `${path:}`（它才做 jail 校验） |
-| 子进程拿到的 argv[0] 不是 "tar" 原文 | 预期：宿主把模板首 token 解析为绝对路径（按宿主 PATH）再传给子进程；模板首 token 必须是裸名 |
+| 解压报 `tar: … could not chdir to '<staging>': No such file or directory`（GNU tar 为 `Cannot open`） | `-C` 的落点必须**已存在**——tar 从不创建它。解压前 `await fs.mkdir(staging, { recursive: true })`（② 已示范）；另两种来源：上一次失败已 `fs.remove(staging)`、或模板 `${path:dest}` 与实际传入目录不一致 |
+| 子进程拿到的 argv[0] 不是 "tar" 原文 | 预期：宿主把模板首 token 解析为绝对路径（按宿主 PATH；Windows 裸名再按 `PATHEXT` 补 `.exe` / `.cmd`，故 `argv[0]` 可能是 `…\tar.exe`）再传给子进程；模板首 token 必须是裸名（带 `/`、`\` 直接拒） |
+| Windows 上成员名 / 校验和里出现 `�`（U+FFFD） | 子进程输出是本地代码页（GBK / CP1252），非 UTF-8 字节按有损解码返回，结果带 `encoding: "lossy"`（v0.1.117；此前缓冲形态直接抛 `not valid UTF-8`）。纯 ASCII 成员名不受影响；要精确字节改用 `exec.spawn` 取原始 `Uint8Array` 并按实际代码页解码（如 `new TextDecoder("gbk")`）。解压落盘的文件名由 **tar 自身**按代码页处理，与本层解码无关 |
 
 ---
 
@@ -2596,6 +2604,7 @@ async function post() {
   // 为什么 fail-closed：解压前先做 -tzf 预检 + 成员名复检，解压后全量 walk 校验（symlink 零容忍
   // + 体积对账），任一步失败删掉整个 staging 再抛——不部分落盘（同场景 34 三步范式）。
   const staging = `dist/.staging/${name}-${version}-${Date.now()}`;
+  await fs.mkdir(staging, { recursive: true });                      // tar -C 要求落点已存在
   await exec.run(["tar", "-tzf", archive], { timeoutMs: 120000 });   // 预检（快速失败）
   await exec.run(["tar", "-xzf", archive, "-C", staging], { timeoutMs: 120000 });
   // ……（此处省略 walk 校验：同场景 34③ 的 symlink/体积对账，失败先 fs.remove(staging, {recursive:true})）
@@ -2890,7 +2899,7 @@ export async function post() {
 | 回调形态想要整段 stdout | v0.1.79 订正：`exec.run` 带 `onStdout` / `onStderr` 时**也缓冲**（返回 `{ code, stdout, stderr }`，只是解码有损）；真正不占内存、拿原始字节要用 `exec.spawn` 逐块消费——大输出别用回调形态 |
 | rid 跨请求 / 跨模块共享 | 句柄 rid 是本次 runtime 的 ResourceId，进程内局部；只有自己 spawn 的会话能把 rid 传给 `kill`，跨模块 / 跨请求不可达 |
 | 忘了 `exit()` 也能回收 | 句柄 close（JS 释放 / runtime 归还 / 异常丢弃）会同步整组击杀子进程，不会泄漏；但显式 `await h.exit()` 才能拿到退出码 |
-| 输出二进制 / 非 UTF-8 | 缓冲形态与回调形态都**有损解码**（U+FFFD），结果带 `encoding:"lossy"`（本版起不再抛错）；要原始字节用 `exec.spawn` |
+| 输出二进制 / 非 UTF-8 | 缓冲形态与回调形态都**有损解码**（U+FFFD），结果带 `encoding:"lossy"`（v0.1.117 起不再抛错）；要原始字节用 `exec.spawn` |
 | 超时 / 超限却没抛错 | 回调与流式形态不抛 `timed out` / `output limit exceeded`，只把 `code` 打成 137 并截断输出——别用 `try/catch` 判成功，要同时校验 `code`（v0.1.79） |
 | Windows 上行尾 / 编码 / 分块解码 | `cmd /c echo` 输出以 CRLF 收尾（oj 不归一，跨平台比对用 `trimEnd()`）；输出含中文时为本地代码页、解码后非 ASCII 变 U+FFFD（结果标 `encoding:"lossy"`；要精确字节用 `exec.spawn` + 按实际代码页解码，`chcp 65001` 只改控制台不改管道）；流式逐块解码要在块边界合并字节，别逐块新建 `TextDecoder`（v0.1.79） |
 

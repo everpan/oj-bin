@@ -1359,7 +1359,8 @@ fs:
 exec.run(argv: string[], opts?: {
   timeoutMs?: number;   // 缺省 30_000，硬上限 600_000（传更大值被钳到上限，不报错）
   stdin?: string;       // 可选，一次性写入后关闭写端（子进程读到 EOF）
-}): Promise<{ code: number; stdout: string; stderr: string }>
+}): Promise<{ code: number; stdout: string; stderr: string; encoding?: "lossy" }>
+// encoding 仅在输出含非法 UTF-8 字节（有损解码过）时出现，见下「返回 vs 抛错边界」
 ```
 
 另有流式消费形态：句柄式 `exec.spawn`（`for await` 消费 stdout/stderr）+ `exec.run` 的 `onStdout`/`onStderr` 回调，详见下方「exec 流式形态（v0.1.78）」小节。`stdin?` 自 v0.1.83 起**三形态一致支持**（含回调与 `exec.spawn`）。
@@ -1407,7 +1408,8 @@ platform:
   其余裸名在**宿主侧**按父进程 PATH 解析为**绝对路径**后 spawn（子进程 env 已清空、不继承
   PATH，宿主侧解析消除 execvp 回落默认路径的不确定性）。**Windows 额外按 `PATHEXT`
   补全扩展名**（`tar` → `tar.exe`、`cmd` → `cmd.exe`；`PATHEXT` 缺失时回落系统默认列表；
-  同一目录先精确名、再逐扩展名）——只搜 PATH 目录（空条目跳过，**绝不搜当前目录**）。
+  同一目录先精确名、再逐扩展名；名字本身已带已知扩展名（`tar.exe`）则不再追加，不会出现
+  `tar.exe.exe`）——只搜 PATH 目录（空条目跳过，**绝不搜当前目录**）。
   解析失败 → `exec: command resolve failed for '<name>': …`。注意：**子进程拿到的 argv[0]
   是解析后的绝对路径**，不是模板首 token 原文。
 - **返回 vs 抛错边界**：进程正常跑到退出（**含非 0 退出码**）= 返回 `{code, stdout, stderr}`
@@ -1457,7 +1459,7 @@ WSL / MSYS**：
   二进制 / 压缩包管道必须保真；跨平台文本比对请用 `trimEnd()` 或 `split(/\r?\n/)`，
   **不要**在跨平台代码里写死 `"\n"`。
 - **Windows 子进程输出是本地代码页（GBK / CP1252 等），不是 UTF-8**（v0.1.79 起；
-  有损解码自本版）：输出含非 ASCII（中文路径、中文报错、`ping` 的本地化文案、`tar -tvzf`
+  有损解码自 v0.1.117）：输出含非 ASCII（中文路径、中文报错、`ping` 的本地化文案、`tar -tvzf`
   的本地化月份名等）时，缓冲形态与回调形态一致，按**有损解码**返回（非法序列 → U+FFFD），
   并在结果上标记 `encoding: "lossy"`；`exec.spawn` 仍给原始字节由 JS 自行解码。
   **`chcp 65001` 只改控制台代码页，不改变子进程写入管道的编码**（管道走进程 ACP）——
@@ -1507,7 +1509,7 @@ WSL / MSYS**：
   |---|---|---|---|
   | 输出合计 > 10MiB | **抛** `exec output limit exceeded` | 不抛：整组击杀，`code = 137`，回调收到的块被截断 | 同左（流提前 EOF，`code = 137`） |
   | `timeoutMs` 到期 | **抛** `exec timed out after N ms` | 不抛：整组击杀，`code = 137` | 同左（`code = 137`） |
-  | 输出非 UTF-8 | 不抛：有损解码（U+FFFD），结果标记 `encoding: "lossy"` | 不抛：`stdout` / `stderr` 为有损解码（U+FFFD） | 不抛：给原始 `Uint8Array`，JS 自行解码 |
+  | 输出非 UTF-8 | 不抛：有损解码（U+FFFD），结果标记 `encoding: "lossy"` | 不抛：`stdout` / `stderr` 为有损解码（U+FFFD），同样标记 `encoding: "lossy"` | 不抛：给原始 `Uint8Array`，JS 自行解码（无 `encoding` 字段） |
   | 内存占用 | 全量（≤10MiB 封顶） | 全量（≤10MiB 封顶） | 仅当前块（16 槽 × 8KiB 背压） |
 
   **别用 `try/catch` 的成功当「跑完了」**：回调 / 流式形态下超时与超限不抛错，只把 `code` 打成 137 并截断输出——必须同时校验 `code`，且不要拿被截断的 stdout 当完整结果（安全判定只认原始字节，见上表）。
@@ -1531,7 +1533,7 @@ Error）：
 | `exec output limit exceeded (10485760 bytes cap, stdout+stderr combined)` | Error | 输出合计超 10MB——**仅无回调的 `exec.run` 抛**；回调 / `exec.spawn` 形态同上为 `code = 137` + 截断（v0.1.79 订正） |
 | `exec: stdin write failed: <e>` | Error | stdin 写入失败 |
 
-> 本版起，非 UTF-8 输出**不再抛** `exec: stdout/stderr is not valid UTF-8`：缓冲形态与回调
+> v0.1.117 起，非 UTF-8 输出**不再抛** `exec: stdout/stderr is not valid UTF-8`：缓冲形态与回调
 > 形态都改为有损解码（U+FFFD）并在结果标记 `encoding: "lossy"`；`exec.spawn` 仍给原始字节。
 > 该错误文案已废止（Windows 本地代码页 / `tar -tvzf` 本地化月份名等均走有损路径）。
 
