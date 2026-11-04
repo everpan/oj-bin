@@ -243,13 +243,12 @@ fn default_resolver_oj_and_path() {
     let oj = default_resolve_command("oj").unwrap();
     assert_eq!(oj, std::env::current_exe().unwrap());
     // 裸名 → 父进程 PATH 解析为绝对路径。探测名取「该平台恒在」者：
-    // unix 用 sh；Windows 无 sh，用 System32 常在 PATH 的 cmd.exe——带扩展名
-    // 是因为 default_resolve_command 的 Windows 分支只 is_file()、不探测
-    // PATHEXT（裸名 cmd 匹配不到 cmd.exe；该缺口另立 OJ-8，不混进本测试）。
+    // unix 用 sh；Windows 用 System32 常在 PATH 的 cmd（R1 起裸名按 PATHEXT
+    // 补 .exe，故无需再写 cmd.exe）。
     #[cfg(unix)]
     let probe = "sh";
     #[cfg(windows)]
-    let probe = "cmd.exe";
+    let probe = "cmd";
     let resolved = default_resolve_command(probe).unwrap();
     assert!(resolved.is_absolute(), "{probe} -> {resolved:?}");
     // 未知命令 → Err 点名。
@@ -257,6 +256,92 @@ fn default_resolver_oj_and_path() {
     assert!(e.contains("not found in PATH"), "{e}");
     // 路径分隔符 → Err（parse 期已拒，此处防御性兜底）。
     assert!(default_resolve_command("./sh").is_err());
+}
+
+// ----- 扩展名搜索纯函数（R1；平台无关，Given-When-Then） -----
+//
+// 说明：模板门禁（prepare_exec 的 match_all）在 resolver **之前**执行，故 R1 只改
+// 「如何把已授权模板的首 token 解析为绝对路径」，不改变 fail-closed 语义。
+
+/// 造一个「可执行」文件：unix 需 0o111，windows 仅需存在。
+fn touch_exec(dir: &Path, file: &str) {
+    std::fs::create_dir_all(dir).unwrap();
+    let p = dir.join(file);
+    std::fs::write(&p, b"").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = std::fs::metadata(&p).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&p, perm).unwrap();
+    }
+}
+
+#[test]
+fn given_bare_name_when_pathext_lists_exe_then_resolves_to_exe() {
+    let dir = tmp("resolve-pathext").join("bin");
+    touch_exec(&dir, "tar.exe");
+    let exts = parse_pathext(Some(".COM;.EXE"));
+    let got = search_in_path("tar", std::slice::from_ref(&dir), &exts).unwrap();
+    assert_eq!(got, dir.join("tar.exe"));
+}
+
+#[test]
+fn given_exact_named_file_when_present_then_exact_wins_over_extension() {
+    let dir = tmp("resolve-exact-first").join("bin");
+    touch_exec(&dir, "tar");
+    touch_exec(&dir, "tar.exe");
+    let exts = parse_pathext(Some(".EXE"));
+    let got = search_in_path("tar", std::slice::from_ref(&dir), &exts).unwrap();
+    assert_eq!(
+        got,
+        dir.join("tar"),
+        "精确名优先于补扩展（CreateProcess 语义）"
+    );
+}
+
+#[test]
+fn given_name_already_with_known_ext_when_only_double_ext_exists_then_not_found() {
+    // 对抗性探针：若错误地对 tar.exe 再补 .exe，会命中 tar.exe.exe（错误成功）。
+    let dir = tmp("resolve-no-double-ext").join("bin");
+    touch_exec(&dir, "tar.exe.exe");
+    let exts = parse_pathext(Some(".EXE"));
+    let err = search_in_path("tar.exe", &[dir], &exts).unwrap_err();
+    assert!(err.contains("not found in PATH"), "{err}");
+}
+
+#[test]
+fn given_no_matching_file_when_searching_then_err_names_command() {
+    let dir = tmp("resolve-missing").join("bin");
+    std::fs::create_dir_all(&dir).unwrap();
+    let err = search_in_path("nope", &[dir], &parse_pathext(Some(".EXE"))).unwrap_err();
+    assert!(
+        err.contains("'nope'") && err.contains("not found in PATH"),
+        "{err}"
+    );
+}
+
+#[test]
+fn given_empty_dir_list_when_searching_then_not_found() {
+    let err = search_in_path("tar", &[], &parse_pathext(Some(".EXE"))).unwrap_err();
+    assert!(err.contains("not found in PATH"), "{err}");
+}
+
+#[test]
+fn given_pathext_entries_without_dot_and_mixed_case_when_parsing_then_normalized() {
+    assert_eq!(
+        parse_pathext(Some(".EXE;.Cmd;BAT")),
+        vec![".exe".to_string(), ".cmd".to_string(), ".bat".to_string()]
+    );
+}
+
+#[test]
+fn given_missing_or_blank_pathext_when_parsing_then_falls_back_to_default() {
+    for raw in [None, Some(""), Some("   ")] {
+        let exts = parse_pathext(raw);
+        assert!(exts.contains(&".exe".to_string()), "{raw:?} -> {exts:?}");
+        assert!(exts.contains(&".cmd".to_string()), "{raw:?} -> {exts:?}");
+    }
 }
 
 // ----- BDD S1–S12（真实子进程；注入解析器 + 直构 grants，经 run_module 归属模块） -----
@@ -531,24 +616,35 @@ async fn exec_bdd_main_scenarios() {
         seen.lock().unwrap()
     );
 
-    // S12：stderr 非 UTF-8 → 抛错点名（from_utf8_lossy 不接受）。
+    // S12（缓冲形态 · stderr）：非 UTF-8 → 有损解码 + encoding=="lossy"，不抛错。
     {
-        let e = b
+        let cap = b
             .run_module(&api("worker"), "s12_badutf8", Default::default(), t)
             .await
-            .unwrap_err();
-        let m = e.to_string();
-        assert!(m.contains("stderr") && m.contains("UTF-8"), "{m}");
+            .expect("buffered form must not throw on non-UTF-8 (R3②)");
+        let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["code"], 0, "{v}");
+        assert_eq!(v["data"]["encoding"], "lossy", "{v}");
+        assert!(
+            v["data"]["stderr"].as_str().unwrap().contains('\u{FFFD}'),
+            "缓冲形态应为有损解码（U+FFFD）: {v}"
+        );
     }
-    // S12 续：同一条非 UTF-8 输出的其它三种形态——**只有缓冲形态抛**。
-    // 缓冲形态（stdout 侧，补 s12_badutf8 未覆盖的 stdout）：抛点名。
+    // S12（缓冲形态 · stdout）：同口径。
     {
-        let e = b
+        let cap = b
             .run_module(&api("worker"), "s12_badutf8_out", Default::default(), t)
             .await
-            .unwrap_err();
-        let m = e.to_string();
-        assert!(m.contains("stdout") && m.contains("UTF-8"), "{m}");
+            .expect("buffered form must not throw on non-UTF-8 (R3②)");
+        let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["code"], 0, "{v}");
+        assert_eq!(v["data"]["encoding"], "lossy", "{v}");
+        assert!(
+            v["data"]["stdout"].as_str().unwrap().contains('\u{FFFD}'),
+            "缓冲形态应为有损解码（U+FFFD）: {v}"
+        );
     }
     // 回调形态：不抛，返回 { code, stdout }，stdout 为**有损**解码（U+FFFD）。
     {

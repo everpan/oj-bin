@@ -2830,7 +2830,7 @@ ls /tmp/verify/manifests.yaml /tmp/verify/*/api.js     # 空前缀：解压即 d
 **什么时候用**：你跑一个会边跑边吐日志的外部命令（构建、ffmpeg、数据导入、长导出），想在前端 / 调用方实时看到进度，而不是等它跑完才一次性拿到整段 stdout。v0.1.78 在 `exec.run` 之上新增流式形态，两种形态复用同一套安全闸门（argv 模板白名单、路径占位符、整组击杀），无第二套读循环、不新增命令构造面：
 
 - **B `exec.spawn(argv, opts)`** 返回句柄，stdout/stderr 是 `AsyncIterable<Uint8Array>`，可 `for await` 逐块消费；
-- **A `exec.run(argv, opts)`** 扩展 `onStdout` / `onStderr` 回调：逐块转发给回调，同时攒下全量，返回 `{ code, stdout, stderr }`（stdout/stderr 为有损解码结果，非法 UTF-8 → U+FFFD **不抛**；v0.1.79 订正，此前称「返回 `{ code }`、不缓冲整段」）。
+- **A `exec.run(argv, opts)`** 扩展 `onStdout` / `onStderr` 回调：逐块转发给回调，同时攒下全量，返回 `{ code, stdout, stderr }`（缓冲与回调形态均为**有损解码**，非法 UTF-8 → U+FFFD **不抛**、结果带 `encoding:"lossy"`；v0.1.79 订正，此前称「返回 `{ code }`、不缓冲整段」）。
 
 ### ① 配置（在场景 33 / 34 的基础上给命令加模板）
 
@@ -2890,9 +2890,9 @@ export async function post() {
 | 回调形态想要整段 stdout | v0.1.79 订正：`exec.run` 带 `onStdout` / `onStderr` 时**也缓冲**（返回 `{ code, stdout, stderr }`，只是解码有损）；真正不占内存、拿原始字节要用 `exec.spawn` 逐块消费——大输出别用回调形态 |
 | rid 跨请求 / 跨模块共享 | 句柄 rid 是本次 runtime 的 ResourceId，进程内局部；只有自己 spawn 的会话能把 rid 传给 `kill`，跨模块 / 跨请求不可达 |
 | 忘了 `exit()` 也能回收 | 句柄 close（JS 释放 / runtime 归还 / 异常丢弃）会同步整组击杀子进程，不会泄漏；但显式 `await h.exit()` 才能拿到退出码 |
-| 输出二进制 / 非 UTF-8 | **只有无回调的 `exec.run` 抛** `exec: stdout is not valid UTF-8`；回调形态有损解码（U+FFFD）、`exec.spawn` 给原始字节，均不抛（v0.1.79 订正） |
+| 输出二进制 / 非 UTF-8 | 缓冲形态与回调形态都**有损解码**（U+FFFD），结果带 `encoding:"lossy"`（本版起不再抛错）；要原始字节用 `exec.spawn` |
 | 超时 / 超限却没抛错 | 回调与流式形态不抛 `timed out` / `output limit exceeded`，只把 `code` 打成 137 并截断输出——别用 `try/catch` 判成功，要同时校验 `code`（v0.1.79） |
-| Windows 上行尾 / 编码 / 分块解码 | `cmd /c echo` 输出以 CRLF 收尾（oj 不归一，跨平台比对用 `trimEnd()`）；输出含中文时为本地代码页、会被 UTF-8 解码拒（先 `chcp 65001`）；流式逐块解码要在块边界合并字节，别逐块新建 `TextDecoder`（v0.1.79） |
+| Windows 上行尾 / 编码 / 分块解码 | `cmd /c echo` 输出以 CRLF 收尾（oj 不归一，跨平台比对用 `trimEnd()`）；输出含中文时为本地代码页、解码后非 ASCII 变 U+FFFD（结果标 `encoding:"lossy"`；要精确字节用 `exec.spawn` + 按实际代码页解码，`chcp 65001` 只改控制台不改管道）；流式逐块解码要在块边界合并字节，别逐块新建 `TextDecoder`（v0.1.79） |
 
 ## 场景 40：长任务中途 kill（超时整组击杀 / 主动 kill，v0.1.78）
 

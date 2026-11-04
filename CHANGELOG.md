@@ -16,6 +16,27 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.117
+
+**fix（exec，Windows 阻断）**：`exec.run` 命令解析与编码修复（源需求：下游 oj-module
+`docs/prd/20261104-oj-windows-exec-resolver-requirement.md`）。
+
+- **R1 Windows `PATHEXT` 解析**：`default_resolve_command` 的 win32 分支按 `PATHEXT`
+  补全扩展名（`tar` → `tar.exe`、`cmd` → `cmd.exe`），同目录先精确名再逐扩展名；`PATHEXT`
+  缺失回落系统默认列表；仍只搜 PATH 目录（空条目跳过，不搜 CWD）。修复 Windows 上
+  `exec.run(["tar", ...])` / `["cmd", "/c", ...]` 恒报
+  `exec: command resolve failed`，恢复 `ojm market install` 解包链路。非 Windows 行为零回归。
+- **R3② 非 UTF-8 输出有损解码**：缓冲形态（无回调 `exec.run`）不再抛
+  `exec: stdout is not valid UTF-8`，与回调形态一致改为有损解码（U+FFFD），结果新增
+  `encoding: "lossy"` 标记（仅非法序列出现时携带）；`exec.spawn` 仍返回原始字节。
+  修复 Windows 本地代码页（GBK）/ `tar -tvzf` 本地化输出导致的安装失败。
+- **docs（devkit 四件）**：`api-manual.md` §6 命令解析与「形态 × 非 UTF-8」表、`SKILL.md`
+  陷阱速查（PATHEXT / `chcp` 仅影响控制台不影响管道 / `encoding:"lossy"`）、`scenarios.md`
+  场景 39 输出形态与场景 34 排障、`README.md` 同步。
+
+详见 `docs/plans/2026-11-04-windows-exec-resolver-implementation-plan.md`（oj-bin 实施）与
+`docs/plans/2026-11-04-windows-exec-resolver-handoff.md`（oj-module 交接）。
+
 ## v0.1.116
 
 **feat（serve，OJ-9/10/11 前端性能专项）**：静态层压缩 + 默认缓存策略 + API HEAD 镜像。

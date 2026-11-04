@@ -6,15 +6,17 @@
 //!   （fs.root ∪ trusted_paths，路径校验单点复用，勿复制语义）；
 //! - `${raw:NAME}` 吸收一个 token，拒绝 `-` 开头与绝对形态（防 option/路径注入）；
 //! - 命令名（模板首 token）宿主侧解析为绝对路径（[`default_resolve_command`]，
-//!   `"oj"` 特判 `current_exe`，其余父进程 PATH 解析；解析器做成 `ExecGrant`
-//!   字段，测试可注入）；
+//!   `"oj"` 特判 `current_exe`，其余父进程 PATH 解析；win32 下裸名再按 `PATHEXT`
+//!   补全扩展名（`tar` → `tar.exe`），只搜 PATH 目录、绝不搜 CWD；解析器做成
+//!   `ExecGrant` 字段，测试可注入）；
 //! - cwd = fs.root；env 默认空表仅白名单透传；stdout/stderr 流式读取边计数
 //!   （合计 10MB 上限）；超时先 `kill(-pgid, SIGKILL)`（spawn 时
 //!   `process_group(0)`）再 `child.kill()` 兜底；
 //! - 返回 vs 抛错边界：进程正常跑到退出（含非 0 code）→ 返回
 //!   `{code, stdout, stderr}`（信号终止 code = 128 + signal）；执行环境失败
-//!   （未授权/模板失配/歧义/占位符校验失败/超时/输出超限/spawn 失败/UTF-8
-//!   解码失败）→ 抛错点名。
+//!   （未授权/模板失配/歧义/占位符校验失败/超时/输出超限/spawn 失败）→ 抛错点名。
+//!   非 UTF-8 输出不再抛错：缓冲形态与回调形态一致，按有损解码（U+FFFD）返回，
+//!   并在结果上标记 `encoding: "lossy"` 供下游识别。
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -328,6 +330,10 @@ struct ExecResult {
     code: i32,
     stdout: String,
     stderr: String,
+    /// 仅当 stdout/stderr 出现非法 UTF-8 而被有损替换时出现（值恒为 `"lossy"`）。
+    /// 正常路径不序列化该字段，避免给既有消费方增加噪声。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encoding: Option<&'static str>,
 }
 
 fn not_capable(msg: impl Into<String>) -> JsErrorBox {
@@ -899,18 +905,26 @@ async fn run_managed(
             };
             #[cfg(not(unix))]
             let code = status.code().unwrap_or(-1);
-            let stdout = String::from_utf8(o1).map_err(|_| {
-                "exec: stdout is not valid UTF-8 (binary output unsupported)".to_string()
-            })?;
-            let stderr = String::from_utf8(o2).map_err(|_| {
-                "exec: stderr is not valid UTF-8 (binary output unsupported)".to_string()
-            })?;
+            let (stdout, stdout_lossy) = decode_lossy(o1);
+            let (stderr, stderr_lossy) = decode_lossy(o2);
+            let encoding = (stdout_lossy || stderr_lossy).then_some("lossy");
             Ok(ExecResult {
                 code,
                 stdout,
                 stderr,
+                encoding,
             })
         }
+    }
+}
+
+/// 有损 UTF-8 解码：合法字节原样返回（`false`）；含非法序列时以 U+FFFD 替换并
+/// 标记 `true`——与回调形态 `TextDecoder()` 的默认（非 fatal）行为一致。
+/// stdout/stderr 共用同一实现，避免分支重复（DRY）。
+fn decode_lossy(bytes: Vec<u8>) -> (String, bool) {
+    match String::from_utf8(bytes) {
+        Ok(s) => (s, false),
+        Err(e) => (String::from_utf8_lossy(e.as_bytes()).into_owned(), true),
     }
 }
 
@@ -958,10 +972,9 @@ fn kill_tree(child: &mut tokio::process::Child) {
 
 /// 模板首 token → 绝对路径（设计稿 §1.1「宿主侧解析」）：
 /// - `"oj"` 特判 → `std::env::current_exe()`（serve 进程即 bin/oj，同版本自保证）；
-/// - 其余裸名 → 父进程 PATH 逐目录探测可执行文件（env 空表下子进程 execvp
-///   会回落 confstr 默认路径、行为不可控——宿主侧解析消除该不确定性）；
+/// - 其余裸名 → 父进程 PATH 逐目录探测（win32 先精确名、再按 `PATHEXT` 补全扩展）；
 /// - 含路径分隔符 → Err（parse 期已拒绝，此处防御性兜底）；
-/// - 解析失败 → Err 点名（op 层转抛错）。
+/// - 只搜 PATH 目录（空条目跳过，防 CWD 隐式劫持），解析失败 → Err 点名。
 pub fn default_resolve_command(name: &str) -> Result<PathBuf, String> {
     if name == "oj" {
         return std::env::current_exe().map_err(|e| format!("current_exe failed: {e}"));
@@ -972,16 +985,67 @@ pub fn default_resolve_command(name: &str) -> Result<PathBuf, String> {
         ));
     }
     let path = std::env::var_os("PATH").unwrap_or_default();
-    for dir in std::env::split_paths(&path) {
-        if dir.as_os_str().is_empty() {
-            continue;
+    let dirs: Vec<PathBuf> = std::env::split_paths(&path)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .collect();
+
+    // win32：按 PATHEXT 补全扩展名（`tar` → `tar.exe`）；其余平台传空列表，
+    // 仅做精确名探测——与既有循环逐字等价，POSIX 行为零回归。
+    #[cfg(windows)]
+    let exts = parse_pathext(std::env::var("PATHEXT").ok().as_deref());
+    #[cfg(not(windows))]
+    let exts: Vec<String> = Vec::new();
+
+    search_in_path(name, &dirs, &exts)
+}
+
+/// Windows 缺省 `PATHEXT`（env 缺失/为空时回落；与 cmd.exe 默认一致）。
+#[cfg(any(windows, test))]
+const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.CPL";
+
+/// 在目录序列中按「精确名 → 逐扩展名补全」查找首个可执行文件。
+/// 纯函数（无 env 依赖），供跨平台单测；`dirs` 须已剔除空条目。
+/// 顺序对齐 CreateProcess 语义：同一目录内先精确名，再按 `exts` 依次补全。
+fn search_in_path(name: &str, dirs: &[PathBuf], exts: &[String]) -> Result<PathBuf, String> {
+    // 已带已知扩展名（如 `tar.exe`）时不追加，避免拼出 `tar.exe.exe`。
+    let lower = name.to_ascii_lowercase();
+    let has_known_ext = exts.iter().any(|ext| lower.ends_with(ext.as_str()));
+    for dir in dirs {
+        let exact = dir.join(name);
+        if is_executable_file(&exact) {
+            return Ok(exact);
         }
-        let cand = dir.join(name);
-        if is_executable_file(&cand) {
-            return Ok(cand);
+        if !has_known_ext {
+            for ext in exts {
+                let cand = dir.join(format!("{name}{ext}"));
+                if is_executable_file(&cand) {
+                    return Ok(cand);
+                }
+            }
         }
     }
     Err(format!("command '{name}' not found in PATH"))
+}
+
+/// 原始 `PATHEXT` → 归一化扩展名列表（小写、带前导点）；缺失/全空回落缺省列表。
+#[cfg(any(windows, test))]
+fn parse_pathext(raw: Option<&str>) -> Vec<String> {
+    let src = raw
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(DEFAULT_PATHEXT);
+    src.split(';')
+        .filter_map(|ext| {
+            let ext = ext.trim();
+            if ext.is_empty() {
+                return None;
+            }
+            Some(if ext.starts_with('.') {
+                ext.to_ascii_lowercase()
+            } else {
+                format!(".{}", ext.to_ascii_lowercase())
+            })
+        })
+        .collect()
 }
 
 #[cfg(unix)]
