@@ -3297,3 +3297,170 @@ async fn list_tables_prefix_escapes_wildcards() {
         "internal tables leaked"
     );
 }
+
+// ---------------------------------------------------------------------------
+// mysql 两步取 id 的连接钉死回归（2026-11-05）
+//
+// `LAST_INSERT_ID()` 是 session 级状态：池路径若把 INSERT 与 SELECT 分成两次
+// acquire，第二步会落到别的连接，返回的是**别人的** id（真库实测：建号 59/实际 5、
+// 广播 b:58/实际 b:1）。以下用例用一个「池与事务刻意不同源」的假访问器，把
+// 「池上 insert+returning 必须走同一事务会话」钉死；回归实现（各自 acquire）会拿到
+// 池侧 999 而红。
+// ---------------------------------------------------------------------------
+
+use crate::bridge::db::TxSession;
+use crate::bridge::dialect_caps::{DialectCaps, DialectInfo, IdStrategy, PlaceholderStyle};
+
+/// 池与事务行为刻意分叉的探针访问器。
+#[derive(Default)]
+struct PinProbe {
+    tx_exec: std::sync::atomic::AtomicBool,
+    tx_query: std::sync::atomic::AtomicBool,
+    rollback: std::sync::atomic::AtomicBool,
+    fail_exec: std::sync::atomic::AtomicBool,
+    fail_query: std::sync::atomic::AtomicBool,
+}
+
+struct PinProbeTx(Arc<PinProbe>);
+
+#[async_trait::async_trait]
+impl TxSession for PinProbeTx {
+    async fn query(&self, _sql: &str, _params: &[Value]) -> BridgeResult<Vec<Value>> {
+        use std::sync::atomic::Ordering;
+        self.0.tx_query.store(true, Ordering::SeqCst);
+        if self.0.fail_query.load(Ordering::SeqCst) {
+            return Err("last id failed".into());
+        }
+        Ok(vec![json!({"id": 7})])
+    }
+
+    async fn exec(&self, _sql: &str, _params: &[Value]) -> BridgeResult<i64> {
+        use std::sync::atomic::Ordering;
+        self.0.tx_exec.store(true, Ordering::SeqCst);
+        if self.0.fail_exec.load(Ordering::SeqCst) {
+            return Err("insert failed".into());
+        }
+        Ok(1)
+    }
+
+    async fn commit(&self) -> BridgeResult<()> {
+        Ok(())
+    }
+
+    async fn rollback(&self) -> BridgeResult<()> {
+        use std::sync::atomic::Ordering;
+        self.0.rollback.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+struct PinProbeAccessor(Arc<PinProbe>);
+
+#[async_trait::async_trait]
+impl DataAccessor for PinProbeAccessor {
+    fn dialect(&self) -> Dialect {
+        Dialect::MySql
+    }
+
+    fn dialect_info(&self) -> &DialectInfo {
+        use std::sync::OnceLock;
+        static INFO: OnceLock<DialectInfo> = OnceLock::new();
+        INFO.get_or_init(|| DialectInfo {
+            name: "mysql".to_string(),
+            caps: DialectCaps {
+                placeholder: PlaceholderStyle::Q,
+                id: IdStrategy::TwoStep,
+                stream: false,
+                cancel: false,
+            },
+        })
+    }
+
+    async fn begin(&self) -> BridgeResult<Box<dyn TxSession>> {
+        Ok(Box::new(PinProbeTx(self.0.clone())))
+    }
+
+    async fn query_with_params(&self, _sql: &str, _params: &[Value]) -> BridgeResult<Vec<Value>> {
+        // 池路径：模拟「另一条连接」的 LAST_INSERT_ID —— 实现若没钉连接就会读到它。
+        Ok(vec![json!({"id": 999})])
+    }
+
+    async fn exec_with_params(&self, _sql: &str, _params: &[Value]) -> BridgeResult<i64> {
+        Ok(1)
+    }
+}
+
+fn pin_probe_bridge(probe: Arc<PinProbe>) -> Bridge {
+    Bridge::with_dbs(
+        std::collections::HashMap::from([(
+            "default".to_string(),
+            Arc::new(PinProbeAccessor(probe)) as Arc<dyn DataAccessor>,
+        )]),
+        Arc::new(InMemoryKV::new()),
+        SchemaRegistry::new().table("t", &["id"], &["id", "name"]),
+        false,
+    )
+}
+
+const INSERT_RETURNING_JS: &str = r#"db.table("t").insert({name:"a"}).returning(["id"]).run()
+    .then(r => json.ok(r))
+    .catch(e => json.fail(500, String(e)));"#;
+
+/// 池路径：insert + LAST_INSERT_ID 必须在同一连接（事务会话），
+/// 不能各自向池 acquire——回归实现读池侧 999，必红。
+#[tokio::test(flavor = "current_thread")]
+async fn mysql_insert_returning_pins_pool_to_one_connection() {
+    use std::sync::atomic::Ordering;
+    let probe = Arc::new(PinProbe::default());
+    let b = pin_probe_bridge(probe.clone());
+    let cap = b.run(INSERT_RETURNING_JS).await.unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["code"], 0, "{v}");
+    assert_eq!(v["data"][0]["id"], json!(7), "池侧 id 泄漏：{v}");
+    assert!(
+        probe.tx_exec.load(Ordering::SeqCst),
+        "insert 未走钉住的会话"
+    );
+    assert!(
+        probe.tx_query.load(Ordering::SeqCst),
+        "LAST_INSERT_ID 未走钉住的会话"
+    );
+    assert!(!probe.rollback.load(Ordering::SeqCst), "成功路径不应回滚");
+}
+
+/// 取 id 失败：必须回滚短事务，且错误原样上抛（不能留下半成品写入）。
+#[tokio::test(flavor = "current_thread")]
+async fn mysql_insert_returning_rolls_back_when_last_id_fails() {
+    use std::sync::atomic::Ordering;
+    let probe = Arc::new(PinProbe::default());
+    probe.fail_query.store(true, Ordering::SeqCst);
+    let b = pin_probe_bridge(probe.clone());
+    let cap = b.run(INSERT_RETURNING_JS).await.unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["code"], 500, "{v}");
+    assert!(
+        v["msg"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("last id failed"),
+        "{v}"
+    );
+    assert!(probe.rollback.load(Ordering::SeqCst), "取 id 失败必须回滚");
+}
+
+/// INSERT 失败：同样回滚，且不再发 LAST_INSERT_ID（避免把别人连接的 id 当结果）。
+#[tokio::test(flavor = "current_thread")]
+async fn mysql_insert_returning_rolls_back_when_insert_fails() {
+    use std::sync::atomic::Ordering;
+    let probe = Arc::new(PinProbe::default());
+    probe.fail_exec.store(true, Ordering::SeqCst);
+    let b = pin_probe_bridge(probe.clone());
+    let cap = b.run(INSERT_RETURNING_JS).await.unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["code"], 500, "{v}");
+    assert!(probe.rollback.load(Ordering::SeqCst), "insert 失败必须回滚");
+    assert!(
+        !probe.tx_query.load(Ordering::SeqCst),
+        "insert 失败后不应再查 LAST_INSERT_ID"
+    );
+}

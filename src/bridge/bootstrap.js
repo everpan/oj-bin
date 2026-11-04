@@ -1471,7 +1471,8 @@ function builderFromReq(snap) {
     // Insert returning clause (whitelisted columns, e.g. ["id"]): run() then resolves
     // to a row array [{id: n}] instead of the affected-row count. pg/sqlite render a
     // single sea-query RETURNING statement; mysql has no RETURNING and takes
-    // LAST_INSERT_ID() in a second step on the same connection (use db.tx for safety).
+    // LAST_INSERT_ID() in a second step pinned to the same connection (the host wraps
+    // both statements in a short transaction on the pool path).
     returning(cols) { req.returning = (cols || []).map(String); return api; },
     // Insert-from-select (v0.1.81): `db.table("t").fromSelect(db.table("s").select(["id","name"]), ["id","name"])`.
     // The two column lists must line up by position -- the engine rejects any arity

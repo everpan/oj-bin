@@ -16,6 +16,30 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.120（未打标签）
+
+**fix（db，mysql 两步取 id 跨连接）**：`insert(...).returning(["id"])` 在 mysql 上取回的
+自增 id 可能是**别的连接**上一次插入的值（源需求：oj-module `docs/prd/framework-verification-playbook.md`
+§11 U2——真库演练建号返回 59、库内真值 5；广播返回 `b:58`、真值 `b:1`）。
+
+- **根因**：mysql 无 `RETURNING`，构造器先 `INSERT`、再 `SELECT LAST_INSERT_ID()` 两步。
+  `LAST_INSERT_ID()` 是 **session 级状态**，而 `Exec::Pool` 臂的两次执行各自向连接池
+  acquire/release（`SqlxAccessor::query/exec` 直接用 `&self.pool`），两条语句**不保证同一连接**
+  ——无并发也可能读到该连接上别人的插入。
+- **修复**：`Exec` 新增 `Owned(Box<dyn TxSession>)` 臂；路由为 `ExecRoute::LastId` 且目标是池时，
+  先 `begin()` 开一次短事务，insert、`SELECT LAST_INSERT_ID()`、commit 全在同一连接上，
+  成功后 commit、失败 rollback。事务内（`Exec::Tx`）路径不变——本来就在同一会话。
+  因 `begin()` 是 `DataAccessor` 的共同抽象，核心 `SqlxAccessor` 与 FFI 插件
+  （`oj-db-mysql`）**一处修两边**；pg/sqlite 走单语句 `RETURNING`，零影响。
+- **顺带收紧原子性**：取 id 失败或 commit 失败同样回滚并报错，不再留下「写入成功但调用方
+  只拿到错误」的半成品。语句超时沿用池路径口径（超时丢弃 future 后由 `LastId` 分支回滚）。
+- **回归用例**：`query_tests.rs` 新增 `PinProbe` 夹具（`TxSession` 记录走没走钉住的会话、
+  `query_with_params` 故意返回 999 模拟另一条连接），三条用例覆盖「钉同连接」「取 id 失败回滚」
+  「insert 失败回滚且不再查 `LAST_INSERT_ID`」；移除修复时必红（实测 `data:[{"id":999}]`）。
+- **文档（无 JS API / 报错文案变更）**：db-guide §6「insert 取回主键」与 §7 去掉「并发请放
+  `db.tx`」的旧劝告，改为「宿主已钉同连接、事务外也安全」；api-manual §6 能力位注、scenarios
+  场景 45 ①、SKILL 陷阱速查同口径；`bootstrap.js` 的 `returning(cols)` 注释同步。
+
 ## v0.1.119（未打标签）
 
 **feat（serve，静态压缩缓存分层）**：`compress-cache` 目录文件过多时的效率优化——

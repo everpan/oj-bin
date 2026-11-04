@@ -2006,7 +2006,7 @@ json.ok(plugins());
   写错/漏项插件**装配期即被拒载**并点名（`unknown capability "…"` / `missing capability group "…"`）。
 - **哪个位影响执行**：`placeholder_*`（决定占位符改写）、`stream`、`cancel` 影响执行；
   `id_*` 只是**登记与对账**——取 id 由构造器按具体方言决定（只有 mysql 走两步
-  `LAST_INSERT_ID()`），别自己据 `caps.id` 分派。
+  `LAST_INSERT_ID()`，且 v0.1.120 起宿主把两步钉在同一连接），别自己据 `caps.id` 分派。
 - 三内置方言的完整串（与启动横幅 `[oj-serve] plugin … | caps: …`、`oj info` 逐字同源）：
   `placeholder=? id=two_step stream`（sqlite）/ `placeholder=? id=two_step stream cancel`（mysql）
   / `placeholder=$ id=returning stream cancel`（postgres）。

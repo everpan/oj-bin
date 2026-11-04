@@ -2179,12 +2179,15 @@ fn build_with_clause(
     Ok(clause)
 }
 
-/// 执行目标（池 / 事务会话）的统一出口。
-/// mysql 无 RETURNING：取自增 id 必须在**同一目标**上连发 insert + SELECT
-/// LAST_INSERT_ID()（两条语句非原子，池路径下建议放进 db.tx 以免并发串号）。
+/// 执行目标（池 / 事务会话 / 宿主临时短事务）的统一出口。
+/// mysql 无 RETURNING：取自增 id 必须在**同一连接**上连发 insert + SELECT
+/// LAST_INSERT_ID()——`LAST_INSERT_ID()` 是 session 级状态，分两次向池 acquire
+/// 会读到别的连接的上一次插入（`Exec::Owned` 即为此自开的短事务）。
 enum Exec<'a> {
     Pool(&'a Arc<dyn DataAccessor>),
     Tx(tokio::sync::MutexGuard<'a, Box<dyn super::db::TxSession>>),
+    /// 宿主自开的短事务（当前仅 mysql 两步取 id）：成功 commit、失败 rollback。
+    Owned(Box<dyn super::db::TxSession>),
 }
 
 impl Exec<'_> {
@@ -2202,6 +2205,7 @@ impl Exec<'_> {
             // tx 臂不计量（REQ 只列 query/stream/构造器三路径的 pool 形态）。
             Exec::Pool(da) => da.query_with_params_metered(sql, params, meter).await,
             Exec::Tx(s) => s.query(sql, params).await,
+            Exec::Owned(s) => s.query(sql, params).await,
         }
     }
 
@@ -2209,6 +2213,7 @@ impl Exec<'_> {
         match self {
             Exec::Pool(da) => da.exec_with_params(sql, params).await,
             Exec::Tx(s) => s.exec(sql, params).await,
+            Exec::Owned(s) => s.exec(sql, params).await,
         }
     }
 }
@@ -2286,6 +2291,11 @@ pub async fn op_db_query_build(
     // 活跃事务路由：会话（跨请求事务）/ 本库 tx / 无 tx 池 / 他库 tx 报错（同 db.rs）。
     let target = super::db::resolve_target(&state, &req.db)?;
     let ex = match &target {
+        // mysql 两步取 id：池路径自开短事务，把 insert 与 LAST_INSERT_ID 钉在同一连接
+        // （session 级状态；分两次 acquire 会读到别的连接的上一次插入）。
+        super::db::Target::Pool(da) if route == ExecRoute::LastId => {
+            Exec::Owned(da.begin().await.map_err(err)?)
+        }
         super::db::Target::Pool(da) => Exec::Pool(da),
         super::db::Target::Tx(t) => {
             // 会话有寿命：等锁也要封顶（长查询会把锁占到过期之后）。查询本身不另设超时
@@ -2306,7 +2316,7 @@ pub async fn op_db_query_build(
             Exec::Tx(guard)
         }
     };
-    let in_tx = matches!(&target, super::db::Target::Tx(_));
+    let in_tx = matches!(&target, super::db::Target::Tx(_)) || matches!(&ex, Exec::Owned(_));
     let db_name = req.db.clone();
     // REQ-05：构造器路径的语句超时（只吃配置侧——裁决：per-call opts 只给裸 SQL 面）
     // 与行级字节计量。tx 臂不叠语句超时（与 db.tx 同口径，连接状态不可知）。
@@ -2316,6 +2326,9 @@ pub async fn op_db_query_build(
     let mut meter = super::db_quota::ByteMeter::new(quota.max_result_bytes, quota.on_exceed);
     let (arm_timeout, cancelled) = match &ex {
         Exec::Pool(da) => (timeout_ms, da.server_cancel_on_abandon()),
+        // 宿主自开的短事务沿用池路径的语句超时（超时由外层 race 丢弃 future，
+        // 随后 LastId 分支回滚）；Tx 臂维持既有「不叠语句超时」口径。
+        Exec::Owned(_) => (timeout_ms, false),
         Exec::Tx(_) => (None, false),
     };
     let start = std::time::Instant::now();
@@ -2385,14 +2398,31 @@ pub async fn op_db_query_build(
                     &state, &sql, &params, &db_name, in_tx, ms, None, true, None, None, None,
                 );
                 // mysql 无 RETURNING：再发一次 LAST_INSERT_ID 取回自增主键。
-                let r = super::db_quota::race_statement(
+                // 池路径已被 Exec::Owned 钉在同一连接；取 id 失败必须回滚，
+                // 否则会留下「写入成功但调用方只拿到错误」的半成品。
+                let r = match super::db_quota::race_statement(
                     ex.query("SELECT LAST_INSERT_ID() AS id", &[], &mut meter),
                     &alias,
                     arm_timeout,
                     cancelled,
                 )
                 .await
-                .map_err(err)?;
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        if let Exec::Owned(s) = &ex {
+                            let _ = s.rollback().await;
+                        }
+                        return Err(err(e));
+                    }
+                };
+                // 提交失败同样不能把 id 交给调用方：回滚并报错。
+                if let Exec::Owned(s) = &ex
+                    && let Err(e) = s.commit().await
+                {
+                    let _ = s.rollback().await;
+                    return Err(err(e));
+                }
                 let ms2 = start.elapsed().as_secs_f64() * 1000.0;
                 super::db::trace_sql(
                     &state,
@@ -2417,6 +2447,9 @@ pub async fn op_db_query_build(
                 Ok(Value::Array(vec![Value::Object(obj)]))
             }
             Err(e) => {
+                if let Exec::Owned(s) = &ex {
+                    let _ = s.rollback().await;
+                }
                 let em = e.to_string();
                 // 结构化错误（来自 FFI 信封）必须原样带到 JS：code/data 经 to_js_err 还原，
                 // category/retryable 同时落 SQL 画像（T12 在 builder 路径的对应半边）。
