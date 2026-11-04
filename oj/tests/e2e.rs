@@ -193,6 +193,30 @@ async fn uc1_method_table() {
     }
 }
 
+/// v0.1.118 h2c（HTTP/2 prior knowledge）入站：axum 开 http2 后 `axum::serve`
+/// （hyper-util auto builder）按连接前导自动识别协议，明文 h2 直连不经 TLS/ALPN
+/// 也完成请求往返；同 boot 上 HTTP/1.1 路径不受影响（req 助手即 1.1 客户端）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h2c_prior_knowledge_roundtrip() {
+    let _g = lock();
+    let (addr, _h, _t) = boot(true).await;
+    let c = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .unwrap();
+    let resp = c
+        .get(format!("http://{addr}/v1/api/user/account/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(resp.version(), reqwest::Version::HTTP_2);
+    // 同端口 HTTP/1.1 共存回归。
+    let (s, _) = req(addr, "GET", "/v1/api/user/account/", None).await;
+    assert_eq!(s, 200);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn uc2_uc3_crud_params_body() {
     let _g = lock();

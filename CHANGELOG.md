@@ -16,6 +16,22 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.118（未打标签）
+
+**feat（serve，入站传输）**：h2c——明文 HTTP/2 prior knowledge 支持。
+
+- `serve` 的 axum 启用 `http2` feature：`axum::serve`（hyper-util auto builder）按连接
+  前导自动识别协议，明文直连的 HTTP/2（h2c prior knowledge）请求与 HTTP/1.1 共存于
+  同一端口，**零配置**。优雅停机（`serve_graceful`）与热重载（`serve_swappable`）走
+  同一 `axum::serve` 入口，自动同享。e2e：`h2c_prior_knowledge_roundtrip`。
+- `oj` CLI 的 reqwest 启用 `http2`：CLI 出站对支持 h2 的 https 端点经 TLS-ALPN 自动
+  协商（此前恒 1.1）。
+- **边界（重要）**：进程内仍无 TLS 终结——浏览器场景的 h2 继续由反代（nginx/caddy）
+  ALPN 承担，本变更只覆盖「客户端直连源站」的明文 h2c；WS 仍走 HTTP/1.1 Upgrade
+  （RFC 8441 h2 extended CONNECT 未实现），WS 客户端须以 HTTP/1.1 发起，在 h2 连接
+  上发 WS 请求按协议语义失败。
+- devkit 四件无涉（无 JS API / 报错文案变更）。
+
 ## v0.1.117
 
 **fix（exec，Windows 阻断）**：`exec.run` 命令解析与编码修复（源需求：下游 oj-module

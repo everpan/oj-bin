@@ -9,7 +9,8 @@ test-support = []
 
 [dependencies]
 only-js = { path = ".." }
-axum = { version = "0.8", features = ["ws"] }
+# http2（v0.1.118）：axum::serve 按 h2 连接前导自动识别，明文 h2c prior knowledge 与 1.1 同端口共存
+axum = { version = "0.8", features = ["ws", "http2"] }
 tower = { version = "0.5", features = ["util"] }
 matchit = "0.8"
 percent-encoding = "2.3"
