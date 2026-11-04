@@ -16,7 +16,7 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
-## v0.1.118（未打标签）
+## v0.1.118
 
 **feat（serve，入站传输）**：h2c——明文 HTTP/2 prior knowledge 支持。
 
@@ -30,7 +30,10 @@
   ALPN 承担，本变更只覆盖「客户端直连源站」的明文 h2c；WS 仍走 HTTP/1.1 Upgrade
   （RFC 8441 h2 extended CONNECT 未实现），WS 客户端须以 HTTP/1.1 发起，在 h2 连接
   上发 WS 请求按协议语义失败。
-- devkit 四件无涉（无 JS API / 报错文案变更）。
+- **docs（devkit 四件）**：api-manual 第 4 章 ws.ts 注 + §13 限制表「入站传输协议」行
+  （h2c prior knowledge 与 1.1 共存、无 `Upgrade: h2c`、WS 须 1.1、进程内无 TLS）；
+  scenarios 场景 70（`curl --http2-prior-knowledge` / `node:http2` 验证与客户端要点）；
+  SKILL 陷阱速查补同款；README 汇总行同步。无 JS API / 报错文案变更。
 
 ## v0.1.117
 
