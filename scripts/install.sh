@@ -93,5 +93,20 @@ fi
 mkdir -p "${INSTALL_DIR}"
 cp -R "${SRC}/." "${INSTALL_DIR}/"
 
+# macOS：new linker 产的 adhoc,linker-signed 签名（CodeDirectory v=20400）在部分
+# macOS 27.x 的 Taskgated/AMFI 下被判死（exec 零输出 SIGKILL）。统一 codesign 重签为
+# plain adhoc（全版本可执行）。失败即中止——留下死签名等于装了个跑不起来的 oj。
+if [[ "$(uname -s)" == "Darwin" ]] && command -v codesign >/dev/null 2>&1; then
+  targets=("${INSTALL_DIR}/oj")
+  shopt -s nullglob
+  targets+=("${INSTALL_DIR}"/plugins/*/*.dylib "${INSTALL_DIR}"/plugins/*/*.so)
+  shopt -u nullglob
+  for f in "${targets[@]}"; do
+    [[ -f "$f" ]] || continue
+    codesign --force --sign - "$f"
+    echo "重签 adhoc: ${f#"${INSTALL_DIR}"/}"
+  done
+fi
+
 echo "已安装到 ${INSTALL_DIR}"
 ls -la "${INSTALL_DIR}"
