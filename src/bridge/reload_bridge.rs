@@ -43,9 +43,12 @@ pub struct ReloadOutcome {
 /// 热更执行闭包类型：`oj serve` 装配期（ReloadState 构造 + set_executor 之后）
 /// 填进共享槽。同步执行——内部独立线程 + 多线 runtime（`from_config` 含 DB
 /// verify / 模块转译，current_thread 直调会死锁）；op 侧经 `spawn_blocking` 调用。
+/// 入参 `force`：跳过 unchanged 幂等闸门强制换代（v0.1.123，`?force=1` /
+/// `reloadConfig(force)` 同源；force 不绕 `reload_lock` 串行化）。
 /// `Err((status, msg))` 的 status 沿用 HTTP 语义：409 = 撞 `reload_lock`
 /// （busy，不静默排队）、400/500 = 归一/装配失败。
-pub type ReloadExecutorLike = Arc<dyn Fn() -> Result<ReloadOutcome, (u16, String)> + Send + Sync>;
+pub type ReloadExecutorLike =
+    Arc<dyn Fn(bool) -> Result<ReloadOutcome, (u16, String)> + Send + Sync>;
 
 /// 共享可填充槽（[`StableState::reload`] 的元素类型）：槽指针构造期冻结、
 /// 内容后填（`slot.set` 一次，照搬 `ReloadState::set_executor` 解环惯例）。
@@ -67,6 +70,7 @@ pub type ReloadSlot = std::sync::OnceLock<ReloadExecutorLike>;
 #[serde]
 pub async fn op_server_reload_config(
     state: Rc<RefCell<OpState>>,
+    force: Option<bool>,
 ) -> Result<ReloadOutcome, JsErrorBox> {
     // ① 特权裁决（借 OpState 短临界区，不跨 await 持有借用）。
     {
@@ -79,8 +83,9 @@ pub async fn op_server_reload_config(
         st.borrow::<Arc<StableState>>().reload.get().cloned()
     }
     .ok_or_else(|| JsErrorBox::generic("reload not available (not running under oj serve)"))?;
-    // ③ 同步 executor → 阻塞池执行（见类型注释）。
-    let outcome = tokio::task::spawn_blocking(move || exec())
+    // ③ 同步 executor → 阻塞池执行（见类型注释）。缺省/非布尔入参 = 未强制。
+    let f = force.unwrap_or(false);
+    let outcome = tokio::task::spawn_blocking(move || exec(f))
         .await
         .map_err(|e| JsErrorBox::generic(format!("server.reloadConfig: join failed: {e}")))?
         .map_err(|(code, msg)| {
@@ -159,6 +164,8 @@ mod tests {
         r#"
 export default {
   reload: async () => json.ok(await server.reloadConfig()),
+  reload_force_true: async () => json.ok(await server.reloadConfig(true)),
+  reload_force_default: async () => json.ok(await server.reloadConfig()),
   reload_catch: async () => {
     try {
       return json.ok(await server.reloadConfig());
@@ -255,7 +262,7 @@ export default {
         // 槽位后填（照搬 serve 装配次序：桥构造在先，executor 在后 set）。
         let calls = Arc::new(AtomicU32::new(0));
         let calls2 = calls.clone();
-        slot.set(Arc::new(move || {
+        slot.set(Arc::new(move |_force: bool| {
             let n = calls2.fetch_add(1, Ordering::SeqCst) + 1;
             Ok(if n == 1 {
                 ReloadOutcome {
@@ -297,15 +304,46 @@ export default {
         assert_eq!(d["kept_listener"], serde_json::json!([]));
     }
 
+    /// S8：force 透传——JS `reloadConfig(true)` / `reloadConfig()` → executor
+    /// 分别收到 true / false（Option<bool> 缺省 undefined → None → false）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn s8_force_flag_passthrough() {
+        let base = tmp("s8").canonicalize().unwrap();
+        let slot: Arc<ReloadSlot> = Arc::new(std::sync::OnceLock::new());
+        let b = make_bridge(&base, slot.clone(), Arc::new(InMemoryKV::new()));
+        let seen: Arc<std::sync::Mutex<Vec<bool>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        slot.set(Arc::new(move |force: bool| {
+            seen2.lock().unwrap().push(force);
+            Ok(ReloadOutcome {
+                generation: 1,
+                unchanged: false,
+                applied: vec!["vars".into()],
+                restart_pending: vec![],
+                kept_listener: vec![],
+            })
+        }))
+        .is_ok()
+        .then_some(())
+        .expect("slot set must succeed");
+        let v = run(&b, &base, "inst", "reload_force_true").await;
+        assert_eq!(v["code"], 0, "{}", v["msg"]);
+        let v = run(&b, &base, "inst", "reload_force_default").await;
+        assert_eq!(v["code"], 0, "{}", v["msg"]);
+        assert_eq!(*seen.lock().unwrap(), vec![true, false]);
+    }
+
     /// S5：非特权模块 → NotCapable: not platform-privileged。
     #[tokio::test(flavor = "current_thread")]
     async fn s5_non_privileged_module_denied() {
         let base = tmp("s5").canonicalize().unwrap();
         let slot: Arc<ReloadSlot> = Arc::new(std::sync::OnceLock::new());
-        slot.set(Arc::new(|| Err((500u16, "must not be called".into()))))
-            .is_ok()
-            .then_some(())
-            .expect("slot set must succeed");
+        slot.set(Arc::new(|_force: bool| {
+            Err((500u16, "must not be called".into()))
+        }))
+        .is_ok()
+        .then_some(())
+        .expect("slot set must succeed");
         let b = make_bridge(&base, slot, Arc::new(InMemoryKV::new()));
         let v = run(&b, &base, "plain", "reload_catch").await;
         assert_eq!(v["code"], 0, "{}", v["msg"]);
@@ -349,7 +387,7 @@ export default {
         // try_lock 串行化在前（撞锁 → 409 busy），executor 体在后。
         let reload_lock = Arc::new(tokio::sync::Mutex::new(()));
         let lock2 = reload_lock.clone();
-        slot.set(Arc::new(move || {
+        slot.set(Arc::new(move |_force: bool| {
             let _guard = lock2
                 .try_lock()
                 .map_err(|_| (409u16, "reload in progress".to_string()))?;

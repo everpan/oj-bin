@@ -368,7 +368,10 @@ globalThis.yaml = {
 // runs (seconds: DB verify + transpile) the actor executing this handler is
 // occupied and is not returned to the pool until it completes.
 globalThis.server = {
-  reloadConfig: () => op_server_reload_config(),
+  // reloadConfig(force): force=true skips the unchanged idempotence gate and
+  // forces a full generation swap (applied may be empty); it never bypasses
+  // the busy lock. Missing/non-boolean arg means not forced.
+  reloadConfig: (force) => op_server_reload_config(force),
 };
 
 // ----- json: unified envelope + response headers -----

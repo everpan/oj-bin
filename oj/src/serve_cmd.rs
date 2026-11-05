@@ -355,7 +355,7 @@ async fn serve_hot_reload_branch(
     // 语义等价）仅记 warn。
     let rs_for_slot = rs.clone();
     let slot_exec: only_js::bridge::reload_bridge::ReloadExecutorLike =
-        Arc::new(move || rs_for_slot.trigger_sync());
+        Arc::new(move |force: bool| rs_for_slot.trigger_sync(force));
     if reload_slot.set(slot_exec).is_err() {
         eprintln!("warn: reload slot already set; keeping the first executor");
     }
@@ -447,7 +447,7 @@ impl HotReloadCtx {
 /// runtime 上跑，current_thread 会因内部 spawn/join 段死锁；禁止在 axum handler
 /// 直接 await，故包一层独立线程）。
 fn build_reload_executor(ctx: Arc<HotReloadCtx>) -> serve::reload::ReloadExecutor {
-    Arc::new(move || {
+    Arc::new(move |force: bool| {
         let ctx = ctx.clone();
         let handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
@@ -455,7 +455,7 @@ fn build_reload_executor(ctx: Arc<HotReloadCtx>) -> serve::reload::ReloadExecuto
                 .enable_all()
                 .build()
                 .map_err(|e| (500u16, format!("reload runtime: {e}")))?;
-            rt.block_on(async { do_reload(&ctx).await })
+            rt.block_on(async { do_reload(&ctx, force).await })
         });
         handle
             .join()
@@ -464,7 +464,13 @@ fn build_reload_executor(ctx: Arc<HotReloadCtx>) -> serve::reload::ReloadExecuto
 }
 
 /// 单次热更全流程（§5）：归一 → 影子装配（复用后端）→ 任务池交接 → swap + 三清单。
-async fn do_reload(ctx: &HotReloadCtx) -> Result<serve::reload::ReloadOutcome, (u16, String)> {
+/// `force=true`（v0.1.123）：跳过 unchanged 幂等闸门强制换代（applied 可空）——
+/// `?force=1` / `reloadConfig(force)` 同源；Task 2 接线闸门，此参暂占位。
+async fn do_reload(
+    ctx: &HotReloadCtx,
+    force: bool,
+) -> Result<serve::reload::ReloadOutcome, (u16, String)> {
+    let _ = force; // TODO(v0.1.123 Task 2): 闸门消费，届时移除
     // ① 归一：load_cfg（解密→类型→mounts→legacy 键）→ fold_cli_mounts 重放 →
     //    cert/key 覆盖重放 → admission_gate。
     let (mut cfg, _, _) = load_cfg(ctx.args.config.as_deref(), true).map_err(|e| (400u16, e))?;

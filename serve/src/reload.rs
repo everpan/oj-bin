@@ -160,23 +160,24 @@ impl ReloadState {
     /// → 取 executor → 同步执行。JS `server.reloadConfig` 经
     /// [`Self::trigger_sync`]（spawn_blocking 线程）调**同一 executor 实例与
     /// 同一把 `reload_lock`**（共享处理体，设计稿 §3；撞锁 → busy 明确报错，
-    /// 不静默并发排队）。
-    pub async fn trigger(&self) -> Result<ReloadOutcome, (u16, String)> {
+    /// 不静默并发排队）。`force=true`（`?force=1`）跳过 unchanged 幂等闸门
+    /// 强制换代，但**不绕开本锁串行化**。
+    pub async fn trigger(&self, force: bool) -> Result<ReloadOutcome, (u16, String)> {
         let _guard = self.reload_lock.try_lock().map_err(|_| Self::busy())?;
         let exec = self.executor.lock().await;
         let exec = exec.as_ref().ok_or_else(Self::not_ready)?;
-        exec()
+        exec(force)
     }
 
     /// 共享触发入口（同步形态，JS `server.reloadConfig` 经 spawn_blocking 调用）。
     /// tokio Mutex 的 `try_lock` 是同步操作，可在阻塞池线程内完成；`reload_lock`
     /// 已串行化全部触发（HTTP 侧经 [`Self::trigger`] 先抢同一把锁），executor
     /// 锁此处实际无竞争，`try_lock` 失败按 busy 归类（防御性，不可达路径）。
-    pub fn trigger_sync(&self) -> Result<ReloadOutcome, (u16, String)> {
+    pub fn trigger_sync(&self, force: bool) -> Result<ReloadOutcome, (u16, String)> {
         let _guard = self.reload_lock.try_lock().map_err(|_| Self::busy())?;
         let exec = self.executor.try_lock().map_err(|_| Self::busy())?;
         let exec = exec.as_ref().ok_or_else(Self::not_ready)?;
-        exec()
+        exec(force)
     }
 
     /// 取出提交句柄（供 `reload_executor` 闭包捕获）。
@@ -335,7 +336,8 @@ async fn handle_config(
             // JS 侧经 spawn_blocking 调用（executor 同步闭包，Send+Sync 已成立）；
             // **既定语义**：触发 reload 的 handler 所在 actor 在热更期间被占用
             // （秒级，DB verify + 转译），完成前不归还池。
-            match rs.trigger().await {
+            match rs.trigger(false).await {
+                // TODO(v0.1.123 Task 2): 改 `rs.trigger(query_flag(...))`——`?force=1` 接线。
                 Ok(outcome) => outcome_response(outcome),
                 Err((status, msg)) => (
                     StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
@@ -422,11 +424,11 @@ mod tests {
     async fn trigger_busy_when_reload_lock_held() {
         let rs = state();
         let _g = rs.reload_lock.try_lock().unwrap();
-        let e = rs.trigger().await.unwrap_err();
+        let e = rs.trigger(false).await.unwrap_err();
         assert_eq!(e.0, 409);
         assert_eq!(e.1, "reload in progress");
         // 同步形态（JS spawn_blocking 路径）同一把锁：同样 busy。
-        let e = rs.trigger_sync().unwrap_err();
+        let e = rs.trigger_sync(false).unwrap_err();
         assert_eq!(e.0, 409);
         assert_eq!(e.1, "reload in progress");
     }
@@ -435,21 +437,21 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn trigger_not_ready_then_executor_shared() {
         let rs = state();
-        let e = rs.trigger().await.unwrap_err();
+        let e = rs.trigger(false).await.unwrap_err();
         assert_eq!(e.0, 503);
-        let e = rs.trigger_sync().unwrap_err();
+        let e = rs.trigger_sync(false).unwrap_err();
         assert_eq!(e.0, 503);
 
         let called = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let c2 = called.clone();
-        rs.set_executor(Arc::new(move || {
+        rs.set_executor(Arc::new(move |_force: bool| {
             c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(outcome(7, true))
         }))
         .await;
-        let o = rs.trigger().await.unwrap();
+        let o = rs.trigger(false).await.unwrap();
         assert!(o.unchanged && o.generation == 7);
-        let o = rs.trigger_sync().unwrap();
+        let o = rs.trigger_sync(false).unwrap();
         assert!(o.unchanged && o.generation == 7);
         assert_eq!(called.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
@@ -458,9 +460,9 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn trigger_propagates_executor_error() {
         let rs = state();
-        rs.set_executor(Arc::new(|| Err((400u16, "bad config".to_string()))))
+        rs.set_executor(Arc::new(|_force: bool| Err((400u16, "bad config".to_string()))))
             .await;
-        let e = rs.trigger().await.unwrap_err();
+        let e = rs.trigger(false).await.unwrap_err();
         assert_eq!(e.0, 400);
         assert_eq!(e.1, "bad config");
     }
@@ -510,7 +512,7 @@ mod tests {
         let rs = state();
         let c = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let c2 = c.clone();
-        rs.set_executor(Arc::new(move || {
+        rs.set_executor(Arc::new(move |_force: bool| {
             std::thread::sleep(Duration::from_millis(50));
             c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(outcome(1, false))
@@ -518,7 +520,7 @@ mod tests {
         .await;
         // 先抢锁模拟在跑的 reload，再触发：busy，executor 未被调用。
         let _g = rs.reload_lock.try_lock().unwrap();
-        let e = rs.trigger().await.unwrap_err();
+        let e = rs.trigger(false).await.unwrap_err();
         assert_eq!(e.0, 409);
         assert_eq!(c.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
