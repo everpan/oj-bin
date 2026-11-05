@@ -16,7 +16,7 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
-## v0.1.123（2026-11-05，未打标签）
+## v0.1.123（2026-11-05）
 
 **feat（serve/oj，reload force 旁路）**：`POST {base}/_system/config?force=1`（取值
 `1`/`true`，值不区分大小写）与特权 JS `server.reloadConfig(force)` 支持**强制热更**
