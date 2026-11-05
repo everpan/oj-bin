@@ -401,7 +401,10 @@ pub fn check_tenant_raw(
         let g = state.borrow();
         let rs = g.borrow::<ReqState>();
         (
-            rs.assembly.clone().expect("assembly pinned at checkout").sql_guard,
+            rs.assembly
+                .clone()
+                .expect("assembly pinned at checkout")
+                .sql_guard,
             rs.req.tenant_id.clone(),
             rs.system,
             rs.assembly

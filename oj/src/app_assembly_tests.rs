@@ -4,8 +4,8 @@
 //! - 空锁门：冷启动空锁 = 忘跑 `oj build`（Err）；复用路径空锁 = 合法卸载全部（Ok）。
 
 use super::*;
-use only_js::bridge::platform::PlatformGrant;
 use only_js::bridge::Bus;
+use only_js::bridge::platform::PlatformGrant;
 use std::collections::BTreeMap;
 
 /// 最小 StableState（仅 platform 授权 + 旧代装配；其余字段全空）——

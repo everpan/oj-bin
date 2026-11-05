@@ -831,7 +831,14 @@ impl Bridge {
             Ok(s) => s,
             Err(e) => return TaskExit::Crashed(format!("task spec: {e}")),
         };
-        let mut rt = match self.checkout_reset(RequestInfo::default(), None, &self.pool.stable().assembly_snapshot()).await {
+        let mut rt = match self
+            .checkout_reset(
+                RequestInfo::default(),
+                None,
+                &self.pool.stable().assembly_snapshot(),
+            )
+            .await
+        {
             Ok(rt) => rt,
             Err(e) => return TaskExit::Crashed(e.to_string()),
         };
@@ -1157,7 +1164,10 @@ impl Bridge {
     /// 带请求上下文执行。
     pub async fn run_with(&self, source: &str, req: RequestInfo) -> Result<Capture, CoreError> {
         // boot 失败（含超时）→ CoreError：run_with 无超时语义，不引入 RunError。
-        let mut rt = match self.checkout_reset(req, None, &self.pool.stable().assembly_snapshot()).await {
+        let mut rt = match self
+            .checkout_reset(req, None, &self.pool.stable().assembly_snapshot())
+            .await
+        {
             Ok(rt) => rt,
             Err(e) => return Err(CoreError::from(std::io::Error::other(e.to_string()))),
         };
@@ -1253,7 +1263,13 @@ impl Bridge {
     /// 若只依赖启动期内省的间接失败，线程 panic 会被 `routes::bridge_introspector` 的
     /// `join()` 吞成路由 failure，而路由 failure 在装配层只 warn 不致命（路由全空、服务照常监听）。
     pub async fn prewarm(&self) -> Result<(), RunError> {
-        let rt = self.checkout_reset(RequestInfo::default(), None, &self.pool.stable().assembly_snapshot()).await?;
+        let rt = self
+            .checkout_reset(
+                RequestInfo::default(),
+                None,
+                &self.pool.stable().assembly_snapshot(),
+            )
+            .await?;
         self.pool.checkin(rt);
         Ok(())
     }
@@ -1269,7 +1285,11 @@ impl Bridge {
             return None;
         }
         let rt = self
-            .checkout_reset(RequestInfo::default(), None, &self.pool.stable().assembly_snapshot())
+            .checkout_reset(
+                RequestInfo::default(),
+                None,
+                &self.pool.stable().assembly_snapshot(),
+            )
             .await
             .ok()?;
         let insp = rt.inspector();
@@ -1681,7 +1701,8 @@ impl Bridge {
             }
             anc = d.parent();
         }
-        self.run_side_driver(req, code, timeout, module, assembly.clone()).await
+        self.run_side_driver(req, code, timeout, module, assembly.clone())
+            .await
     }
 
     /// 启动期内省：import api 模块，**递归**遍历 default 导出的键（v0.1.64 嵌套 handler 组），

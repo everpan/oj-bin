@@ -190,13 +190,15 @@ mod tests {
         Arc::new(StableState {
             kv: Arc::new(InMemoryKV::new()),
             dbs: HashMap::new(),
-            assembly: Arc::new(std::sync::RwLock::new(Arc::new(crate::bridge::PerGenAssembly {
-                registry: Arc::new(SchemaRegistry::new()),
-                modules: Arc::new(HashMap::new()),
-                sql_guard: crate::bridge::SqlGuard::Off,
-                ownership_deny: false,
-                allow_as_tenant: false,
-            }))),
+            assembly: Arc::new(std::sync::RwLock::new(Arc::new(
+                crate::bridge::PerGenAssembly {
+                    registry: Arc::new(SchemaRegistry::new()),
+                    modules: Arc::new(HashMap::new()),
+                    sql_guard: crate::bridge::SqlGuard::Off,
+                    ownership_deny: false,
+                    allow_as_tenant: false,
+                },
+            ))),
             input_contracts: None,
             seq_ensured: std::sync::Mutex::new(HashSet::new()),
             loader: None,

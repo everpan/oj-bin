@@ -2850,7 +2850,12 @@ fn slot_fallback_from_registry_and_extras() {
 #[test]
 fn swap_assembly_visible_in_snapshot() {
     let db = Arc::new(InMemoryAccessor::new());
-    let b = Bridge::with_opts(db, Arc::new(InMemoryKV::new()), SchemaRegistry::new(), false);
+    let b = Bridge::with_opts(
+        db,
+        Arc::new(InMemoryKV::new()),
+        SchemaRegistry::new(),
+        false,
+    );
     let stable = b.stable_for_test();
     assert!(!stable.assembly_snapshot().registry.has_table("order"));
     let mut modules = std::collections::HashMap::new();

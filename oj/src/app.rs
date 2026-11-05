@@ -25,12 +25,10 @@ use only_js::bridge::ldap::{FfiLdapBackend, LdapBackend, LdapConfig};
 use only_js::bridge::mail::{FfiMailBackend, MailBackend, MailConfig};
 use only_js::bridge::mq::MqInstance;
 use only_js::bridge::plugin_loader::kv_backend_connect;
+use only_js::bridge::{AssemblySlot, EventBroker, PerGenAssembly, SqlGuard, StableState};
 use only_js::bridge::{
     Bridge, EsBackend, Extras, InMemoryKV, JwtCfg, KVStore, LoaderShared, ModuleCtx, ModuleIndex,
     NamedRegistry, SchemaRegistry,
-};
-use only_js::bridge::{
-    AssemblySlot, EventBroker, PerGenAssembly, SqlGuard, StableState,
 };
 use only_js::config::{self, Config};
 use only_js::contract::{InputContract, InputContractRegistry};
@@ -618,9 +616,7 @@ fn check_platform_squatting(stable: &StableState, asm: &PerGenAssembly) -> Resul
     };
     let old = stable.assembly_snapshot();
     for ctx in asm.modules.values() {
-        if p.modules.contains(&ctx.name)
-            && !old.modules.values().any(|m| m.name == ctx.name)
-        {
+        if p.modules.contains(&ctx.name) && !old.modules.values().any(|m| m.name == ctx.name) {
             return Err(format!(
                 "platform module '{}' must not be hot-installed \
                  (deploy it in a platform-controlled directory under platform.root, then restart)",
