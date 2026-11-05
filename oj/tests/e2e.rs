@@ -2484,10 +2484,12 @@ fn reload_platform_fixture(name: &str, port: u16) -> (PathBuf, PathBuf, String) 
 }
 
 /// spawn `oj serve` 子进程并轮询 health 至就绪（≤120s）。返回 (child, 诊断缓冲)。
+/// `health_base`：health 端点所在挂载前缀（如 "/pf/api"）。
 #[cfg(unix)]
 async fn boot_reload_serve(
     cfg_path: &Path,
     port: u16,
+    health_base: &str,
 ) -> (
     std::process::Child,
     std::sync::Arc<std::sync::Mutex<String>>,
@@ -2528,7 +2530,7 @@ async fn boot_reload_serve(
         .build()
         .unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    let health_url = format!("http://{addr}/pf/api/_system/health");
+    let health_url = format!("http://{addr}{health_base}/_system/health");
     loop {
         let ready =
             matches!(client.get(&health_url).send().await, Ok(r) if r.status().as_u16() == 200);
@@ -2592,7 +2594,7 @@ async fn req_rel(addr: std::net::SocketAddr, method: &str, path: &str) -> (u16, 
 async fn given_reload_api_when_privileged_module_calls_reload_config_then_applies() {
     let _g = lock();
     let (root, cfg_path, cfg) = reload_platform_fixture("js", 19988);
-    let (mut child, out_buf) = boot_reload_serve(&cfg_path, 19988).await;
+    let (mut child, out_buf) = boot_reload_serve(&cfg_path, 19988, "/pf/api").await;
     let addr: std::net::SocketAddr = "127.0.0.1:19988".parse().unwrap();
 
     // S5：非特权模块 → NotCapable: not platform-privileged。
@@ -2662,7 +2664,7 @@ async fn given_reload_api_when_privilege_segments_change_then_restart_pending_an
 {
     let _g = lock();
     let (root, cfg_path, cfg) = reload_platform_fixture("seg", 19989);
-    let (mut child, out_buf) = boot_reload_serve(&cfg_path, 19989).await;
+    let (mut child, out_buf) = boot_reload_serve(&cfg_path, 19989, "/pf/api").await;
     let addr: std::net::SocketAddr = "127.0.0.1:19989".parse().unwrap();
 
     // S4：改 fs 段（readonly）→ restart_pending 含 fs，不进 applied。
@@ -2712,6 +2714,399 @@ async fn given_reload_api_when_privilege_segments_change_then_restart_pending_an
         "grants must not hot apply: {body}"
     );
     assert_eq!(r["generation"], serde_json::json!(2), "{body}");
+
+    stop_reload_serve(&mut child).await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// —— 热装配 e2e（v0.1.122 B1/B2/B16/B17/B11：release 锁装/卸免重启）—— //
+
+/// 热装配夹具：src 源 → in-process `oj build` 逐模块（build 读旧锁 union 追加）
+/// → dist 树含全部版本目录且锁全量；**调用方按场景预摘锁**（安装语义 = 运行期补锁项，
+/// 目录已在盘）。platform=true 追加受控根 platform-modules/（dev 树，admin 模块）
+/// + platform 段（B16 用）。
+#[cfg(unix)]
+async fn hot_apply_fixture(
+    name: &str,
+    port: u16,
+    mods: &[(&str, &str, &str, &str)], // (模块名, 版本, 路由段, api.ts 源)
+    platform: bool,
+) -> (PathBuf, PathBuf) {
+    let raw = std::env::temp_dir().join(format!("oj-e2e-hotapply-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&raw);
+    std::fs::create_dir_all(&raw).unwrap();
+    let root = raw.canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("config")).unwrap();
+    std::fs::copy(
+        sample().join("config/public.pem"),
+        root.join("config/public.pem"),
+    )
+    .unwrap();
+    std::fs::copy(
+        sample().join("config/cert.jws"),
+        root.join("config/cert.jws"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("data")).unwrap();
+    for (m, v, seg, src) in mods {
+        std::fs::create_dir_all(root.join(format!("src/{m}/{seg}"))).unwrap();
+        std::fs::write(
+            root.join(format!("src/{m}/manifest.yaml")),
+            format!("name: {m}\ndesc: hot-apply probe\nversion: {v}\n"),
+        )
+        .unwrap();
+        std::fs::write(root.join(format!("src/{m}/{seg}/api.ts")), src).unwrap();
+    }
+    if platform {
+        std::fs::create_dir_all(root.join("platform-modules/admin/x")).unwrap();
+        std::fs::write(
+            root.join("platform-modules/admin/manifest.yaml"),
+            "name: admin\ndesc: privileged\nversion: 0.1.0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("platform-modules/admin/x/api.ts"),
+            "export default { get() { json.ok({ priv: true }); } };\n",
+        )
+        .unwrap();
+    }
+    for (m, _, _, _) in mods {
+        let a = BuildArgs {
+            module: Some((*m).into()),
+            config: Some("config.yaml".into()),
+            dir: root.join("src").display().to_string(),
+            module_root: None,
+            out: root.join("dist").display().to_string(),
+            minify: true,
+            check: false,
+            bundle: false,
+        };
+        oj::build_cmd::run(&a).await.unwrap();
+    }
+    let mut mounts = "  - prefix: \"/v1/api\"\n    api: \"dist\"\n".to_string();
+    let mut plat = String::new();
+    if platform {
+        mounts.push_str("  - prefix: \"/pf/api\"\n    api: \"platform-modules\"\n");
+        plat = "platform:\n  modules: [\"admin\"]\n  root: \"./platform-modules\"\n  trusted_paths: [\"./config.yaml\"]\n".into();
+    }
+    let dsn = oj_plugin_ffi::path_util::sqlite_file_dsn(&root.join("data/db.sqlite"));
+    let cfg = format!(
+        "server:\n  host: \"127.0.0.1\"\n  port: {port}\n  reload_api: true\n  public_key_path: \"config/public.pem\"\n  certificate_path: \"config/cert.jws\"\ndb:\n  default: \"{dsn}\"\nmounts:\n{mounts}{plat}vars:\n  FOO: \"bar\"\n",
+    );
+    let cfg_path = root.join("config.yaml");
+    std::fs::write(&cfg_path, &cfg).unwrap();
+    (root, cfg_path)
+}
+
+/// B1+B2：release 运行中装/卸模块免重启。运行期补锁 b → reload `applied` ⊇
+/// `+b@1.0.0`、GET b 200 且 `http.module.version=1.0.0`；摘锁（版本目录一并移除）
+/// → `applied` ⊇ `-b@1.0.0`、GET b 404；a 全程不受扰动。
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn hot_apply_install_uninstall_cycle() {
+    let _g = lock();
+    let port = 19990;
+    let (root, cfg_path) = hot_apply_fixture(
+        "cycle",
+        port,
+        &[
+            (
+                "a",
+                "0.1.0",
+                "list",
+                "export default { get() { json.ok({ m: \"a\", v: http.module.version }); } };\n",
+            ),
+            (
+                "b",
+                "1.0.0",
+                "ping",
+                "export default { get() { json.ok({ m: \"b\", v: http.module.version }); } };\n",
+            ),
+        ],
+        false,
+    )
+    .await;
+    // 预装语义：锁暂只含 a（b 版本目录已在 dist，等运行期补锁 = 安装）。
+    let lock_a: std::collections::BTreeMap<String, String> =
+        std::iter::once(("a".to_string(), "0.1.0".to_string())).collect();
+    oj::manifest::save_lock(&root.join("dist/manifests.yaml"), &lock_a).unwrap();
+    let (mut child, out_buf) = boot_reload_serve(&cfg_path, port, "/v1/api").await;
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+    // 装前：b 404，a 基线正常。
+    let (st, body) = req_rel(addr, "GET", "/v1/api/b/ping/").await;
+    assert_eq!(st, 404, "b before install: {st} {body}");
+    let (st, body) = req_rel(addr, "GET", "/v1/api/a/list/").await;
+    assert_eq!(st, 200, "a baseline: {body}\n{}", out_buf.lock().unwrap());
+    assert_eq!(body["data"]["v"], "0.1.0", "{body}");
+
+    // B1 安装：补锁 → reload → applied ⊇ +b@1.0.0（非 unchanged：无 msg 键）。
+    let lock_ab: std::collections::BTreeMap<String, String> = [
+        ("a".to_string(), "0.1.0".to_string()),
+        ("b".to_string(), "1.0.0".to_string()),
+    ]
+    .into_iter()
+    .collect();
+    oj::manifest::save_lock(&root.join("dist/manifests.yaml"), &lock_ab).unwrap();
+    let (st, body) = req_rel(addr, "POST", "/v1/api/_system/config").await;
+    assert_eq!(st, 200, "install reload: {body}\n{}", out_buf.lock().unwrap());
+    assert_eq!(body["code"], 0, "{body}");
+    assert!(body["msg"].is_null(), "lock change must not be unchanged: {body}");
+    let applied = body["data"]["applied"].as_array().expect("applied array");
+    assert!(
+        applied.iter().any(|v| v.as_str() == Some("+b@1.0.0")),
+        "applied must contain +b@1.0.0: {body}"
+    );
+
+    // 装后：b 200 且模块身份版本正确（B1 的 http.module.version=1.0.0）。
+    let (st, body) = req_rel(addr, "GET", "/v1/api/b/ping/").await;
+    assert_eq!(st, 200, "b after install: {body}");
+    assert_eq!(body["data"]["m"], "b", "{body}");
+    assert_eq!(body["data"]["v"], "1.0.0", "{body}");
+
+    // B2 卸载：摘锁 + 移除版本目录 → applied ⊇ -b@1.0.0；GET b 404。
+    oj::manifest::save_lock(&root.join("dist/manifests.yaml"), &lock_a).unwrap();
+    std::fs::remove_dir_all(root.join("dist/b-1.0.0")).unwrap();
+    let (st, body) = req_rel(addr, "POST", "/v1/api/_system/config").await;
+    assert_eq!(st, 200, "uninstall reload: {body}");
+    let applied = body["data"]["applied"].as_array().expect("applied array");
+    assert!(
+        applied.iter().any(|v| v.as_str() == Some("-b@1.0.0")),
+        "applied must contain -b@1.0.0: {body}"
+    );
+    let (st, _) = req_rel(addr, "GET", "/v1/api/b/ping/").await;
+    assert_eq!(st, 404, "b must be gone after uninstall");
+    let (st, body) = req_rel(addr, "GET", "/v1/api/a/list/").await;
+    assert_eq!(st, 200, "a untouched: {body}");
+
+    stop_reload_serve(&mut child).await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// B16 抢注拦截：admin 受控根部署（gen0 含）→ 运行期摘除受控根副本 + vars 变更
+/// 驱动换代（gen1 不含 admin）→ 市场树补 admin 锁 → reload 400 点名
+/// `must not be hot-installed`；特权不继承（市场 admin 路由不上树，代际不动）。
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn hot_apply_squatting_rejected() {
+    let _g = lock();
+    let port = 19991;
+    let (root, cfg_path) = hot_apply_fixture(
+        "squat",
+        port,
+        &[
+            (
+                "shop",
+                "0.1.0",
+                "list",
+                "export default { get() { json.ok({ m: \"shop\" }); } };\n",
+            ),
+            (
+                "admin",
+                "1.0.0",
+                "x",
+                "export default { get() { json.ok({ m: \"admin\" }); } };\n",
+            ),
+        ],
+        true,
+    )
+    .await;
+    let lock_shop: std::collections::BTreeMap<String, String> =
+        std::iter::once(("shop".to_string(), "0.1.0".to_string())).collect();
+    oj::manifest::save_lock(&root.join("dist/manifests.yaml"), &lock_shop).unwrap();
+    let (mut child, out_buf) = boot_reload_serve(&cfg_path, port, "/pf/api").await;
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let (st, body) = req_rel(addr, "GET", "/pf/api/admin/x/").await;
+    assert_eq!(st, 200, "root admin deployed: {body}\n{}", out_buf.lock().unwrap());
+
+    // 摘除受控根副本 + vars 变更驱动换代（gen1 不含 admin）。
+    std::fs::remove_dir_all(root.join("platform-modules/admin")).unwrap();
+    let cfg2 = std::fs::read_to_string(&cfg_path)
+        .unwrap()
+        .replace("FOO: \"bar\"", "FOO: \"baz\"");
+    std::fs::write(&cfg_path, &cfg2).unwrap();
+    let (st, body) = req_rel(addr, "POST", "/v1/api/_system/config").await;
+    assert_eq!(st, 200, "undeploy reload: {body}\n{}", out_buf.lock().unwrap());
+    let gen1 = body["data"]["generation"].as_u64().expect("generation");
+    let (st, _) = req_rel(addr, "GET", "/pf/api/admin/x/").await;
+    assert_eq!(st, 404, "admin must be undeployed");
+
+    // 抢注：市场树补 admin 锁 → 400 点名，零副作用。
+    let lock_squat: std::collections::BTreeMap<String, String> = [
+        ("shop".to_string(), "0.1.0".to_string()),
+        ("admin".to_string(), "1.0.0".to_string()),
+    ]
+    .into_iter()
+    .collect();
+    oj::manifest::save_lock(&root.join("dist/manifests.yaml"), &lock_squat).unwrap();
+    let (st, body) = req_rel(addr, "POST", "/v1/api/_system/config").await;
+    assert_eq!(st, 400, "squat reload must be rejected: {st} {body}\n{}", out_buf.lock().unwrap());
+    let msg = body.as_str().unwrap_or("");
+    assert!(
+        msg.contains("admin") && msg.contains("must not be hot-installed"),
+        "rejection must name the squat: {msg}"
+    );
+    // 特权不继承：代际不动、市场 admin 路由不上树。
+    let (st, _) = req_rel(addr, "GET", "/v1/api/admin/x/").await;
+    assert_eq!(st, 404, "market admin must not mount");
+    let (_, body) = req_rel(addr, "GET", "/v1/api/_system/config").await;
+    assert_eq!(body["generation"], gen1, "failed reload must not advance: {body}");
+
+    stop_reload_serve(&mut child).await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// B17：卸载挂载的最后一个模块（锁 → 空）。reload 路径空锁合法（D7，空路由
+/// 放行）；冷启动空锁 fail-fast 由单测 `empty_lock_allowed_on_reuse_rejected_on_cold` 钉住。
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn hot_apply_uninstall_last_module() {
+    let _g = lock();
+    let port = 19992;
+    let (root, cfg_path) = hot_apply_fixture(
+        "last",
+        port,
+        &[(
+            "a",
+            "0.1.0",
+            "list",
+            "export default { get() { json.ok({ m: \"a\" }); } };\n",
+        )],
+        false,
+    )
+    .await;
+    let (mut child, out_buf) = boot_reload_serve(&cfg_path, port, "/v1/api").await;
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let (st, body) = req_rel(addr, "GET", "/v1/api/a/list/").await;
+    assert_eq!(st, 200, "baseline: {body}\n{}", out_buf.lock().unwrap());
+
+    // 锁 → 空：reload 放行（卸载全部 = 合法空装配），applied ⊇ -a@0.1.0。
+    let lock_empty: std::collections::BTreeMap<String, String> = Default::default();
+    oj::manifest::save_lock(&root.join("dist/manifests.yaml"), &lock_empty).unwrap();
+    let (st, body) = req_rel(addr, "POST", "/v1/api/_system/config").await;
+    assert_eq!(st, 200, "empty-lock reload: {body}\n{}", out_buf.lock().unwrap());
+    assert_eq!(body["code"], 0, "{body}");
+    let applied = body["data"]["applied"].as_array().expect("applied array");
+    assert!(
+        applied.iter().any(|v| v.as_str() == Some("-a@0.1.0")),
+        "applied must contain -a@0.1.0: {body}"
+    );
+    // 空装配套 GET：模块路由 404、health 仍 200（服务活着）。
+    let (st, _) = req_rel(addr, "GET", "/v1/api/a/list/").await;
+    assert_eq!(st, 404, "module must be gone");
+    let (st, _) = req_rel(addr, "GET", "/v1/api/_system/health").await;
+    assert_eq!(st, 200, "health must survive empty assembly");
+
+    stop_reload_serve(&mut child).await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// B11 e2e：`* * * * *` cron 在 reload 换代（任务池交接 + resume 闸）后仍触发
+/// 且恰一次。就绪/触发一律 deadline 轮询（分钟边界最长等 ~130s，e2e 较慢属预期）。
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn cron_survives_reload_fires_once() {
+    let _g = lock();
+    let port = 19993;
+    let raw = std::env::temp_dir().join(format!("oj-e2e-cronsurv-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&raw);
+    std::fs::create_dir_all(&raw).unwrap();
+    let root = raw.canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("config")).unwrap();
+    std::fs::copy(
+        sample().join("config/public.pem"),
+        root.join("config/public.pem"),
+    )
+    .unwrap();
+    std::fs::copy(
+        sample().join("config/cert.jws"),
+        root.join("config/cert.jws"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("data")).unwrap();
+    // 模块（读计数的路由）+ cron 任务（TLA 写 kv 计数；tasks.dir/crontab 走默认值）。
+    std::fs::create_dir_all(root.join("src/cronmod/count")).unwrap();
+    std::fs::write(
+        root.join("src/cronmod/manifest.yaml"),
+        "name: cronmod\ndesc: cron probe\nversion: 0.1.0\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/cronmod/count/api.ts"),
+        "export default { async get() { const n = await kv.get(\"cron:e2e:n\"); json.ok({ n: n ? Number(n) : 0 }); } };\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("src/tasks/task")).unwrap();
+    std::fs::write(
+        root.join("src/tasks/task/crontab.yaml"),
+        "* * * * * ./jobs/tick.ts\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("src/tasks/jobs")).unwrap();
+    std::fs::write(
+        root.join("src/tasks/jobs/tick.ts"),
+        "const n = Number((await kv.get(\"cron:e2e:n\")) ?? \"0\");\nawait kv.set(\"cron:e2e:n\", String(n + 1));\n",
+    )
+    .unwrap();
+    let dsn = oj_plugin_ffi::path_util::sqlite_file_dsn(&root.join("data/db.sqlite"));
+    let cfg = format!(
+        "server:\n  host: \"127.0.0.1\"\n  port: {port}\n  reload_api: true\n  public_key_path: \"config/public.pem\"\n  certificate_path: \"config/cert.jws\"\ndb:\n  default: \"{dsn}\"\nmounts:\n  - prefix: \"/v1/api\"\n    api: \"src\"\nvars:\n  FOO: \"bar\"\n",
+    );
+    let cfg_path = root.join("config.yaml");
+    std::fs::write(&cfg_path, &cfg).unwrap();
+    let (mut child, out_buf) = boot_reload_serve(&cfg_path, port, "/v1/api").await;
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let count = || async {
+        let (st, body) = req_rel(addr, "GET", "/v1/api/cronmod/count/").await;
+        assert_eq!(st, 200, "{body}");
+        body["data"]["n"].as_u64().unwrap_or(0)
+    };
+    // 拍 1：对齐下一个分钟边界（deadline 130s 覆盖整分钟 + 启动期）。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(130);
+    loop {
+        let n = count().await;
+        assert!(n <= 1, "first window must not double-fire: {n}");
+        if n >= 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "first cron fire missed:\n{}",
+            out_buf.lock().unwrap()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+    // 换代：vars 变更驱动 reload（旧池停 → 放闸新池，恰在此刻交接）。
+    let cfg2 = cfg.replace("FOO: \"bar\"", "FOO: \"baz\"");
+    std::fs::write(&cfg_path, &cfg2).unwrap();
+    let (st, body) = req_rel(addr, "POST", "/v1/api/_system/config").await;
+    assert_eq!(st, 200, "reload: {body}\n{}", out_buf.lock().unwrap());
+    assert!(
+        body["data"]["generation"].as_u64().unwrap_or(0) >= 1,
+        "generation must advance: {body}"
+    );
+
+    // 拍 2：下一个分钟边界仍触发（存活）且恰一次（无双发）。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(130);
+    loop {
+        let n = count().await;
+        assert!(n <= 2, "double-fire across reload: {n}");
+        if n >= 2 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "post-reload cron fire missed:\n{}",
+            out_buf.lock().unwrap()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+    // 负向观察窗（3s 有界）：边界已过，计数不得再涨。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        assert_eq!(count().await, 2, "exactly-once violated");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
 
     stop_reload_serve(&mut child).await;
     let _ = std::fs::remove_dir_all(&root);
