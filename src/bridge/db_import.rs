@@ -1244,11 +1244,11 @@ pub async fn op_db_import(
     // 2. import 预检：guard != Off && !system && 已登记且 tenant-scoped → fail-closed。
     {
         let g = state.borrow();
-        let st = g.borrow::<Arc<super::StableState>>();
         let rs = g.borrow::<super::ReqState>();
-        if st.sql_guard != super::SqlGuard::Off
+        let asm = rs.assembly.clone().expect("assembly pinned at checkout");
+        if asm.sql_guard != super::SqlGuard::Off
             && !rs.system
-            && st
+            && asm
                 .registry
                 .get(&args.table)
                 .is_some_and(|d| d.is_tenant_scoped())
@@ -1277,10 +1277,15 @@ pub async fn op_db_import(
     };
     let (section, registry, import_registry) = {
         let g = state.borrow();
+        let asm = g
+            .borrow::<super::ReqState>()
+            .assembly
+            .clone()
+            .expect("assembly pinned at checkout");
         let st = g.borrow::<Arc<super::StableState>>();
         (
             st.import_section.clone(),
-            st.registry.clone(),
+            asm.registry.clone(),
             st.import_registry.clone(),
         )
     };

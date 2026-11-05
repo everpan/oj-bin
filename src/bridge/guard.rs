@@ -16,7 +16,7 @@ use std::sync::Arc;
 use deno_core::OpState;
 use deno_error::JsErrorBox;
 
-use super::{ModuleCtx, ReqState, StableState};
+use super::{ModuleCtx, PerGenAssembly, ReqState, StableState};
 
 /// 词法切分（best-effort）：返回标识符/关键字词序列，跳过字符串字面量与 `--`、`/* */`
 /// 注释；`"…"`/`` `…` `` 引用标识符的内容**成词**（表名 `"t"` 必须可见）。
@@ -234,20 +234,27 @@ fn is_boundary_kw(w: &str) -> bool {
 }
 
 /// 取本请求模块上下文（无上下文 / 模块未登记 → None = 不设防）。
-fn module_ctx(state: &Rc<RefCell<OpState>>) -> Option<(ModuleCtx, Arc<StableState>)> {
+fn module_ctx(
+    state: &Rc<RefCell<OpState>>,
+) -> Option<(ModuleCtx, Arc<PerGenAssembly>, Arc<StableState>)> {
     let g = state.borrow();
     let name = g.borrow::<ReqState>().module.clone()?;
-    let stable = g.borrow::<Arc<StableState>>().clone();
+    let asm = g
+        .borrow::<ReqState>()
+        .assembly
+        .clone()
+        .expect("assembly pinned at checkout");
     // modules 键 = 目录路径（run_module 祖先命中用），此处按名取。
     // ponytail: 模块数个位~几十，线性扫远低于 SQL 噪声；模块表破百再换按名索引。
-    let ctx = stable.modules.values().find(|c| c.name == name)?.clone();
-    Some((ctx, stable))
+    let ctx = asm.modules.values().find(|c| c.name == name)?.clone();
+    let stable = g.borrow::<Arc<StableState>>().clone();
+    Some((ctx, asm, stable))
 }
 
 /// 归属判定 + warn/deny 处置（Err = deny 模式拒绝）。
 /// 未声明归属的表（owner=None）不设防——那是静态 S003 检查的职责。
-fn judge(stable: &StableState, ctx: &ModuleCtx, table: &str, src: &str) -> Result<(), JsErrorBox> {
-    let Some(owner) = stable.registry.owner_of(table) else {
+fn judge(asm: &PerGenAssembly, ctx: &ModuleCtx, table: &str, src: &str) -> Result<(), JsErrorBox> {
+    let Some(owner) = asm.registry.owner_of(table) else {
         return Ok(());
     };
     if owner == ctx.name || ctx.deps.contains(owner) {
@@ -257,7 +264,7 @@ fn judge(stable: &StableState, ctx: &ModuleCtx, table: &str, src: &str) -> Resul
         "ownership: 表 {table:?} 属于模块 {owner:?}，模块 {:?} 未声明依赖（{src}）",
         ctx.name
     );
-    if stable.ownership_deny {
+    if asm.ownership_deny {
         return Err(JsErrorBox::generic(format!(
             "{msg}\n  修复：在模块 manifest.yaml 声明 deps: [{owner}]，或改用契约调用"
         )));
@@ -284,7 +291,7 @@ fn memo_put(
 
 /// 裸 SQL 守卫（op_db_query / op_db_exec）：提取表名（memo 缓存）→ 逐表归属判定。
 pub fn check_raw(state: &Rc<RefCell<OpState>>, sql: &str) -> Result<(), JsErrorBox> {
-    let Some((ctx, stable)) = module_ctx(state) else {
+    let Some((ctx, asm, stable)) = module_ctx(state) else {
         return Ok(());
     };
     let tables = {
@@ -298,17 +305,17 @@ pub fn check_raw(state: &Rc<RefCell<OpState>>, sql: &str) -> Result<(), JsErrorB
         }
     };
     for t in tables.iter() {
-        judge(&stable, &ctx, t, "raw sql")?;
+        judge(&asm, &ctx, t, "raw sql")?;
     }
     Ok(())
 }
 
 /// 构造器路径守卫（op_db_query_build）：表名精确已知，不走扫描。
 pub fn check_table(state: &Rc<RefCell<OpState>>, table: &str) -> Result<(), JsErrorBox> {
-    let Some((ctx, stable)) = module_ctx(state) else {
+    let Some((ctx, asm, _stable)) = module_ctx(state) else {
         return Ok(());
     };
-    judge(&stable, &ctx, table, "db.table()")
+    judge(&asm, &ctx, table, "db.table()")
 }
 
 /// 多字节字符的 utf-8 字节长度（strip_literals 按字节扫描用）。
@@ -392,13 +399,16 @@ pub fn check_tenant_raw(
 ) -> Result<(), JsErrorBox> {
     let (guard, tid, system, registry) = {
         let g = state.borrow();
-        let st = g.borrow::<Arc<StableState>>();
         let rs = g.borrow::<ReqState>();
         (
-            st.sql_guard,
+            rs.assembly.clone().expect("assembly pinned at checkout").sql_guard,
             rs.req.tenant_id.clone(),
             rs.system,
-            st.registry.clone(),
+            rs.assembly
+                .clone()
+                .expect("assembly pinned at checkout")
+                .registry
+                .clone(),
         )
     };
     if guard == super::SqlGuard::Off || system {
@@ -507,8 +517,10 @@ pub fn bound_db(state: &Rc<RefCell<OpState>>, name: &str) -> String {
     let module_bound = {
         let rs = g.borrow::<ReqState>();
         match rs.module.clone() {
-            Some(m) => g
-                .borrow::<Arc<StableState>>()
+            Some(m) => rs
+                .assembly
+                .clone()
+                .expect("assembly pinned at checkout")
                 .modules
                 .values()
                 .find(|c| c.name == m)

@@ -554,7 +554,12 @@ pub fn op_db_as_tenant(state: &mut OpState, #[string] id: String) -> Result<bool
     }
     // 平台无从校验 id 是否为真实租户（无租户目录可查）——安全完全取决于「服务端派生」
     // 这条红线，故默认关闭 + 审计日志。
-    let allow = state.borrow::<Arc<super::StableState>>().allow_as_tenant;
+    let allow = state
+        .borrow::<super::ReqState>()
+        .assembly
+        .clone()
+        .expect("assembly pinned at checkout")
+        .allow_as_tenant;
     if !allow {
         return Err(JsErrorBox::generic(
             "db.asTenant is disabled: set tenant.allow_as_tenant=true to let anonymous handlers declare a tenant",

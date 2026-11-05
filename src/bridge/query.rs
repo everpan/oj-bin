@@ -646,7 +646,14 @@ impl QueryLimits {
 }
 
 fn registry(state: &Rc<RefCell<OpState>>) -> Result<Arc<SchemaRegistry>, JsErrorBox> {
-    Ok(state.borrow().borrow::<Arc<StableState>>().registry.clone())
+    Ok(state
+        .borrow()
+        .borrow::<super::ReqState>()
+        .assembly
+        .clone()
+        .expect("assembly pinned at checkout")
+        .registry
+        .clone())
 }
 
 // REQ-12：导入批渲染复用（serde → sea_query 值）。
@@ -2614,7 +2621,7 @@ pub fn op_db_query_sql(
     Ok(out)
 }
 
-/// 两构造器 op 共用的租户预变换：读 StableState.sql_guard + ReqState（tenant_id/system），
+/// 两构造器 op 共用的租户预变换：读本代装配 sql_guard + ReqState（tenant_id/system），
 /// Off 或 system 逃生口直接放行。
 fn apply_tenant_guard(
     state: &Rc<RefCell<OpState>>,
@@ -2622,7 +2629,12 @@ fn apply_tenant_guard(
     reg: &SchemaRegistry,
 ) -> Result<(), JsErrorBox> {
     let g = state.borrow();
-    let guard = g.borrow::<Arc<StableState>>().sql_guard;
+    let guard = g
+        .borrow::<super::ReqState>()
+        .assembly
+        .clone()
+        .expect("assembly pinned at checkout")
+        .sql_guard;
     if guard == super::SqlGuard::Off {
         return Ok(());
     }
