@@ -75,11 +75,17 @@ pub async fn op_client_dispatch(
             .try_borrow::<TestAnonymous>()
             .is_some_and(|a| a.0);
         let mut g = state.borrow_mut();
+        let assembly = g
+            .borrow::<Arc<only_js::bridge::StableState>>()
+            .assembly_snapshot();
         let rs = g.borrow_mut::<only_js::bridge::ReqState>();
         rs.reset(only_js::bridge::RequestInfo {
             anonymous,
             ..Default::default()
         });
+        // `oj test` runtime（非 checkout 路径）：重置后按当前槽代重钉，测试体内直连的
+        // db/守卫 op 才有本代装配可读（与任务侧驾同口径）。
+        rs.assembly = Some(assembly);
     }
     // 3) base 拼接（与 app() 路由单一事实来源一致，修正 #7）。
     let uri = format!("{}{}", t.base(), path);

@@ -714,7 +714,13 @@ deno_core::extension!(
     options = { stable: Arc<StableState> },
     state = |state, options| {
         state.put(options.stable.clone());
-        state.put(ReqState::default());
+        // 创建即钉创建代快照（v0.1.122）：oj exec / oj test 等裸 runtime 路径不经
+        // checkout_reset，db/守卫 op 仍需读到本代装配；池路径每请求 checkout_reset
+        // 重钉（reset 清 None 后按参 Some），不受此初值影响。
+        state.put(ReqState {
+            assembly: Some(options.stable.assembly_snapshot()),
+            ..Default::default()
+        });
         // deno_websocket 的 op_ws_check_permission_and_cancel_handle 要求 OpState
         // 里有 PermissionsContainer——出站 WS 与 fetch 同一信任边界。
         // 放在 bridge_ext 的 state 闭包：HTTP 池 / 任务 / `oj test` 三路径统一生效。
@@ -1953,7 +1959,12 @@ impl TaskSession {
         {
             let op_state = runtime::op_state(&self.rt);
             let mut g = op_state.borrow_mut();
-            g.borrow_mut::<ReqState>().reset(RequestInfo::default());
+            let assembly = g.borrow::<Arc<StableState>>().assembly_snapshot();
+            let rs = g.borrow_mut::<ReqState>();
+            rs.reset(RequestInfo::default());
+            // 任务侧驾（非 checkout 路径）：重置后按当前槽代重钉，钩子里的 db/守卫 op
+            // 才有本代装配可读（与 op_client_dispatch 同口径）。
+            rs.assembly = Some(assembly);
         }
         let handle = self.rt.v8_isolate().thread_safe_handle();
         self.kill.arm(handle, timeout);

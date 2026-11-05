@@ -76,6 +76,9 @@ pub struct App {
     /// 租户头配置（任务管理 API 同管线语义）。
     tenant_header: Option<String>,
     tenant_anon: Vec<String>,
+    /// 影子装配产物（v0.1.122 D3，仅复用路径 Some）：新一代 PerGenAssembly，
+    /// `do_reload` 在 commit 后经 `take_pending_assembly` 取走并换槽。
+    pending_assembly: Option<PerGenAssembly>,
 }
 
 /// dispatch 外层超时（handler 死循环 KillSwitch 兜底 server.timeout，这里再兜底测试 task）。
@@ -604,6 +607,42 @@ pub(crate) fn build_platform_grants(
     Ok((Some(platform), Some(exec)))
 }
 
+/// 热装抢注拦截（v0.1.122 D3，语义对齐 [`build_platform_grants`] 的装配期绊线）：
+/// 复用路径新代**新增**的模块名若命中特权名单 → Err 点名——「热装名为 X 的 bundle
+/// = 继承 X 特权」必须被阻断；特权模块只能由部署方放入 `platform.root` 后重启。
+/// 增量语义：旧代已有的特权名（受控根产物）豁免——否则每次 reload 都会误伤。
+/// 平台未配置（无特权名单）→ 恒放行。
+fn check_platform_squatting(stable: &StableState, asm: &PerGenAssembly) -> Result<(), String> {
+    let Some(p) = &stable.platform else {
+        return Ok(());
+    };
+    let old = stable.assembly_snapshot();
+    for ctx in asm.modules.values() {
+        if p.modules.contains(&ctx.name)
+            && !old.modules.values().any(|m| m.name == ctx.name)
+        {
+            return Err(format!(
+                "platform module '{}' must not be hot-installed \
+                 (deploy it in a platform-controlled directory under platform.root, then restart)",
+                ctx.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// release 路由构建的空锁门（v0.1.122 D3 / D7 决策）：冷启动空锁 = 忘跑
+/// `oj build`，fail-fast；热更复用路径空锁 = 合法「卸载全部模块」，放行。
+fn release_route_lock_check(
+    lock: &std::collections::BTreeMap<String, String>,
+    reused: bool,
+) -> Result<(), String> {
+    if lock.is_empty() && !reused {
+        return Err("manifests.yaml missing or empty — run `oj build` first".into());
+    }
+    Ok(())
+}
+
 /// jwt / oidc 原语配置（装配第 14 步）。auth 与 OIDC 解耦：核心只留原语，端点在 JS；
 /// 装配期构造失败即 fail-fast。
 fn build_jwt_and_oidc(cfg: &Config, config_dir: &Path) -> Result<JwtOidcCfg, String> {
@@ -1072,6 +1111,12 @@ impl Backend {
     ) -> Arc<dyn Fn() -> Bridge + Send + Sync> {
         let f = self.make_bridge_of.clone();
         Arc::new(move || f(Some(flag.clone())))
+    }
+
+    /// 换代（v0.1.122 D3）：单指针换槽，全 Bridge 下一请求起读新代；
+    /// do_reload 在 commit 返回后调用（失败路径零指针移动）。
+    pub fn swap_assembly(&self, next: PerGenAssembly) {
+        self.stable.swap_assembly(next);
     }
 }
 
@@ -1894,6 +1939,31 @@ impl App {
             ),
         };
         let stable = backend.stable().clone();
+        // 影子装配（v0.1.122 D3，仅复用路径）：重跑 build_schema_and_modules（与
+        // 冷启动**同一函数**，D「重建同源」红线），产出新一代 registry/modules +
+        // tenant 三旗标，暂存 pending **不 swap**——do_reload 在 commit 后单指针换，
+        // 失败路径（含抢注拦截）零指针移动 = 零副作用。
+        let pending_assembly = if reused {
+            let sql_guard = sql_guard_of(&cfg);
+            let (registry, modules) = build_schema_and_modules(
+                &trees,
+                sql_guard,
+                &cfg.tenant.shared_allow,
+                module_index.as_deref(),
+            )
+            .await?;
+            let asm = PerGenAssembly {
+                registry: Arc::new(registry),
+                modules,
+                sql_guard,
+                ownership_deny: ownership_deny_of(&cfg)?,
+                allow_as_tenant: cfg.tenant.allow_as_tenant,
+            };
+            check_platform_squatting(&stable, &asm)?;
+            Some(asm)
+        } else {
+            None
+        };
         // 停机 flag（spec §6）：App 持有，信号处理器置位；任务 Bridge 的 Extras 注
         // Some(flag)（HTTP actor 桥注 None——消费会话归属评审 M2）。HTTP 层创建。
         let tasks_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2019,10 +2089,13 @@ impl App {
                     )
                 })?;
                 if lock.is_empty() {
-                    return Err(format!(
-                        "release mode: {} missing or empty — run `oj build` first",
-                        mdir.join("manifests.yaml").display()
-                    ));
+                    // 空锁门（v0.1.122 D3）：冷启动拒绝、复用路径（卸载全部）放行。
+                    release_route_lock_check(&lock, reused).map_err(|e| {
+                        format!(
+                            "release mode: {}: {e}",
+                            mdir.join("manifests.yaml").display()
+                        )
+                    })?;
                 }
                 let reader = routes::bridge_default_reader(make_bridge.clone());
                 let mut entries = Vec::new();
@@ -2375,7 +2448,13 @@ impl App {
             auth_guard: auth,
             tenant_header: cfg.tenant.enable.then(|| cfg.tenant.header_key.clone()),
             tenant_anon: config::anon_paths(&cfg.tenant.anonymous_paths),
+            pending_assembly,
         })
+    }
+
+    /// 取走影子装配产物（v0.1.122 D3）：仅复用路径 Some；取后不复（take 语义）。
+    pub fn take_pending_assembly(&mut self) -> Option<PerGenAssembly> {
+        self.pending_assembly.take()
     }
 
     /// 进程内 dispatch：克隆 router + oneshot（零 TCP）。外层 timeout 防 hang（修正 #10）。
@@ -2535,3 +2614,7 @@ impl ClientTransport for App {
 #[cfg(test)]
 #[path = "app_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "app_assembly_tests.rs"]
+mod app_assembly_tests;
