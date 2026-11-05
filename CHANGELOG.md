@@ -16,7 +16,16 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
-## 下一版（未发布）
+## v0.1.123（2026-11-05，未打标签）
+
+**feat（serve/oj，reload force 旁路）**：`POST {base}/_system/config?force=1`（取值
+`1`/`true`，值不区分大小写）与特权 JS `server.reloadConfig(force)` 支持**强制热更**
+——`force=true` 跳过 unchanged 幂等闸门，零差异也照常影子装配换代（`unchanged` 恒
+false、`applied` 可为空）。busy 串行锁（并发 409）与空 body 校验（400）**不豁免**；
+force 不改变闸门基线（强制换代后无 force 调用仍按幂等判定）。不传 force 行为逐字节
+不变。设计动机：为 ojm 安装器去 `ojm_install_seq` 哨兵铺路——「同版本重装收
+unchanged」从此是幂等成功语义（活代已与盘上一致），安装器侧采纳另行交付
+（设计：`docs/superpowers/specs/2026-11-05-ojm-reload-force-design.md`）。
 
 - **fix（oj/tasks，cron fail-fast）**：cron driver 线程拉起失败由 eprintln 吞掉改为
   返回 `Err` 经装配层 `?` 上抛中止装配——绝不静默「服务照常跑但 cron 永不触发」

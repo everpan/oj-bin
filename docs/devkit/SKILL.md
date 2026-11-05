@@ -103,6 +103,7 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 
 | 症状 | 原因 |
 |---|---|
+| 想「强制重载配置」，却去改 config.yaml 凑 diff（如自增哨兵键）——改完还要担心污染用户配置 | **别凑 diff（v0.1.123）**：`POST {base}/_system/config?force=1` 或特权 JS `server.reloadConfig(true)` 直接跳过幂等闸门强制换代（零差异也装配，`applied` 可空；busy/空 body 校验不豁免）。反过来，`unchanged` 响应是「活代已与盘上一致」的**幂等成功**——调用方（如安装器）收到它应正常收尾，不是失败 |
 | 升级 v0.1.116 后响应多出 `Content-Encoding`/`Vary`/`Cache-Control` 头 / 静态资产被浏览器「永远」缓存 | v0.1.116 静态压缩与默认缓存**默认开**（CHANGELOG 行为变更）。回退：`server.static.compression: false` / `server.static.web_cache_policy: none`。未哈希资产（文件名无哈希段）恒 `no-cache` 是**特性**——要长缓存给 `mounts[].headers` 显式配；`config-production.js` 这类纯字母段名不会被误钉 immutable |
 | 前置 CDN/缓存层出现压缩体/明文体互串 | 缓存层没按 `Vary: Accept-Encoding` 分键（oj 恒带该头）。确认不了就 `server.static.compression: false` 让前置层独揽压缩；oj 之上再挂 nginx gzip 属双压冗余（nginx 见 `Content-Encoding` 会跳过，但缓存分键问题仍在） |
 | 升级后 HEAD 探针不再 405，但监控流量/副作用暴涨 | v0.1.116 起 HEAD **真实执行 GET handler**（含鉴权与副作用）——HEAD 不再是空操作。探针选轻路由、拉长间隔；按状态码族判活（受保护端点无 token → 401 是正常语义不是宕机；证书过期期 HEAD 同 403）。有副作用的「GET」应改成 POST 或自写 `head()` 顶掉镜像 |

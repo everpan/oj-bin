@@ -4678,3 +4678,37 @@ curl -X POST http://localhost:9778/v1/api/_system/config
   路径模式，失配即无害；匿名清单本身随换代即时生效。
 - cron 任务跨换代**仍触发且恰一次**（换代闸：新代任务池 hold 到旧代收场统一放闸）；
   如果观察到双发，先确认两端 oj 版本一致（旧版有跨代双发窗口）。
+
+## 场景 72：强制热更——跳过幂等闸门强制换代（v0.1.123）
+
+> 何时抄我：自动化流程（安装器、发布脚本、运维工具）需要**确保**当前代是从盘上内容
+> 装配出来的——即使 config sha 与 manifests 锁都没变（同版本重装、盘上目录被手工动过、
+> 疑似装配态损坏）。v0.1.123 前的唯一办法是改 config 凑 diff（污染用户配置、依赖哨兵
+> 键在场）；现在直接用 force 旁路。
+> 手册 §10「配置热更新（reload_api）」、§6 server。
+
+```js
+// 特权模块内（platform.modules 名单）：JS 面强制热更
+const r = await server.reloadConfig(true); // force=true：零差异也影子装配换代
+// r.unchanged 恒 false；无段 diff 时 r.applied === []（不是失败，是「强制换了代」）
+if (r.applied.length === 0) {
+  // 无 diff 的强制换代：装配态已与盘上对齐，无段生效——按需记录/告警
+}
+```
+
+```bash
+# HTTP 面（回环或 Bearer）：零改动强制换代
+curl -X POST 'http://127.0.0.1:9778/v1/api/_system/config?force=1'
+# → {"code":0,"data":{"generation":7,"applied":[],...}}
+# 之后无 force 的 POST 恢复幂等判定（force 不改变闸门基线）：
+curl -X POST 'http://127.0.0.1:9778/v1/api/_system/config'   # → msg:"unchanged"
+```
+
+**关键纪律**：
+- **`unchanged` 是幂等成功，不是失败**：闸门状态只在 commit 成功时更新，三者一致
+  ⟹ 线上装配就是从这套盘上内容来的。轮询/重试型调用方收到 `unchanged` 应正常收尾。
+- **force 不是重试键**：busy（并发 409）与空 body 校验（400）不豁免；并发触发仍会
+  撞锁，与普通 reload 同语义。
+- **force 值口径**：query 取 `1`/`true`（值不区分大小写、键名精确匹配）；`force=0`/
+  `force=yes` 等一律视同未强制——别指望 `force=yes` 生效。
+- **JS 面缺省即旧语义**：`reloadConfig()` 不带参 = 未强制，行为与 v0.1.122 逐字一致。

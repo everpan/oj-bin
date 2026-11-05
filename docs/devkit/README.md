@@ -40,6 +40,13 @@ cp bin/devkit/global.d.ts bin/devkit/oj-modules.d.ts .                       # �
 手册与 skill 随 oj 版本一起发布。升级 oj 后，用新包里的 `devkit/` 覆盖旧拷贝即可。
 源文件与反馈入口在仓库 `docs/devkit/`。
 
+v0.1.123 已落地部分：**reload force 旁路——强制热更不再需要凑 config diff**——
+`POST {base}/_system/config?force=1` 或特权 JS `server.reloadConfig(true)` 跳过 unchanged
+幂等闸门强制影子装配换代（零差异也换代，`applied` 可空；busy 409 与空 body 400 不豁免；
+force 不改变闸门基线）。`unchanged` 从此是**幂等成功**语义（活代已与盘上一致）——自动化
+调用方（如安装器）收到它应正常收尾。不传 force 行为逐字节不变。见 api-manual §10
+「配置热更新」/ §6 server、scenarios 场景 72、SKILL 陷阱速查。
+
 v0.1.122 已落地部分：**热装配——reload 覆盖 manifests 锁，release 装/卸模块免重启**——
 `server.reload_api: true` 时改 `dist/manifests.yaml` 锁（装/卸/升级）+ `POST
 {base}/_system/config` 即换代生效；`applied` 新增模块条目 `+name@ver`/`-name@ver`（升级
