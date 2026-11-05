@@ -2294,6 +2294,11 @@ impl App {
             tenant_header: cfg.tenant.enable.then(|| cfg.tenant.header_key.clone()),
             tenant_require_signed_claim: cfg.tenant.require_signed_claim,
             tenant_anon: config::anon_paths(&cfg.tenant.anonymous_paths),
+            auth_anon: cfg
+                .auth
+                .as_ref()
+                .map(|a| config::anon_paths(&a.anonymous_paths))
+                .unwrap_or_default(),
             auth: auth.clone(),
             max_upload: cfg.server.max_upload_bytes,
             blob_upload_max: cfg.server.blob_upload_max_bytes,

@@ -718,9 +718,30 @@ pub fn validate_anon_paths(cfg: &Config) -> Result<(), String> {
         }
         Ok(())
     };
+    // 保留段黑名单（v0.1.122 B10）：这些面各有独立验签通道（reload / tasks API /
+    // WS / 平台特权面），admit 的 anon 短路对它们不生效——声明即「让配置撒谎」，
+    // 装配期拒装。`auth` 段不在列：业务登录端点走 admit，匿名声明是既有合法用法。
+    const RESERVED_ANON_PREFIXES: &[&str] = &["_platform", "_system", "_lifecycle", "tasks"];
+    let check_reserved = |list: &[AnonPath]| -> Result<(), String> {
+        for p in list {
+            let first = p
+                .path()
+                .split('/')
+                .find(|s| !s.is_empty())
+                .unwrap_or_default();
+            if let Some(seg) = RESERVED_ANON_PREFIXES.iter().find(|s| **s == first) {
+                return Err(format!(
+                    "auth.anonymous_paths: anonymous path {:?} under reserved prefix /{seg} — denied",
+                    p.path()
+                ));
+            }
+        }
+        Ok(())
+    };
     check("tenant.anonymous_paths", &cfg.tenant.anonymous_paths)?;
     if let Some(a) = &cfg.auth {
         check("auth.anonymous_paths", &a.anonymous_paths)?;
+        check_reserved(&a.anonymous_paths)?;
     }
     Ok(())
 }

@@ -245,19 +245,26 @@ pub(crate) fn admit(
     let mut hdr_map: Option<HashMap<String, String>> = None;
     let user = match (st.pipeline.auth.as_ref(), path_no_base) {
         (Some(guard), Some(p)) => {
-            let header = headers
-                .get(axum::http::header::AUTHORIZATION)
-                .and_then(|v| v.to_str().ok());
             let hm: HashMap<String, String> = headers
                 .iter()
                 .filter_map(|(k, v)| Some((k.to_string(), v.to_str().ok()?.to_string())))
                 .collect();
             let headers_json = serde_json::to_string(&hm).unwrap_or_default();
             hdr_map = Some(hm);
-            match guard.verify(p, verb, header, Some(&headers_json)) {
-                Ok(Some(u)) => Some(u),
-                Ok(None) => None,
-                Err(msg) => return Err(Box::new(fail_response(401, &msg))),
+            // v0.1.122 D4：auth.anonymous_paths 命中 → 预短路（user=None，不调
+            // guard.verify；verify 无副作用，会话在登录端点签发）。hdr_map 照建
+            // ——匿名请求 handler 侧 headers 不得消失。tenant 段语义一字不动。
+            if path_matches(&st.pipeline.auth_anon, p) {
+                None
+            } else {
+                let header = headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok());
+                match guard.verify(p, verb, header, Some(&headers_json)) {
+                    Ok(Some(u)) => Some(u),
+                    Ok(None) => None,
+                    Err(msg) => return Err(Box::new(fail_response(401, &msg))),
+                }
             }
         }
         _ => None,

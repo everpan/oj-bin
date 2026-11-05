@@ -2593,3 +2593,59 @@ async fn head_mirror_integration_real_table() {
         "镜像以 GET 语义运行 handler: {hg}"
     );
 }
+
+// ===== v0.1.122 Task 6：admit() anon 预短路（D4 暗礁二） =====
+
+/// 计数守卫：verify 每调 +1，恒 Ok(Some(user))。
+struct CountingGuard(AtomicUsize);
+impl only_js::bridge::AuthGuard for CountingGuard {
+    fn verify(
+        &self,
+        _path: &str,
+        _method: &str,
+        _auth: Option<&str>,
+        _headers: Option<&str>,
+    ) -> Result<Option<Value>, String> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(Some(serde_json::json!({"id": "9", "roles": []})))
+    }
+}
+
+/// D4/B8：auth_anon 命中 → 跳过 verify（0 次）、user=None、hdr_map 照建
+/// （匿名请求 handler 侧 headers 不得消失）；名单外路径 verify 照跑。
+#[test]
+fn admit_short_circuits_auth_anon_without_verify() {
+    let mut st = dummy_app_state();
+    let g = Arc::new(CountingGuard(AtomicUsize::new(0)));
+    st.pipeline.auth = Some(g.clone());
+    st.pipeline.auth_anon = vec!["/probe/**".to_string()];
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert("x-a", "1".parse().unwrap());
+    let (user, _tid, anonymous, hm) =
+        crate::dispatch::admit(&st, &headers, "GET", Some("/probe/deep")).unwrap();
+    assert!(user.is_none(), "anon short-circuit: user must be None");
+    assert!(!anonymous, "anonymous flag is tenant-side; untouched here");
+    let hm = hm.expect("hdr_map still built for handler-side headers");
+    assert_eq!(hm.get("x-a").map(String::as_str), Some("1"));
+    assert_eq!(g.0.load(Ordering::SeqCst), 0, "verify must be skipped");
+    // 名单外：verify 照跑，user 透传。
+    let (user, _, _, _) = crate::dispatch::admit(&st, &headers, "GET", Some("/other")).unwrap();
+    assert!(user.is_some());
+    assert_eq!(g.0.load(Ordering::SeqCst), 1);
+}
+
+/// B9 前半回归：tenant_anon 命中 → 免租户头 + anonymous=true，但 verify **照跑**
+/// （tenant 豁免 ≠ 鉴权豁免，两条名单语义不同，并集是自设红线）。
+#[test]
+fn admit_tenant_anon_still_verifies() {
+    let mut st = dummy_app_state();
+    let g = Arc::new(CountingGuard(AtomicUsize::new(0)));
+    st.pipeline.auth = Some(g.clone());
+    st.pipeline.tenant_header = Some("X-T".to_string());
+    st.pipeline.tenant_anon = vec!["/jump/*".to_string()];
+    let headers = axum::http::HeaderMap::new();
+    let (_user, _tid, anonymous, _hm) =
+        crate::dispatch::admit(&st, &headers, "GET", Some("/jump/leg")).unwrap();
+    assert!(anonymous, "tenant_anon hit → anonymous");
+    assert_eq!(g.0.load(Ordering::SeqCst), 1, "verify must still run");
+}

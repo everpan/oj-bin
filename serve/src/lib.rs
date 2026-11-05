@@ -184,6 +184,10 @@ pub struct Pipeline {
     pub tenant_require_signed_claim: bool,
     /// 跳转腿豁免（tenant.anonymous_paths；命中则免租户头——OIDC 302 带不了自定义头）。
     pub tenant_anon: Vec<String>,
+    /// 免鉴权路径（auth.anonymous_paths；v0.1.122 D4）：admit() 在 guard.verify
+    /// 之前预短路（user=None、hdr_map 照建）。每代 from_config 重建 → reload 后
+    /// 免重启生效。与 tenant_anon 语义不同（那边免租户头但仍验签），禁止并集。
+    pub auth_anon: Vec<String>,
     /// Some = 鉴权启用：Bearer 守卫 + http.user（实现由 oj-auth 插件提供）。
     pub auth: Option<Arc<dyn AuthGuard>>,
     /// 上传/请求体上限（超限 413 信封）；axum body limit = 2x（超 2x 裸 413，ponytail: 接受）。
@@ -222,6 +226,7 @@ impl Default for Pipeline {
             tenant_header: None,
             tenant_require_signed_claim: false,
             tenant_anon: Vec::new(),
+            auth_anon: Vec::new(),
             auth: None,
             max_upload: 10 * 1024 * 1024,        // 10MiB
             blob_upload_max: 1024 * 1024 * 1024, // 1GiB

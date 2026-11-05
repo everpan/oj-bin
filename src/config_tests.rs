@@ -1423,3 +1423,34 @@ fn find_path_explicit_and_search() {
     let _ = find_path(None).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// v0.1.122 B10：anon 条目落保留段（`_platform`/`_system`/`_lifecycle`/`tasks`）
+/// → 装配期 Err 点名——这些面各有独立验签通道（reload / tasks API / WS / 平台
+/// 特权面），admit 短路对它们不生效，声明即「让配置撒谎」。
+/// `auth` 段**不在**黑名单（Task 6 Ruling）：业务登录端点（/auth/login 等）走
+/// admit，匿名声明是既有合法用法（sample/config.yaml 同款）——误列会让全部
+/// 存量部署启动即拒。
+#[test]
+fn anon_paths_reserved_prefix_rejected() {
+    let mk = |entries: &str| -> Config {
+        serde_yaml::from_str(&format!(
+            "auth:\n  jwt_secret: \"s\"\n  anonymous_paths:\n{entries}"
+        ))
+        .unwrap()
+    };
+    for (entry, seg) in [
+        ("    - \"/_system/**\"", "_system"),
+        ("    - \"/_platform/**\"", "_platform"),
+        ("    - \"/_lifecycle/x\"", "_lifecycle"),
+        ("    - \"/tasks/*\"", "tasks"),
+    ] {
+        let c = mk(entry);
+        let err = validate_anon_paths(&c).unwrap_err();
+        assert!(err.contains("anonymous path"), "{err}");
+        assert!(err.contains(seg), "{err}");
+        assert!(err.contains("denied"), "{err}");
+    }
+    // 对照（裁决钉）：/auth/* 不在黑名单——登录端点的既有合法匿名形态。
+    let ok = mk("    - \"/auth/login\"\n    - \"/auth/refresh\"\n");
+    assert!(validate_anon_paths(&ok).is_ok());
+}
