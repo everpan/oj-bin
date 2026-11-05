@@ -313,6 +313,7 @@ async fn serve_hot_reload_branch(
     let (mut cfg0, _, _) = load_cfg(args.config.as_deref(), true)?;
     fold_cli_mounts(&mut cfg0, args)?;
     let baseline_locks = release_locks(&cfg0, config_dir)?;
+    let baseline_modules = lock_union_names(&baseline_locks);
     let ctx = Arc::new(HotReloadCtx {
         args: args.clone(),
         top: top.clone(),
@@ -341,6 +342,7 @@ async fn serve_hot_reload_branch(
         true,
         config_path,
         None,
+        baseline_modules,
     );
     let committer = rs.committer();
     ctx.set_committer(committer);
@@ -568,7 +570,11 @@ async fn do_reload(ctx: &HotReloadCtx) -> Result<serve::reload::ReloadOutcome, (
     }
     // ④ watch swap：新 Router 送入通道，旧 App 随在途请求完成自然 drain。
     let new_inner = std::sync::Arc::new(new_app.router());
-    let generation = ctx.committer().await.commit(new_inner, sha.clone()).await;
+    let generation = ctx
+        .committer()
+        .await
+        .commit(new_inner, sha.clone(), lock_union_names(&new_locks))
+        .await;
     // —— commit 返回后无 await 间隔（v0.1.122 D3）：换代 + 清单落盘同一同步段。
     //    此前的任何 Err（cfg 归一 / 影子装配 / 抢注 / 任务交接）都已提前返回，
     //    失败路径零指针移动。残余窗口（commit 后、swap 前落在新路由的请求）
@@ -703,6 +709,20 @@ fn locks_changed(
         return true;
     }
     old.iter().any(|(k, v)| new.get(k).is_none_or(|v2| v2 != v))
+}
+
+/// 锁 map → 本代挂载模块清单（GET `_system/config` `modules` 键与 commit 参数
+/// 共用，v0.1.122 Task 5）：跨树 merged（同名后者胜，与 applied 的 merged diff
+/// 同口径），`name@ver` 按名排序。
+fn lock_union_names(
+    locks: &HashMap<PathBuf, std::collections::BTreeMap<String, String>>,
+) -> Vec<String> {
+    let merged: std::collections::BTreeMap<String, String> =
+        locks.values().flat_map(|m| m.clone()).collect();
+    merged
+        .into_iter()
+        .map(|(m, v)| format!("{m}@{v}"))
+        .collect()
 }
 
 /// 停机 mail drain 的总超时：在途投递本身已在插件侧受 `profile.timeout` 约束，
@@ -2110,6 +2130,14 @@ pub(crate) fn assemble_ojinfo(
         "host_triple": host_triple_str(),
         "v8": v8_version(),
         "exe": std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default(),
+        // 能力广播（v0.1.122）：安装器/运维据此判定热装可用性——
+        // assemble_modules=锁驱动整代重装；anon_per_reload=匿名口径每请求快照；
+        // cron_survives=reload 后 cron 不丢不双发。
+        "capabilities": [
+            "reload.assemble_modules",
+            "reload.anon_per_reload",
+            "reload.cron_survives",
+        ],
     });
     if let Some(p) = config_path
         && let Some(m) = build.as_object_mut()

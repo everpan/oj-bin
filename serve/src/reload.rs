@@ -41,6 +41,9 @@ struct ReloadMeta {
     cfg_sha256: String,
     loaded_at: String,
     config_path: PathBuf,
+    /// 本代生效的挂载模块清单（`name@ver`，按名排序）——v0.1.122 起随锁
+    /// 装配推进，GET 摘要可见。
+    modules: Vec<String>,
 }
 
 /// 热更新共享状态（外层 fallback 持有，启动期构造一次）。
@@ -69,7 +72,13 @@ pub struct Committer {
 
 impl Committer {
     /// 热更成功后提交：swap 内层 Router + 推进代际元数据。返回新代际 id。
-    pub async fn commit(&self, new_inner: Arc<Router>, sha256: String) -> u64 {
+    /// `modules` = 新一代锁并集（`name@ver`），GET 摘要随提交更新。
+    pub async fn commit(
+        &self,
+        new_inner: Arc<Router>,
+        sha256: String,
+        modules: Vec<String>,
+    ) -> u64 {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -80,6 +89,7 @@ impl Committer {
             let g = meta.generation;
             meta.cfg_sha256 = sha256;
             meta.loaded_at = now.to_string();
+            meta.modules = modules;
             g
         };
         // 旧内层 Router 随 watch 接收方丢弃（在途请求仍持有旧 Arc）自然 drain。
@@ -94,7 +104,8 @@ impl Committer {
 }
 
 impl ReloadState {
-    /// 构造（启动期调用一次）。`initial_inner` = 首代内层 Router。
+    /// 构造（启动期调用一次）。`initial_inner` = 首代内层 Router；
+    /// `modules` = 首代锁并集（`name@ver`）。
     pub fn new(
         initial_inner: Arc<Router>,
         prefixes: Vec<String>,
@@ -102,6 +113,7 @@ impl ReloadState {
         enabled: bool,
         config_path: PathBuf,
         executor: Option<ReloadExecutor>,
+        modules: Vec<String>,
     ) -> Arc<Self> {
         let (inner_tx, inner_rx) = watch::channel(initial_inner);
         let now = SystemTime::now()
@@ -120,6 +132,7 @@ impl ReloadState {
                 cfg_sha256: String::new(),
                 loaded_at: now.to_string(),
                 config_path,
+                modules,
             })),
             executor: Mutex::new(executor),
         })
@@ -290,6 +303,7 @@ async fn handle_config(
                 "sha256": meta.cfg_sha256,
                 "loaded_at": meta.loaded_at,
                 "generation": meta.generation,
+                "modules": meta.modules,
             }))
             .into_response()
         }
@@ -389,6 +403,7 @@ mod tests {
             true,
             PathBuf::from("config.yaml"),
             None,
+            vec![],
         )
     }
 
@@ -506,5 +521,52 @@ mod tests {
         let e = rs.trigger().await.unwrap_err();
         assert_eq!(e.0, 409);
         assert_eq!(c.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// v0.1.122：GET `_system/config` 摘要报 `modules`（当前生效代的挂载模块
+    /// 清单 `name@ver`）——装/卸后运维无需重启即可看到生效代；commit 推进时
+    /// 随新锁并集更新。
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_summary_includes_modules() {
+        async fn get_body(rs: &Arc<ReloadState>) -> Value {
+            let app = Router::new()
+                .fallback(any(system_fallback))
+                .with_state(rs.clone());
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri("/v1/api/_system/config")
+                .extension(ConnectInfo("127.0.0.1:1234".parse::<SocketAddr>().unwrap()))
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+        let rs = ReloadState::new(
+            Arc::new(Router::new()),
+            vec!["/v1/api".to_string()],
+            None,
+            true,
+            PathBuf::from("config.yaml"),
+            None,
+            vec!["a@1.0.0".to_string(), "b@0.2.0".to_string()],
+        );
+        let v = get_body(&rs).await;
+        assert_eq!(v["modules"], serde_json::json!(["a@1.0.0", "b@0.2.0"]));
+        // commit 推进：modules 换成新锁并集。
+        let g = rs
+            .committer()
+            .commit(
+                Arc::new(Router::new()),
+                "abc".to_string(),
+                vec!["a@1.0.1".to_string()],
+            )
+            .await;
+        assert_eq!(g, 1);
+        let v = get_body(&rs).await;
+        assert_eq!(v["modules"], serde_json::json!(["a@1.0.1"]));
     }
 }

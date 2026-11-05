@@ -176,3 +176,29 @@ fn diff_configs_frozen_sections_now_restart_pending() {
         );
     }
 }
+
+// ----- Task 5（v0.1.122）：ojInfo capabilities 广播 -----
+
+use super::{Registries, assemble_ojinfo};
+
+/// ojInfo build 段报 reload capabilities（安装器/运维据此判定热装/匿名口径/
+/// cron 存活能力可用与否）。
+#[test]
+fn ojinfo_has_capabilities() {
+    let cfg = super::Config::default();
+    let info = assemble_ojinfo(
+        &cfg,
+        &serde_json::json!({}),
+        &[],
+        &Registries::default(),
+        None,
+    );
+    assert_eq!(
+        info.build["capabilities"],
+        serde_json::json!([
+            "reload.assemble_modules",
+            "reload.anon_per_reload",
+            "reload.cron_survives",
+        ])
+    );
+}
