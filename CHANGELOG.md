@@ -16,6 +16,15 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## 下一版（未发布）
+
+- **fix（oj/tasks，cron fail-fast）**：cron driver 线程拉起失败由 eprintln 吞掉改为
+  返回 `Err` 经装配层 `?` 上抛中止装配——绝不静默「服务照常跑但 cron 永不触发」
+  （v0.1.122 终审 deferred minor ①）。
+- **test（bridge，B12 并发换代回归）**：写侧连续 2000 代换代、读侧并发取快照——
+  锁定快照代际原子（registry/modules/旗标同代，torn 快照即红，经两步写突变验证
+  用例牙齿）+ 旧代 pinned 快照换代后原样可读（终审 deferred minor ②）。
+
 ## v0.1.122
 
 **feat（serve/oj，热装配）**：`_system/config/reload` 覆盖 manifests 锁——release 部署

@@ -367,7 +367,8 @@ pub fn assemble_tasking(
         );
         pool.spawn();
         if cron_count > 0 {
-            spawn_cron_driver(pool.clone(), flag.clone(), resume.clone());
+            // fail-fast（终审 deferred minor ①）：拉起失败中止装配，绝不静默无 cron。
+            spawn_cron_driver(pool.clone(), flag.clone(), resume.clone())?;
         }
         Some(pool)
     } else {
@@ -400,7 +401,7 @@ fn spawn_cron_driver(
     pool: Arc<only_js::bridge::task_pool::TaskPool>,
     flag: Arc<AtomicBool>,
     resume: Arc<AtomicBool>,
-) {
+) -> Result<(), String> {
     use only_js::bridge::task_pool::{OnceJob, TaskKind};
     let spawned = std::thread::Builder::new()
         .name("cron-driver".into())
@@ -471,9 +472,9 @@ fn spawn_cron_driver(
                 }
             });
         });
-    if let Err(e) = spawned {
-        eprintln!("task: spawn cron-driver failed: {e}");
-    }
+    spawned
+        .map(|_| ())
+        .map_err(|e| format!("spawn cron-driver: {e}"))
 }
 
 /// 到点复核（cron 驱动竞态防护的纯函数臂）：按最新 entry 计算 new_next。
@@ -1245,6 +1246,68 @@ mod tests {
             assert_eq!(n, 0, "aborted generation must not fire cron");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// BDD（终审 deferred minor ①）：cron driver 线程拉起失败必须 fail-fast——
+    /// 返回 Err 由装配层 `?` 上抛中止装配，不得 eprintln 吞掉后静默无 cron。
+    /// Err 腿需进程内线程资源耗尽方可触发，测试内无法可靠复现——本用例锁
+    /// Result 契约与 Ok 腿（若签名退回 `()` 本用例编译红）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn cron_driver_spawn_error_is_propagated_not_swallowed() {
+        let d = tmpdir("cron-spawn-result");
+        std::fs::create_dir_all(d.join("tasks/task")).unwrap();
+        std::fs::create_dir_all(d.join("tasks/jobs")).unwrap();
+        std::fs::write(
+            d.join("tasks/task/crontab.yaml"),
+            "0 3 * * * ./jobs/tick.ts\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("tasks/jobs/tick.ts"),
+            "await kv.set(\"x\", \"1\");\n",
+        )
+        .unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        let kv = Arc::new(only_js::bridge::InMemoryKV::new());
+        let make_bridge = {
+            let kv = kv.clone();
+            let flag = flag.clone();
+            let root = d.clone();
+            Arc::new(move || {
+                only_js::bridge::Bridge::with_dbs_and_loader(
+                    HashMap::new(),
+                    kv.clone(),
+                    SchemaRegistry::new(),
+                    false,
+                    Some(Arc::new(only_js::bridge::LoaderShared {
+                        project_root: root.clone(),
+                        ts: true,
+                    })),
+                    only_js::bridge::Extras {
+                        tasks_flag: Some(flag.clone()),
+                        ..Default::default()
+                    },
+                )
+            }) as Arc<dyn Fn() -> Bridge + Send + Sync>
+        };
+        let resume = Arc::new(AtomicBool::new(true));
+        let tasking = assemble_tasking(
+            &cfg("tasks", 64),
+            &d,
+            make_bridge,
+            flag.clone(),
+            resume.clone(),
+        )
+        .unwrap();
+        let pool = tasking
+            .pool
+            .clone()
+            .expect("cron entry must assemble a pool");
+        let r = spawn_cron_driver(pool.clone(), flag.clone(), resume.clone());
+        assert!(r.is_ok(), "spawn must surface errors, not swallow them");
+        flag.store(true, Ordering::Relaxed);
+        pool.shutdown_and_join();
         let _ = std::fs::remove_dir_all(&d);
     }
 }

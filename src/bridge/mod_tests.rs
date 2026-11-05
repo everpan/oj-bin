@@ -2881,3 +2881,91 @@ fn swap_assembly_visible_in_snapshot() {
     assert_eq!(snap.sql_guard, SqlGuard::Deny);
     assert!(snap.ownership_deny && snap.allow_as_tenant);
 }
+
+/// B12 并发换代回归（v0.1.122 终审 deferred minor ②）：写侧连续换代、读侧并发取
+/// 快照——每个快照必须代际原子（registry 白名单 / modules 表 / tenant 旗标永远
+/// 同代，无 torn 混代），且请求期 pin 住的旧代快照在后续换代后原样可读。
+#[test]
+fn concurrent_swap_snapshots_are_generation_atomic_and_old_gen_stays_readable() {
+    const GENS: u64 = 2000;
+    let mk = |i: u64| PerGenAssembly {
+        registry: Arc::new(SchemaRegistry::new().table(&format!("t{i}"), &["id"], &["id"])),
+        modules: {
+            let mut m = std::collections::HashMap::new();
+            m.insert(
+                format!("gen{i}"),
+                ModuleCtx {
+                    name: format!("m{i}"),
+                    version: "1".into(),
+                    deps: Arc::new(std::collections::HashSet::new()),
+                    db: None,
+                },
+            );
+            Arc::new(m)
+        },
+        // 旗标随代翻转，提供 registry 之外的第二个配对断言维度。
+        sql_guard: if i.is_multiple_of(2) {
+            SqlGuard::Off
+        } else {
+            SqlGuard::Deny
+        },
+        ownership_deny: false,
+        allow_as_tenant: false,
+    };
+    let db = Arc::new(InMemoryAccessor::new());
+    let b = Bridge::with_opts(
+        db,
+        Arc::new(InMemoryKV::new()),
+        SchemaRegistry::new(),
+        false,
+    );
+    let stable = b.stable_for_test();
+    stable.swap_assembly(mk(0));
+    // 请求期 pin：换代后旧代快照必须原样可读（Arc 语义，写侧不可及）。
+    let pinned = stable.assembly_snapshot();
+
+    let writer_stable = stable.clone();
+    let writer = std::thread::spawn(move || {
+        for i in 1..=GENS {
+            writer_stable.swap_assembly(mk(i));
+        }
+    });
+    // 读侧：快照里 modules 落在 gen{j} ⇒ registry 必须有 t{j} 且旗标同 j 奇偶。
+    // 两步写（先换 registry 再换 modules）会造出 modules gen{j-1} + registry t{j}
+    // 的 torn 快照，t{j-1} 不存在 → 本断言即红。
+    let mut reads = 0u64;
+    while !writer.is_finished() {
+        let s = stable.assembly_snapshot();
+        let j: u64 = s
+            .modules
+            .keys()
+            .next()
+            .unwrap()
+            .trim_start_matches("gen")
+            .parse()
+            .unwrap();
+        assert!(
+            s.registry.has_table(&format!("t{j}")),
+            "torn snapshot at gen{j}"
+        );
+        assert_eq!(
+            s.sql_guard == SqlGuard::Deny,
+            j % 2 == 1,
+            "flag/module mismatch at gen{j}"
+        );
+        reads += 1;
+    }
+    writer.join().unwrap();
+
+    let last = stable.assembly_snapshot();
+    assert_eq!(
+        last.modules.keys().next().unwrap(),
+        &format!("gen{GENS}"),
+        "final generation must be visible"
+    );
+    assert!(pinned.registry.has_table("t0"));
+    assert!(pinned.modules.contains_key("gen0"));
+    assert!(!pinned.registry.has_table(&format!("t{GENS}")));
+    assert!(!pinned.modules.contains_key(&format!("gen{GENS}")));
+    assert!(reads > 0);
+}
