@@ -90,17 +90,29 @@ impl TaskSupervisor {
         root: &Path,
         make_bridge: Arc<dyn Fn() -> only_js::bridge::Bridge + Send + Sync>,
         flag: Arc<AtomicBool>,
+        resume: Arc<AtomicBool>,
     ) -> Result<Self, String> {
         let tasks = scan_tasks(&root.join(&cfg.dir), cfg.max)?;
-        Self::spawn_selected(cfg, tasks, make_bridge, flag, Duration::from_secs(1))
+        Self::spawn_selected(
+            cfg,
+            tasks,
+            make_bridge,
+            flag,
+            resume,
+            Duration::from_secs(1),
+        )
     }
 
     /// 拉起指定子集（PRD v2 双模式：池化任务剔除后，存量 TLA 任务走此入口）。
+    /// `resume` = 换代闸（v0.1.122）：闭门时任务线程 hold 在门口不开工（reload
+    /// 交接：新代任务等旧代收场后统一放闸，防双发）；等闸期间停机 flag 置位
+    /// → 不开工直接收场。
     pub fn spawn_selected(
         cfg: &TasksCfg,
         tasks: Vec<(String, PathBuf)>,
         make_bridge: Arc<dyn Fn() -> only_js::bridge::Bridge + Send + Sync>,
         flag: Arc<AtomicBool>,
+        resume: Arc<AtomicBool>,
         backoff_base: Duration,
     ) -> Result<Self, String> {
         let grace = Duration::from_secs(cfg.stop_grace_secs);
@@ -115,8 +127,15 @@ impl TaskSupervisor {
                 .spawn({
                     let name = name.clone();
                     let flag = flag.clone();
+                    let resume = resume.clone();
                     let make_bridge = make_bridge.clone();
-                    move || task_loop(&name, &path, make_bridge, flag, grace, backoff_base)
+                    move || {
+                        if !hold_for_gate(&resume, &flag) {
+                            eprintln!("task: {name} → stopped (held at gate)");
+                            return;
+                        }
+                        task_loop(&name, &path, make_bridge, flag, grace, backoff_base)
+                    }
                 })
                 .map_err(|e| format!("spawn task {name}: {e}"))?;
             handles.push(TaskHandle { name, join: j });
@@ -130,10 +149,11 @@ impl TaskSupervisor {
         root: &Path,
         make_bridge: Arc<dyn Fn() -> only_js::bridge::Bridge + Send + Sync>,
         flag: Arc<AtomicBool>,
+        resume: Arc<AtomicBool>,
         backoff_base: Duration,
     ) -> Result<Self, String> {
         let tasks = scan_tasks(&root.join(&cfg.dir), cfg.max)?;
-        Self::spawn_selected(cfg, tasks, make_bridge, flag, backoff_base)
+        Self::spawn_selected(cfg, tasks, make_bridge, flag, resume, backoff_base)
     }
 
     /// 停机收场：等每个任务线程退出（调用方须先置位停机 flag）。
@@ -211,11 +231,14 @@ pub struct Tasking {
 /// crontab.yaml 注册 → TaskPool 起 Worker → TLA 监督器拉起 → cron 调度器上树。
 /// 探测在独立线程跑（Bridge !Send，own current_thread runtime）；探测失败的文件
 /// 归入 TLA 桶（存量监督器会照常报错 + 退避重启，行为与旧版一致）。
+/// `resume` = 换代闸（v0.1.122）：闭门时 Worker / cron driver / TLA 任务全部
+/// hold 在门口——reload 交接方在旧代收场后放闸（启动路径传已开闸）。
 pub fn assemble_tasking(
     cfg: &TasksCfg,
     root: &Path,
     make_bridge: Arc<dyn Fn() -> only_js::bridge::Bridge + Send + Sync>,
     flag: Arc<AtomicBool>,
+    resume: Arc<AtomicBool>,
 ) -> Result<Tasking, String> {
     use only_js::bridge::task_pool::{
         TaskEntry, TaskEventLog, TaskPool, TaskRegistry, parse_crontab_line,
@@ -318,10 +341,11 @@ pub fn assemble_tasking(
             Duration::from_millis(cfg.pool.interval_ms),
             make_bridge.clone(),
             registry,
+            resume.clone(),
         );
         pool.spawn();
         if cron_count > 0 {
-            spawn_cron_driver(pool.clone(), flag.clone());
+            spawn_cron_driver(pool.clone(), flag.clone(), resume.clone());
         }
         Some(pool)
     } else {
@@ -337,70 +361,97 @@ pub fn assemble_tasking(
             tla,
             make_bridge,
             flag,
+            resume,
             Duration::from_secs(1),
         )?)
     };
     Ok(Tasking { sup, pool })
 }
 
-/// cron 调度器（PRD v2 §6.4）：tokio 任务，睡到最近 next_run → 先推后 next_run
-/// （防重复触发，单机权威）→ 投一次性作业。停机 flag 置位即退。
-fn spawn_cron_driver(pool: Arc<only_js::bridge::task_pool::TaskPool>, flag: Arc<AtomicBool>) {
+/// cron 调度器（PRD v2 §6.4）：独立 OS 线程 + 自持 current_thread runtime
+/// （v0.1.122 宿主迁移——此前 tokio::spawn 挂在调用方运行时上，reload 交接在
+/// spawn_blocking 里装配会 panic、宿主运行时换代也不随进程存活），睡到最近
+/// next_run → 先推后 next_run（防重复触发，单机权威）→ 投一次性作业。
+/// 停机 flag 置位即退；`resume` 闸闭门时阻塞在循环顶（旧代交接收场前不投递，
+/// US-3 ② 防双发），闸门与停机都能唤醒。
+fn spawn_cron_driver(
+    pool: Arc<only_js::bridge::task_pool::TaskPool>,
+    flag: Arc<AtomicBool>,
+    resume: Arc<AtomicBool>,
+) {
     use only_js::bridge::task_pool::{OnceJob, TaskKind};
-    tokio::spawn(async move {
-        loop {
-            if flag.load(Ordering::Relaxed) {
-                return;
-            }
-            let now = std::time::SystemTime::now();
-            let next = pool
-                .registry
-                .list()
-                .into_iter()
-                .filter_map(|e| match (&e.kind, e.enabled) {
-                    (
-                        TaskKind::Cron {
-                            next_run: Some(t), ..
-                        },
-                        true,
-                    ) => Some((*t, e)),
-                    _ => None,
-                })
-                .min_by_key(|(t, _)| *t);
-            let Some((fire_at, entry)) = next else {
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => continue,
-                    _ = wait_flag(&flag) => return,
+    let spawned = std::thread::Builder::new()
+        .name("cron-driver".into())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("cron driver rt");
+            rt.block_on(async move {
+                loop {
+                    if flag.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    if !resume.load(Ordering::Relaxed) {
+                        wait_gate(&resume, &flag).await;
+                        if flag.load(Ordering::Relaxed) {
+                            return;
+                        }
+                    }
+                    let now = std::time::SystemTime::now();
+                    let next = pool
+                        .registry
+                        .list()
+                        .into_iter()
+                        .filter_map(|e| match (&e.kind, e.enabled) {
+                            (
+                                TaskKind::Cron {
+                                    next_run: Some(t), ..
+                                },
+                                true,
+                            ) => Some((*t, e)),
+                            _ => None,
+                        })
+                        .min_by_key(|(t, _)| *t);
+                    let Some((fire_at, entry)) = next else {
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(1)) => continue,
+                            _ = wait_flag(&flag) => return,
+                        }
+                    };
+                    let wait = fire_at.duration_since(now).unwrap_or(Duration::ZERO);
+                    tokio::select! {
+                        _ = tokio::time::sleep(wait) => {}
+                        _ = wait_flag(&flag) => return,
+                    }
+                    // 到点：先重读注册表最新 entry（入睡期间 PATCH 改表达式/停用/删除的竞态
+                    // 防护——旧快照会把过期表达式写回覆盖新调度），按新值算下一次触发时间写回，
+                    // 再投作业（顺序 = 防重契约）。
+                    let Some(fresh) = pool.registry.get(&entry.name) else {
+                        continue; // 已删除：不写回不投递。
+                    };
+                    let Some(new_next) =
+                        cron_resolved_next(Some(&fresh), std::time::SystemTime::now())
+                    else {
+                        continue; // 已停用（或非 cron）：不写回——停用条目不会被再次选中，
+                        // 重新启用后 next_run 已过期会立即补触发一次。
+                    };
+                    pool.registry.set_next_run(&entry.name, new_next);
+                    pool.submit_once(OnceJob {
+                        name: fresh.name.clone(),
+                        path: fresh.path.clone(),
+                    });
+                    pool.registry.log.record(
+                        "tasks.commands",
+                        "cron.triggered",
+                        serde_json::json!({ "task": fresh.name }),
+                    );
                 }
-            };
-            let wait = fire_at.duration_since(now).unwrap_or(Duration::ZERO);
-            tokio::select! {
-                _ = tokio::time::sleep(wait) => {}
-                _ = wait_flag(&flag) => return,
-            }
-            // 到点：先重读注册表最新 entry（入睡期间 PATCH 改表达式/停用/删除的竞态
-            // 防护——旧快照会把过期表达式写回覆盖新调度），按新值算下一次触发时间写回，
-            // 再投作业（顺序 = 防重契约）。
-            let Some(fresh) = pool.registry.get(&entry.name) else {
-                continue; // 已删除：不写回不投递。
-            };
-            let Some(new_next) = cron_resolved_next(Some(&fresh), std::time::SystemTime::now())
-            else {
-                continue; // 已停用（或非 cron）：不写回——停用条目不会被再次选中，
-                // 重新启用后 next_run 已过期会立即补触发一次。
-            };
-            pool.registry.set_next_run(&entry.name, new_next);
-            pool.submit_once(OnceJob {
-                name: fresh.name.clone(),
-                path: fresh.path.clone(),
             });
-            pool.registry.log.record(
-                "tasks.commands",
-                "cron.triggered",
-                serde_json::json!({ "task": fresh.name }),
-            );
-        }
-    });
+        });
+    if let Err(e) = spawned {
+        eprintln!("task: spawn cron-driver failed: {e}");
+    }
 }
 
 /// 到点复核（cron 驱动竞态防护的纯函数臂）：按最新 entry 计算 new_next。
@@ -426,6 +477,25 @@ async fn wait_flag(flag: &AtomicBool) {
     }
 }
 
+/// 换代闸等待（cron driver 异步臂）：放闸或停机任一即醒。
+async fn wait_gate(resume: &AtomicBool, flag: &AtomicBool) {
+    while !resume.load(Ordering::Relaxed) && !flag.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// 换代闸等待（TLA 任务线程同步臂）：true = 放闸开工；false = 停机中途置位
+/// （不开工直接收场）。
+fn hold_for_gate(resume: &AtomicBool, flag: &AtomicBool) -> bool {
+    while !resume.load(Ordering::Relaxed) {
+        if flag.load(Ordering::Relaxed) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,6 +517,11 @@ mod tests {
             stop_grace_secs: 30,
             ..Default::default()
         }
+    }
+
+    /// 开闸（启动路径形态：立即可跑）。
+    fn open_gate() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(true))
     }
 
     /// BDD：scan 只认 task_*/ *_task 约定文件，其余（含子目录共享库）忽略；递归入池。
@@ -608,6 +683,7 @@ mod tests {
             &d,
             make_bridge,
             flag.clone(),
+            open_gate(),
             Duration::from_millis(80),
         )
         .unwrap();
@@ -643,6 +719,7 @@ mod tests {
             &d,
             make_bridge,
             flag.clone(),
+            open_gate(),
             Duration::from_millis(80),
         )
         .unwrap();
@@ -718,7 +795,14 @@ mod tests {
                 )
             }) as Arc<dyn Fn() -> Bridge + Send + Sync>
         };
-        let tasking = assemble_tasking(&cfg("tasks", 64), &d, make_bridge, flag.clone()).unwrap();
+        let tasking = assemble_tasking(
+            &cfg("tasks", 64),
+            &d,
+            make_bridge,
+            flag.clone(),
+            open_gate(),
+        )
+        .unwrap();
         let pool = tasking.pool.expect("loop task must assemble a pool");
         assert!(
             tasking.sup.is_some(),
@@ -816,7 +900,14 @@ mod tests {
                 )
             }) as Arc<dyn Fn() -> Bridge + Send + Sync>
         };
-        let tasking = assemble_tasking(&cfg("tasks", 64), &d, make_bridge, flag.clone()).unwrap();
+        let tasking = assemble_tasking(
+            &cfg("tasks", 64),
+            &d,
+            make_bridge,
+            flag.clone(),
+            open_gate(),
+        )
+        .unwrap();
         let pool = tasking.pool.expect("pooled tasks must assemble a pool");
         // 轮询：两个任务的 kv 计数都 ≥3（10s 宽限，远超 100ms 轮间节奏）。
         for name in ["alpha", "beta"] {
@@ -872,7 +963,8 @@ mod tests {
         std::fs::write(d.join("tasks/jobs/xx.ts"), "export {};\n").unwrap();
         let flag = Arc::new(AtomicBool::new(false));
         let make_bridge = test_bridge_factory(&d, flag.clone());
-        let tasking = assemble_tasking(&cfg("tasks", 64), &d, make_bridge, flag).unwrap();
+        let tasking =
+            assemble_tasking(&cfg("tasks", 64), &d, make_bridge, flag, open_gate()).unwrap();
         let pool = tasking.pool.expect("cron entry must assemble a pool");
         let e = pool.registry.get("xx").expect("cron entry registered");
         assert!(matches!(
@@ -888,7 +980,7 @@ mod tests {
         std::fs::write(d2.join("tasks/task/crontab.yaml"), "# ok\n*/5 * * * *\n").unwrap();
         let flag2 = Arc::new(AtomicBool::new(false));
         let make_bridge2 = test_bridge_factory(&d2, flag2.clone());
-        let e = assemble_tasking(&cfg("tasks", 64), &d2, make_bridge2, flag2)
+        let e = assemble_tasking(&cfg("tasks", 64), &d2, make_bridge2, flag2, open_gate())
             .err()
             .unwrap();
         assert!(e.contains(":2:"), "{e}");
@@ -911,7 +1003,7 @@ mod tests {
         .unwrap();
         let flag3 = Arc::new(AtomicBool::new(false));
         let make_bridge3 = test_bridge_factory(&d3, flag3.clone());
-        let e = assemble_tasking(&cfg("tasks", 64), &d3, make_bridge3, flag3)
+        let e = assemble_tasking(&cfg("tasks", 64), &d3, make_bridge3, flag3, open_gate())
             .err()
             .unwrap();
         assert!(e.contains("duplicates a pool task"), "{e}");
@@ -928,11 +1020,120 @@ mod tests {
         std::fs::write(pool.join("task_broken.ts"), "this is not ?? valid ts").unwrap();
         let flag = Arc::new(AtomicBool::new(false));
         let make_bridge = test_bridge_factory(&d, flag.clone());
-        let tasking = assemble_tasking(&cfg("tasks", 64), &d, make_bridge, flag.clone()).unwrap();
+        let tasking = assemble_tasking(
+            &cfg("tasks", 64),
+            &d,
+            make_bridge,
+            flag.clone(),
+            open_gate(),
+        )
+        .unwrap();
         assert!(tasking.pool.is_none(), "探测失败不得进池");
         let sup = tasking.sup.expect("探测失败须归 TLA 桶（warn 打点）");
         flag.store(true, Ordering::Relaxed);
         sup.shutdown();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// BDD（v0.1.122 US-3 / B11）：闭门（resume=false）时 cron driver 阻塞——
+    /// next_run 到点也不投递（换代交接收场前不双发）；放闸后恰一次触发
+    /// （kv 计数 =1，后续观察窗不增长——next_run 已被推到明日 3 点）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn cron_gate_holds_then_fires_once() {
+        use only_js::bridge::KVStore;
+        let d = tmpdir("cron-gate");
+        std::fs::create_dir_all(d.join("tasks/task")).unwrap();
+        std::fs::create_dir_all(d.join("tasks/jobs")).unwrap();
+        // 日内 3 点：到点由测试显式 set_next_run 驱动，无分钟边界的二触发风险。
+        std::fs::write(
+            d.join("tasks/task/crontab.yaml"),
+            "0 3 * * * ./jobs/tick.ts\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("tasks/jobs/tick.ts"),
+            "const n = Number((await kv.get(\"cron:n\")) ?? \"0\");\n\
+             await kv.set(\"cron:n\", String(n + 1));\n",
+        )
+        .unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        let kv = Arc::new(only_js::bridge::InMemoryKV::new());
+        let make_bridge = {
+            let kv = kv.clone();
+            let flag = flag.clone();
+            let root = d.clone();
+            Arc::new(move || {
+                only_js::bridge::Bridge::with_dbs_and_loader(
+                    HashMap::new(),
+                    kv.clone(),
+                    SchemaRegistry::new(),
+                    false,
+                    Some(Arc::new(only_js::bridge::LoaderShared {
+                        project_root: root.clone(),
+                        ts: true,
+                    })),
+                    only_js::bridge::Extras {
+                        tasks_flag: Some(flag.clone()),
+                        ..Default::default()
+                    },
+                )
+            }) as Arc<dyn Fn() -> Bridge + Send + Sync>
+        };
+        // 闭门装配（reload 路径形态）。
+        let resume = Arc::new(AtomicBool::new(false));
+        let tasking = assemble_tasking(
+            &cfg("tasks", 64),
+            &d,
+            make_bridge,
+            flag.clone(),
+            resume.clone(),
+        )
+        .unwrap();
+        let pool = tasking.pool.expect("cron entry must assemble a pool");
+        assert_eq!(
+            pool.resume_handle().as_ptr(),
+            resume.as_ptr(),
+            "pool must carry the caller's gate"
+        );
+        let count = || async {
+            kv.get("cron:n")
+                .await
+                .unwrap()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+        // 注入近未来触发点。
+        assert!(pool.registry.set_next_run(
+            "tick",
+            Some(std::time::SystemTime::now() + Duration::from_millis(300))
+        ));
+        // 闭门：3s 观察窗内不得触发。
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            assert_eq!(count().await, 0, "closed gate must hold cron fire");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // 放闸：恰一次触发。
+        resume.store(true, Ordering::Relaxed);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if count().await >= 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "gate opened but cron did not fire"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // 恰一次：后续 1.5s 观察窗计数不增长（next_run 已推到明日）。
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        while Instant::now() < deadline {
+            assert_eq!(count().await, 1, "cron fired more than once");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        flag.store(true, Ordering::Relaxed);
+        pool.shutdown_and_join();
         let _ = std::fs::remove_dir_all(&d);
     }
 }

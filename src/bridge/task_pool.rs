@@ -573,6 +573,9 @@ pub struct TaskPool {
     jobs_tx: std::sync::mpsc::Sender<OnceJob>,
     jobs_rx: Mutex<std::sync::mpsc::Receiver<OnceJob>>,
     shutdown: Arc<AtomicBool>,
+    /// 换代闸（v0.1.122）：false = Worker 不开工（reload 交接期防双发）；闸不自设，
+    /// 由调用方定——启动路径传 true、reload 路径传 false（旧池收场后置 true）。
+    resume: Arc<AtomicBool>,
     handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
     /// 存活 Worker 数（panic 补员自愈的观测量）。
     live: AtomicUsize,
@@ -585,6 +588,7 @@ impl TaskPool {
         interval: Duration,
         make: Arc<dyn Fn() -> Bridge + Send + Sync>,
         registry: Arc<TaskRegistry>,
+        resume: Arc<AtomicBool>,
     ) -> Arc<Self> {
         let (jobs_tx, jobs_rx) = std::sync::mpsc::channel();
         Arc::new(Self {
@@ -597,9 +601,15 @@ impl TaskPool {
             jobs_tx,
             jobs_rx: Mutex::new(jobs_rx),
             shutdown: Arc::new(AtomicBool::new(false)),
+            resume,
             handles: Mutex::new(Vec::new()),
             live: AtomicUsize::new(0),
         })
+    }
+
+    /// 换代闸句柄（reload 交接方在旧池收场后置 true 放行 Worker / cron driver）。
+    pub fn resume_handle(&self) -> Arc<AtomicBool> {
+        self.resume.clone()
     }
 
     pub fn spawn(self: &Arc<Self>) {
@@ -662,6 +672,18 @@ impl TaskPool {
         let h = std::thread::Builder::new()
             .name(format!("task-worker-{worker_id}"))
             .spawn(move || {
+                // 换代闸（v0.1.122）：闭门不开工（不接 loop/once 作业）——旧池
+                // 交接收场后由调用方统一放闸；等闸期间停机置位 → 不开工直接收场。
+                loop {
+                    if pool.resume.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if pool.shutdown.load(Ordering::SeqCst) {
+                        pool.live.fetch_sub(1, Ordering::SeqCst);
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let rt = tokio::runtime::Builder::new_current_thread()
                         .enable_all()

@@ -201,11 +201,13 @@ async fn run_inner(a: ServeArgs) -> Result<(), String> {
     // 有 loop_body = 池化模式（TaskPool，多任务共享有限 Worker）；无 = 存量 TLA
     // 监督模式（一任务一线程 + 退避重启，tasks.rs 原样）。两模式零迁移共存。
     let task_flag = app.tasks_flag();
+    // 启动路径：换代闸直接开（无交接对手，立即可跑）。
     let task_pool = crate::tasks::assemble_tasking(
         &tasks_cfg,
         &dir,
         app.make_task_bridge(),
         task_flag.clone(),
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
     )?;
     // 任务管理 API（PRD v2 §6.6）：有池（池化长任务/cron）才挂 `{base}/tasks`。
     if let Some(pool) = task_pool.pool.clone() {
@@ -531,6 +533,8 @@ async fn do_reload(ctx: &HotReloadCtx) -> Result<serve::reload::ReloadOutcome, (
     .await
     .map_err(|e| (400u16, e))?;
     // ③ 任务池交接（顺序：先建新池 fail-fast，再停旧池——回滚完整：新池失败则旧池仍跑）。
+    // 换代闸（v0.1.122 US-3 ②）：新池闭门装配——cron driver / Worker / TLA 任务
+    // hold 在门口，旧代收场后统一放闸，消灭「新旧两池同时在跑」的双发窗口。
     let new_flag = new_app.tasks_flag();
     let new_tasking = {
         // 旧池用「上一代」flag 停机：取出 current_task_flag 当前指向的旧 flag，
@@ -538,29 +542,42 @@ async fn do_reload(ctx: &HotReloadCtx) -> Result<serve::reload::ReloadOutcome, (
         // 当前在跑的新池（spec §6 ⑤）。
         let old_flag = ctx.current_task_flag.lock().await.clone();
         let mut old = ctx.tasking.lock().await;
+        let resume = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let t = crate::tasks::assemble_tasking(
             &tasks_cfg,
             &ctx.dir,
             new_app.make_task_bridge(),
             new_flag.clone(),
+            resume.clone(),
         )
         .map_err(|e| (500u16, e))?;
-        // 旧池停机（flag 置位 → 驱动退出；spawn_blocking 同步 join）。
+        // 旧池停机（flag 置位 → 驱动退出；spawn_blocking 同步 join，10s 有界——
+        // 超时 500 拒绝本次 reload，避免无限挂死在拒不退出的旧任务上）。
         old_flag.store(true, std::sync::atomic::Ordering::SeqCst);
         let old_pool = old.pool.clone();
         // `TaskSupervisor` 无 `Default` 故不能用 `Option::take()`，这里显式 replace。
         #[allow(clippy::mem_replace_option_with_none)]
         let old_sup = std::mem::replace(&mut old.sup, None);
         drop(old);
-        if let Some(p) = old_pool {
-            let p2 = p.clone();
-            tokio::task::spawn_blocking(move || p2.shutdown_and_join())
-                .await
-                .map_err(|e| (500u16, format!("join old task pool: {e}")))?;
-        }
-        if let Some(s) = old_sup {
-            s.shutdown();
-        }
+        let stop_old = tokio::task::spawn_blocking(move || {
+            if let Some(p) = old_pool {
+                p.shutdown_and_join();
+            }
+            if let Some(s) = old_sup {
+                s.shutdown();
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), stop_old)
+            .await
+            .map_err(|_| {
+                (
+                    500u16,
+                    "old task pool did not stop within 10s — reload aborted".to_string(),
+                )
+            })?
+            .map_err(|e| (500u16, format!("join old task pool: {e}")))?;
+        // 旧代收场 → 放闸：新代 cron / Worker / TLA 任务开工（恰在此刻，无双发窗口）。
+        resume.store(true, std::sync::atomic::Ordering::SeqCst);
         t
     };
     // 任务管理 API 随新代重建（有池才挂）。

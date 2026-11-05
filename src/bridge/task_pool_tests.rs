@@ -141,6 +141,7 @@ fn given_worker_panic_when_respawn_then_live_recovered() {
         Duration::from_millis(5),
         make,
         TaskRegistry::new(TaskEventLog::memory_only()),
+        Arc::new(AtomicBool::new(true)),
     );
     pool.spawn();
     // 第 2 次 make = 补员 Worker 已就位（首调 panic → fetch_sub → 原参重起）。
@@ -169,6 +170,7 @@ async fn given_stopping_when_run_once_then_rejected_without_status_change() {
         Duration::from_millis(5),
         test_bridge(&d),
         TaskRegistry::new(TaskEventLog::memory_only()),
+        Arc::new(AtomicBool::new(true)),
     );
     pool.registry.upsert(TaskEntry::cron(
         "nightly",
