@@ -309,6 +309,10 @@ async fn serve_hot_reload_branch(
     let baseline_doc: serde_yaml::Value =
         serde_yaml::from_slice(&baseline_raw).map_err(|e| format!("reload baseline parse: {e}"))?;
     let baseline_sha = doc_sha(&baseline_doc).map_err(|e| format!("reload baseline sha: {e}"))?;
+    // 首代 manifests 锁快照（v0.1.122 D1）：与 do_reload 同源的 cfg 归一后解锁。
+    let (mut cfg0, _, _) = load_cfg(args.config.as_deref(), true)?;
+    fold_cli_mounts(&mut cfg0, args)?;
+    let baseline_locks = release_locks(&cfg0, config_dir)?;
     let ctx = Arc::new(HotReloadCtx {
         args: args.clone(),
         top: top.clone(),
@@ -319,6 +323,7 @@ async fn serve_hot_reload_branch(
         backend: app.backend(),
         current_doc: tokio::sync::Mutex::new(baseline_doc),
         current_sha: tokio::sync::Mutex::new(baseline_sha),
+        current_locks: tokio::sync::Mutex::new(baseline_locks),
         config_path: config_path.clone(),
         module_index: module_index.clone(),
         tasking: tokio::sync::Mutex::new(initial_tasking),
@@ -403,6 +408,9 @@ struct HotReloadCtx {
     /// 当前代归一 raw 文档（段 diff 基线）+ 其 sha256（幂等判定）。
     current_doc: tokio::sync::Mutex<serde_yaml::Value>,
     current_sha: tokio::sync::Mutex<String>,
+    /// 当前代 manifests 锁逐文件快照（v0.1.122 D1）：键 = 锁文件绝对路径。
+    /// 变化检测的另一半——config 未动但锁变（装/卸模块）也触发重装配。
+    current_locks: tokio::sync::Mutex<HashMap<PathBuf, std::collections::BTreeMap<String, String>>>,
     /// 配置路径（幂等读取落盘文件用）。
     config_path: PathBuf,
     /// 当前代任务池（重载交接）。
@@ -469,23 +477,40 @@ async fn do_reload(ctx: &HotReloadCtx) -> Result<serve::reload::ReloadOutcome, (
     let doc: serde_yaml::Value =
         serde_yaml::from_slice(&raw).map_err(|e| (400u16, format!("parse config: {e}")))?;
     let sha = doc_sha(&doc).map_err(|e| (400u16, e))?;
-    // 幂等：归一 raw 文档的 sha256 与当前代相同 → unchanged（不装配、不 swap）。
+    // 幂等（v0.1.122 D1）：config sha 与 manifests 锁**双双未变**才 unchanged
+    // （不装配、不 swap）。只看 sha 会漏「config 未动、锁变」的装/卸（卸载空转）。
     let cur_gen = ctx.committer().await.generation().await;
-    {
+    let sha_same = {
         let cur = ctx.current_sha.lock().await;
-        if *cur == sha {
-            return Ok(serve::reload::ReloadOutcome {
-                generation: cur_gen,
-                applied: vec![],
-                restart_pending: vec![],
-                kept_listener: vec![],
-                unchanged: true,
-            });
-        }
+        *cur == sha
+    };
+    let new_locks =
+        release_locks(&cfg, &ctx.config_dir).map_err(|e| (400u16, format!("manifests: {e}")))?;
+    let locks_same = {
+        let cur = ctx.current_locks.lock().await;
+        !locks_changed(&cur, &new_locks)
+    };
+    if sha_same && locks_same {
+        return Ok(serve::reload::ReloadOutcome {
+            generation: cur_gen,
+            applied: vec![],
+            restart_pending: vec![],
+            kept_listener: vec![],
+            unchanged: true,
+        });
     }
     // 段 diff 三清单（旧代 vs 新代）。
     let old_doc = ctx.current_doc.lock().await.clone();
-    let (applied, restart_pending, kept_listener) = diff_configs(&old_doc, &doc);
+    let (mut applied, restart_pending, kept_listener) = diff_configs(&old_doc, &doc);
+    // manifests 锁 diff（merged 口径，跨挂载移动 = 无差）→ applied 追加 +/-name@ver（D2）。
+    {
+        let cur = ctx.current_locks.lock().await;
+        let merged_old: std::collections::BTreeMap<String, String> =
+            cur.values().flat_map(|m| m.clone()).collect();
+        let merged_new: std::collections::BTreeMap<String, String> =
+            new_locks.values().flat_map(|m| m.clone()).collect();
+        applied.extend(lock_diff(&merged_old, &merged_new));
+    }
     // ② 影子装配（复用旧 Backend：不重建连接池、不二次 init 插件；迁移强制 verify-only）。
     // `cfg` 整体移入 `from_config`；任务配置先取出克隆供下方任务池交接。
     let tasks_cfg = cfg.tasks.clone();
@@ -544,8 +569,16 @@ async fn do_reload(ctx: &HotReloadCtx) -> Result<serve::reload::ReloadOutcome, (
     // ④ watch swap：新 Router 送入通道，旧 App 随在途请求完成自然 drain。
     let new_inner = std::sync::Arc::new(new_app.router());
     let generation = ctx.committer().await.commit(new_inner, sha.clone()).await;
+    // —— commit 返回后无 await 间隔（v0.1.122 D3）：换代 + 清单落盘同一同步段。
+    //    此前的任何 Err（cfg 归一 / 影子装配 / 抢注 / 任务交接）都已提前返回，
+    //    失败路径零指针移动。残余窗口（commit 后、swap 前落在新路由的请求）
+    //    读旧代装配 fail-closed：白名单外 SQL 被拒，无特权泄漏。
+    if let Some(next) = new_app.take_pending_assembly() {
+        ctx.backend.swap_assembly(next);
+    }
     *ctx.current_doc.lock().await = doc;
     *ctx.current_sha.lock().await = sha;
+    *ctx.current_locks.lock().await = new_locks;
     *ctx.tasking.lock().await = new_tasking;
     // 当前代 flag 指向新池：后续 SIGTERM 精确停机这一代（spec §6 ⑤）。
     *ctx.current_task_flag.lock().await = new_flag.clone();
@@ -599,11 +632,77 @@ fn diff_configs(
             "db_access" | "db_client" | "db_session" | "audit" | "mgmt" => {
                 restart_pending.push((*key).to_string())
             }
+            // 冻结段（v0.1.122 D4）：vars（部署期常量）/ oidc / db_query / db_trace / ws
+            // 改动随热更生效会破坏「装配期冻结」红线或 WS 池代际语义——归 restart_pending，
+            // 不再落入默认 applied 臂（旧代码的静默误标）。
+            "vars" | "oidc" | "db_query" | "db_trace" | "ws" => {
+                restart_pending.push((*key).to_string())
+            }
             "server" => kept_listener.push((*key).to_string()),
             _ => applied.push((*key).to_string()),
         }
     }
     (applied, restart_pending, kept_listener)
+}
+
+/// manifests 锁 diff → applied 追加项（v0.1.122 D2 applied 契约，B6）：
+/// 升级 = `-旧@v` + `+新@v`（先减后增）、新增 = `+name@ver`、卸载 = `-name@ver`，
+/// 全量按模块名排序；模板侧断言按 op 符号解析（装期期望 +、卸期期望 -）。
+fn lock_diff(
+    old: &std::collections::BTreeMap<String, String>,
+    new: &std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
+    // (模块名, 是否减项) —— 同名先减后增。
+    let mut out: Vec<(String, bool, String)> = Vec::new();
+    for (m, v) in old {
+        match new.get(m) {
+            None => out.push((m.clone(), true, format!("-{m}@{v}"))),
+            Some(v2) if v2 != v => {
+                out.push((m.clone(), true, format!("-{m}@{v}")));
+                out.push((m.clone(), false, format!("+{m}@{v2}")));
+            }
+            _ => {}
+        }
+    }
+    for (m, v) in new {
+        if !old.contains_key(m) {
+            out.push((m.clone(), false, format!("+{m}@{v}")));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1).reverse()));
+    out.into_iter().map(|(_, _, e)| e).collect()
+}
+
+/// 逐 release 树解 manifests 锁（v0.1.122 D1）：键 = 锁文件绝对路径，值 = 名→版本
+/// （NotFound = 空锁，见 [`crate::manifest::load_lock`]）。dev 树无锁，跳过。
+fn release_locks(
+    cfg: &Config,
+    config_dir: &Path,
+) -> Result<HashMap<PathBuf, std::collections::BTreeMap<String, String>>, String> {
+    let resolved = crate::app::resolve_mounts(cfg, config_dir)?;
+    let mut out = HashMap::new();
+    for m in resolved.iter().filter(|m| m.kind.api().is_some()) {
+        let (d, ts) = m.kind.api().expect("filtered above");
+        if ts {
+            continue;
+        }
+        let lock_path = d.join("manifests.yaml");
+        let lock = crate::manifest::load_lock(&lock_path)?;
+        out.insert(lock_path, lock);
+    }
+    Ok(out)
+}
+
+/// per-file 变化判定（v0.1.122 D1，B18）：键集差或任一同键值差 = 变。
+/// merged map 对「跨挂载移动」无感——检测必须逐文件，applied 才走 merged diff。
+fn locks_changed(
+    old: &HashMap<PathBuf, std::collections::BTreeMap<String, String>>,
+    new: &HashMap<PathBuf, std::collections::BTreeMap<String, String>>,
+) -> bool {
+    if old.len() != new.len() {
+        return true;
+    }
+    old.iter().any(|(k, v)| new.get(k).is_none_or(|v2| v2 != v))
 }
 
 /// 停机 mail drain 的总超时：在途投递本身已在插件侧受 `profile.timeout` 约束，
@@ -2090,3 +2189,7 @@ pub async fn assemble_for_info(cfg_path: Option<&str>) -> Result<OjInfo, String>
 #[cfg(test)]
 #[path = "serve_cmd_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "serve_cmd_hot_reload_tests.rs"]
+mod hot_reload_tests;

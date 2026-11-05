@@ -2234,16 +2234,19 @@ async fn given_reload_api_when_post_config_then_swaps_and_reports_diff() {
     assert_eq!(body["msg"].as_str(), Some("unchanged"), "{body}");
     assert_eq!(body["generation"].as_u64(), Some(0), "{body}");
 
-    // 改 vars 段 → 重写落盘 → POST：applied 含 "vars"，代际推进到 1。
+    // 改 vars 段 → 重写落盘 → POST：vars 为冻结段归 restart_pending（v0.1.122 B19，
+    // 不再误标 applied），代际仍推进到 1。
     let cfg2 = cfg.replace("FOO: \"bar\"", "FOO: \"baz\"");
     std::fs::write(&cfg_path, &cfg2).unwrap();
     let (st, body) = req(addr, "POST", "/v1/api/_system/config", None).await;
     assert_eq!(st, 200, "config post applied");
     assert_eq!(body["code"].as_i64(), Some(0), "{body}");
-    let applied = body["data"]["applied"].as_array().expect("applied array");
+    let restart_pending = body["data"]["restart_pending"]
+        .as_array()
+        .expect("restart_pending array");
     assert!(
-        applied.iter().any(|v| v.as_str() == Some("vars")),
-        "vars should be in applied: {body}"
+        restart_pending.iter().any(|v| v.as_str() == Some("vars")),
+        "vars should be in restart_pending: {body}"
     );
     assert_eq!(body["data"]["generation"].as_u64(), Some(1), "{body}");
 
@@ -2339,8 +2342,8 @@ async fn given_reload_api_when_backend_and_listener_segments_change_then_classif
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
 
-    // 改三类段：`vars`（applied）/ `db` DSN 变更（restart_pending）/ `server.port` 变更
-    // （kept_listener；监听器不动，仍走 19978）。
+    // 改三类段：`vars`（冻结段，v0.1.122 B19）与 `db` DSN 变更（restart_pending）/
+    // `server.port` 变更（kept_listener；监听器不动，仍走 19978）。
     let cfg2 = cfg
         .replace("FOO: \"bar\"", "FOO: \"baz\"")
         .replace(&db1, &db2)
@@ -2351,13 +2354,14 @@ async fn given_reload_api_when_backend_and_listener_segments_change_then_classif
     assert_eq!(body["code"].as_i64(), Some(0), "{body}");
     let d = &body["data"];
     let applied = d["applied"].as_array().expect("applied array");
+    assert!(applied.is_empty(), "no lock change, applied empty: {body}");
     let restart_pending = d["restart_pending"]
         .as_array()
         .expect("restart_pending array");
     let kept_listener = d["kept_listener"].as_array().expect("kept_listener array");
     assert!(
-        applied.iter().any(|v| v.as_str() == Some("vars")),
-        "vars in applied: {body}"
+        restart_pending.iter().any(|v| v.as_str() == Some("vars")),
+        "vars in restart_pending: {body}"
     );
     assert!(
         restart_pending.iter().any(|v| v.as_str() == Some("db")),
@@ -2581,7 +2585,7 @@ async fn req_rel(addr: std::net::SocketAddr, method: &str, path: &str) -> (u16, 
 }
 
 /// BDD S1/S2/S5/S6（特权 JS 回调路径）：非特权模块 NotCapable；特权模块改盘上
-/// vars 段触发 reloadConfig → applied 含段名 + generation+1；再触发 unchanged；
+/// vars 段触发 reloadConfig → restart_pending 含段名（冻结段）+ generation+1；再触发 unchanged；
 /// 并发双触发一方 busy（文案点名）。
 #[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
@@ -2598,7 +2602,7 @@ async fn given_reload_api_when_privileged_module_calls_reload_config_then_applie
     assert!(err.contains("NotCapable"), "{err}");
     assert!(err.contains("not platform-privileged"), "{err}");
 
-    // S1：改盘上 vars 段 → 特权模块 reloadConfig → applied 含段名、generation+1。
+    // S1：改盘上 vars 段 → 特权模块 reloadConfig → restart_pending 含段名、generation+1。
     let cfg2 = cfg.replace("FOO: \"bar\"", "FOO: \"baz\"");
     std::fs::write(&cfg_path, &cfg2).unwrap();
     let (st, body) = req_rel(addr, "GET", "/pf/api/reloadinst/reload/").await;
@@ -2606,10 +2610,12 @@ async fn given_reload_api_when_privileged_module_calls_reload_config_then_applie
     let r = &body["data"]["reloaded"];
     assert_eq!(r["unchanged"], serde_json::json!(false), "{body}");
     assert_eq!(r["generation"], serde_json::json!(1), "{body}");
-    let applied = r["applied"].as_array().expect("applied array");
+    let restart_pending = r["restart_pending"]
+        .as_array()
+        .expect("restart_pending array");
     assert!(
-        applied.iter().any(|v| v.as_str() == Some("vars")),
-        "vars in applied: {body}"
+        restart_pending.iter().any(|v| v.as_str() == Some("vars")),
+        "vars in restart_pending: {body}"
     );
 
     // S2：盘上无变化再触发 → unchanged=true、generation 不动、三清单空数组。
