@@ -728,6 +728,14 @@ mod tests {
     /// permit，cancel 彻底丢失（假取消：db.cancel 已返 `{cancelled:true}`，语句却
     /// 跑完返回全量行）。全缓冲快行流（本地 sqlite）每轮两臂皆 ready——修复前每判
     /// 取消 ~50% 丢失，10/10 全过的概率 ≈ 0.001；修复后 sticky 标志在循环头拦截，必中。
+    ///
+    /// trial 有效性判定用相位事件精确分类（Windows CI 实测教训）：`poll(5)` 返回
+    /// `done:false` 只证明「判定时刻未 settle」——poll op 在执行器侧解析完、JS 续跑
+    /// `db.cancel` 前，执行器可把语句整跑完（sqlite 全缓冲行流不 yield，一口气到底），
+    /// cancel 落进已天然完成的执行 → 返回全量行是**正当语义**（F2 只保在飞 cancel）。
+    /// `"done"` 事件只在行循环自然耗尽时推（accessor_sqlx 两条取消臂都不推）：
+    /// ROWS_RETURNED 有 done 事件 = 天然跑完（trial 无效，重试）；无 done 事件 =
+    /// cancel 真丢（F2 回归），才失败。
     #[tokio::test(flavor = "current_thread")]
     async fn sqlite_fast_rows_cancel_not_lost_ten_trials() {
         // 文件 DSN（非 :memory:）：取消 = 连接关闭级（close_on_drop），:memory: 每连接
@@ -775,26 +783,48 @@ mod tests {
                 &b,
                 r#"(async () => {
                   const v = await __ojCall.queryBegin("default", "select n from big", null, null);
-                  // 无效判：语句在 cancel 前已跑完（快 trial）——不计入，重来。
+                  // 累积全部相位事件（done 只在行循环自然耗尽时推）。
+                  const evs = [];
+                  // 无效判 A：语句在 cancel 前已跑完（快 trial）——不计入，重来。
                   const r = await __ojCall.poll(v.executionId, 5);
+                  evs.push(...(r.events || []));
                   if (r.done) return json.ok({ code: "DONE_BEFORE_CANCEL" });
                   await db.cancel(v.executionId);
-                  for (;;) { const r2 = await __ojCall.poll(v.executionId, 1000); if (r2.done) break; }
+                  for (;;) {
+                    const r2 = await __ojCall.poll(v.executionId, 1000);
+                    evs.push(...(r2.events || []));
+                    if (r2.done) break;
+                  }
                   let code = "ROWS_RETURNED";
                   try { await __ojCall.queryTake(v.executionId); } catch (e) { code = e.code || String(e); }
-                  return json.ok({ code });
+                  return json.ok({ code, doneEv: evs.some((e) => e.phase === "done") });
                 })()"#,
             )
             .await;
-            let code = v["data"]["code"].as_str().unwrap_or_default();
-            if code == "DONE_BEFORE_CANCEL" {
-                continue;
+            let code = v["data"]["code"].as_str().unwrap_or_default().to_owned();
+            let done_ev = v["data"]["doneEv"].as_bool().unwrap_or(false);
+            match code.as_str() {
+                "DONE_BEFORE_CANCEL" => continue,
+                "OJ_DB_CANCELLED" => {
+                    valid += 1;
+                    // 钉死事件契约：取消臂绝不推 done。
+                    assert!(
+                        !done_ev,
+                        "trial {valid} (attempt {attempt}): cancelled but natural-done event present: {v}"
+                    );
+                }
+                "ROWS_RETURNED" => {
+                    // 无效判 B：cancel 落进已天然跑完的执行（poll→cancel 空档竞态，
+                    // Windows CI 实测）——done 事件在场即正当返回行，trial 无效重试；
+                    // 无 done 事件才是 F2 回归（cancel 真丢）。
+                    assert!(
+                        done_ev,
+                        "trial {valid} (attempt {attempt}): cancel lost (rows without natural-done event): {v}"
+                    );
+                    eprintln!("attempt {attempt}: statement finished before cancel landed, retry");
+                }
+                other => panic!("trial {valid} (attempt {attempt}): unexpected code {other}: {v}"),
             }
-            valid += 1;
-            assert_eq!(
-                code, "OJ_DB_CANCELLED",
-                "valid trial {valid} (attempt {attempt}): {v}"
-            );
         }
         assert!(
             valid >= 10,
