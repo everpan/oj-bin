@@ -2849,9 +2849,17 @@ async fn hot_apply_install_uninstall_cycle() {
     .collect();
     oj::manifest::save_lock(&root.join("dist/manifests.yaml"), &lock_ab).unwrap();
     let (st, body) = req_rel(addr, "POST", "/v1/api/_system/config").await;
-    assert_eq!(st, 200, "install reload: {body}\n{}", out_buf.lock().unwrap());
+    assert_eq!(
+        st,
+        200,
+        "install reload: {body}\n{}",
+        out_buf.lock().unwrap()
+    );
     assert_eq!(body["code"], 0, "{body}");
-    assert!(body["msg"].is_null(), "lock change must not be unchanged: {body}");
+    assert!(
+        body["msg"].is_null(),
+        "lock change must not be unchanged: {body}"
+    );
     let applied = body["data"]["applied"].as_array().expect("applied array");
     assert!(
         applied.iter().any(|v| v.as_str() == Some("+b@1.0.0")),
@@ -2917,7 +2925,12 @@ async fn hot_apply_squatting_rejected() {
     let (mut child, out_buf) = boot_reload_serve(&cfg_path, port, "/pf/api").await;
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let (st, body) = req_rel(addr, "GET", "/pf/api/admin/x/").await;
-    assert_eq!(st, 200, "root admin deployed: {body}\n{}", out_buf.lock().unwrap());
+    assert_eq!(
+        st,
+        200,
+        "root admin deployed: {body}\n{}",
+        out_buf.lock().unwrap()
+    );
 
     // 摘除受控根副本 + vars 变更驱动换代（gen1 不含 admin）。
     std::fs::remove_dir_all(root.join("platform-modules/admin")).unwrap();
@@ -2926,7 +2939,12 @@ async fn hot_apply_squatting_rejected() {
         .replace("FOO: \"bar\"", "FOO: \"baz\"");
     std::fs::write(&cfg_path, &cfg2).unwrap();
     let (st, body) = req_rel(addr, "POST", "/v1/api/_system/config").await;
-    assert_eq!(st, 200, "undeploy reload: {body}\n{}", out_buf.lock().unwrap());
+    assert_eq!(
+        st,
+        200,
+        "undeploy reload: {body}\n{}",
+        out_buf.lock().unwrap()
+    );
     let gen1 = body["data"]["generation"].as_u64().expect("generation");
     let (st, _) = req_rel(addr, "GET", "/pf/api/admin/x/").await;
     assert_eq!(st, 404, "admin must be undeployed");
@@ -2940,7 +2958,12 @@ async fn hot_apply_squatting_rejected() {
     .collect();
     oj::manifest::save_lock(&root.join("dist/manifests.yaml"), &lock_squat).unwrap();
     let (st, body) = req_rel(addr, "POST", "/v1/api/_system/config").await;
-    assert_eq!(st, 400, "squat reload must be rejected: {st} {body}\n{}", out_buf.lock().unwrap());
+    assert_eq!(
+        st,
+        400,
+        "squat reload must be rejected: {st} {body}\n{}",
+        out_buf.lock().unwrap()
+    );
     let msg = body.as_str().unwrap_or("");
     assert!(
         msg.contains("admin") && msg.contains("must not be hot-installed"),
@@ -2950,7 +2973,10 @@ async fn hot_apply_squatting_rejected() {
     let (st, _) = req_rel(addr, "GET", "/v1/api/admin/x/").await;
     assert_eq!(st, 404, "market admin must not mount");
     let (_, body) = req_rel(addr, "GET", "/v1/api/_system/config").await;
-    assert_eq!(body["generation"], gen1, "failed reload must not advance: {body}");
+    assert_eq!(
+        body["generation"], gen1,
+        "failed reload must not advance: {body}"
+    );
 
     stop_reload_serve(&mut child).await;
     let _ = std::fs::remove_dir_all(&root);
@@ -2984,7 +3010,12 @@ async fn hot_apply_uninstall_last_module() {
     let lock_empty: std::collections::BTreeMap<String, String> = Default::default();
     oj::manifest::save_lock(&root.join("dist/manifests.yaml"), &lock_empty).unwrap();
     let (st, body) = req_rel(addr, "POST", "/v1/api/_system/config").await;
-    assert_eq!(st, 200, "empty-lock reload: {body}\n{}", out_buf.lock().unwrap());
+    assert_eq!(
+        st,
+        200,
+        "empty-lock reload: {body}\n{}",
+        out_buf.lock().unwrap()
+    );
     assert_eq!(body["code"], 0, "{body}");
     let applied = body["data"]["applied"].as_array().expect("applied array");
     assert!(

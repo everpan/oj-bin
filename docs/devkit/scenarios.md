@@ -4627,3 +4627,54 @@ req.end();
   WS 库本就经 1.1 `Upgrade` 握手，无需改动；勿把 WS 握手塞进 h2 连接。
 - 浏览器场景的 h2 由前置反代（nginx/caddy）TLS-ALPN 协商，与源站本特性无关；
   反代→源站一跳按需选协议即可。
+
+## 场景 71：release 运行中热装/卸模块免重启（v0.1.122）
+
+**什么时候用**：`server.reload_api: true` 的 release 部署（服务 `oj build` 产出的
+`dist/` 树）。市场/运维侧装了一个新模块、或要下线一个模块——不想重启进程丢在途请求。
+
+**机制**：release 树的 `dist/manifests.yaml` 是版本锁（`模块名: 版本`）。v0.1.122 起
+`POST {base}/_system/config` 把**锁的变化**也纳入检测：锁变了就按锁重装配（与启动期
+同一装配函数），影子装配成功后单指针换代——新请求命中新路由，旧代随在途请求 drain。
+
+**操作（部署方/安装器侧，两步）**：
+
+1. 落盘模块版本目录 `dist/<name>-<version>/`（正常 `oj build` 产物；手动放置须含
+   `manifest.yaml` + 转译后的 `*.js` + `routes.js`，与 build 产物同形）；
+2. 改锁：装/升级 = 锁里写 `name: version`；卸载 = 摘条目（版本目录可留可删）。
+   然后 `POST {base}/_system/config`（空 body）。
+
+```bash
+# 装 b@1.0.0（版本目录已就位、锁补条目后触发）
+cat dist/manifests.yaml          # a: 0.1.0
+echo 'b: 1.0.0' >> dist/manifests.yaml
+curl -X POST http://localhost:9778/v1/api/_system/config
+# → {"code":0,"data":{"generation":1,"applied":["+b@1.0.0"],...}}
+curl http://localhost:9778/v1/api/b/ping/       # → 200，路由已上树
+
+# 卸 b（锁摘条目 + 删版本目录）
+# ... manifests.yaml 摘掉 b 行 ...
+curl -X POST http://localhost:9778/v1/api/_system/config
+# → applied 含 "-b@1.0.0"；GET b/ping/ → 404
+```
+
+**契约**：
+- `applied` 模块条目：`+<name>@<ver>` / `-<name>@<ver>`，按名排序；**升级 = `-旧@v` +
+  `+新@v` 成对**。只改锁不改 config.yaml 也会触发（幂等判定 = config sha **与** 锁
+  双双未变才 `unchanged`）。
+- **空锁 = 卸载全部**：reload 路径放行空 `manifests.yaml`（模块路由全 404、health 仍
+  200）；冷启动空锁依旧 fail-fast（忘跑 `oj build`）。
+- **失败零副作用**：装配失败（编译错、抢注）→ 400 + 原因，旧代继续服务、代际不动。
+
+**常见坑**：
+- 报 400 `platform module 'x' must not be hot-installed …`：装的是 `platform.modules`
+  名单里的特权名。特权模块只能由部署方放入 `platform.root` 后**重启**生效（热装特权名
+  = 继承特权，被抢注拦截；失败零副作用）。
+- 新模块带 `schema.yaml`（要建表）：热更路径迁移强制 `verify`-only，账本没跑过该模块的
+  迁移会拒——先 `oj migrate` 跑迁移再改锁触发热更。
+- 改 `vars:` 想让新模块读到新值：`vars` 是冻结段（v0.1.122 起如实报 `restart_pending`），
+  必须重启；别把「模块热装生效」和「vars 热生效」混为一谈。
+- 卸载后 `auth.anonymous_paths` 里指向该模块的旧条目**无需清理也无需重启**——条目是
+  路径模式，失配即无害；匿名清单本身随换代即时生效。
+- cron 任务跨换代**仍触发且恰一次**（换代闸：新代任务池 hold 到旧代收场统一放闸）；
+  如果观察到双发，先确认两端 oj 版本一致（旧版有跨代双发窗口）。

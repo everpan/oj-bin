@@ -1629,6 +1629,7 @@ server.reloadConfig(): Promise<{
 | `reload not available (not running under oj serve)` | `oj test` / 嵌入式无执行器 |
 | `server.reloadConfig: reload in progress (busy)` | 并发触发撞串行锁（HTTP 侧同语义 409） |
 | `server.reloadConfig: HTTP 400: <原因>` | 归一/装配失败（旧代继续服务，不破坏在跑实例） |
+| `server.reloadConfig: HTTP 400: platform module '<name>' must not be hot-installed …`（v0.1.122） | 热装 `platform.modules` 特权名被抢注拦截——特权模块只能放入 `platform.root` 后重启（失败零副作用，代际不动） |
 
 ### bus —— 订阅发布
 
@@ -2052,7 +2053,8 @@ JS 出口：handler 里 `ojInfo()` **同步**返回五段诊断对象（装配�
 
 ```jsonc
 {
-  "build":   { "oj": "0.1.54", "profile": "release", "host_triple": "…", "v8": "…", "exe": "…" },  // config_path 仅 oj info CLI 出，JS ojInfo() 无此字段
+  "build":   { "oj": "0.1.54", "profile": "release", "host_triple": "…", "v8": "…", "exe": "…",
+               "capabilities": ["reload.assemble_modules","reload.anon_per_reload","reload.cron_survives"] },  // config_path 仅 oj info CLI 出，JS ojInfo() 无此字段；capabilities 为 v0.1.122 增量能力位（闭集，客户端按位探测）
   "abi":     { "abi_version": 12, "host_fingerprint": "…" },
   "plugins": [ { "name": "…", "semver": "…", "abi_version": 12, "fingerprint": "…",
                  "description": "…", "host_abi_version": 12,
@@ -2510,6 +2512,20 @@ CLI/MCP 继续用 Bearer，两者并存。
 「这一层是有意的」时改写成对象形态 `- { path: "/pub/*", one_layer: true }`（消音迁移
 WARN，见下）。`{base}` 之外的路径（静态站点）不设防。
 
+**保留段黑名单（v0.1.122）**：`auth.anonymous_paths` 条目落在保留前缀 `_platform` /
+`_system` / `_lifecycle` / `tasks` 之下 → **装配期 fail-fast**，报错点名：
+`auth.anonymous_paths: anonymous path "…" under reserved prefix /<seg> — denied`——
+平台保留面（`_system/config` 热更端点、任务管理 API 等）有自己的守卫（回环/Bearer），
+匿名豁免进不来。`auth` 段**不在**黑名单（`/auth/login` 这类端点本就是业务匿名路由）。
+`tenant.anonymous_paths` 不受此限（它只豁免租户头、不免验签，见下）。
+
+**命中即短路（v0.1.122）**：命中 `auth.anonymous_paths` 的请求在前置管线**直接放行**，
+不再调用守卫 `verify`（无 auth 插件往返）；未命中照常验签。语义对请求方不变（匿名照旧
+匿名），变化只有两点：守卫侧不再看到匿名请求的验签调用（自研守卫的调用计数会少）；
+清单随热更换代即时生效（`reload.anon_per_reload`）。**注意 `tenant.anonymous_paths`
+不免验签**——它只豁免「缺租户头 400」，Bearer 验签照走；免验签只能配
+`auth.anonymous_paths`。
+
 **用户表是业务约定，没有配置项**：框架不管用户表（不存在 `auth.user_table`），JS 端点
 按约定查询 `users` 表（`_platform` 伪模块持有归属），最小 schema：
 
@@ -2906,24 +2922,32 @@ mounts:
 
 **触发**：`POST {base}/_system/config`（**空 body**，非空 body 一律 400），或特权模块在 JS 侧调 `server.reloadConfig()`（同一 executor 实例与同一把串行锁，见「server」一节）。服务端重新 `load_cfg` → `fold_cli_mounts` 重放 CLI 覆盖 → 证书/公钥路径重放 → `admission_gate`，再与当前代做幂等/段 diff：
 
-- **幂等**：归一后落盘文件 sha256 与当前代相同 → 返回 `{"code":0,"msg":"unchanged","generation":<n>}`，不装配、不 swap。
+- **幂等**：归一后落盘文件 sha256 **与 manifests 锁（`dist/manifests.yaml`，release 树）双双未变** → 返回 `{"code":0,"msg":"unchanged","generation":<n>}`，不装配、不 swap。（v0.1.122 起锁纳入变化检测：只改锁不改 config 也会触发装配——装/卸模块免重启的检测面。）
 - **段 diff 三清单**（每次成功 swap 返回）：
-  - `restart_pending`：后端段（`db`/`redis`/`blob`/`es`/`broker`/`smtp`/`ldap`/`auth`/`kafkas`/`rabbits`/`plugins`/`plugins_dir`/`secrets`）与**特权面段（`platform`/`fs`）**——已验证合法，但本代沿用旧连接池/旧插件后端/旧授权面，**重启后生效**。特权面段不热生效是安全语义：特权模块不能热改自己的 API/exec/fs 白名单（防自提权）。
+  - `restart_pending`：后端段（`db`/`redis`/`blob`/`es`/`broker`/`smtp`/`ldap`/`auth`/`kafkas`/`rabbits`/`plugins`/`plugins_dir`/`secrets`）、**特权面段（`platform`/`fs`）**与**冻结段（`vars`/`oidc`/`db_query`/`db_trace`/`ws`，v0.1.122 起）**——已验证合法，但本代沿用旧连接池/旧插件后端/旧授权面/旧装配期常量，**重启后生效**。特权面段不热生效是安全语义：特权模块不能热改自己的 API/exec/fs 白名单（防自提权）；冻结段不热生效是「装配期冻结」红线（**v0.1.122 行为修正**：旧版把 `vars` 等静默误标进 `applied`，实际并未热生效——现如实归入 `restart_pending`）。
   - `kept_listener`：`server` 段（port/host/证书路径）——listener 永生，本代沿旧，改了也**下个进程**才生效。
-  - `applied`：其余段（如 `vars` 部署期常量）——本代即生效。
+  - `applied`：其余段（`mounts`/`tenant`/`tasks`）——本代即生效；v0.1.122 起追加 **manifests 锁 diff 条目**（见下「热装配」）。
 
 成功响应：`{"code":0,"data":{"generation":<n>,"applied":[...],"restart_pending":[...],"kept_listener":[...]}}`。
+
+**热装配（v0.1.122，release 锁装/卸免重启）**：release 树（`oj build` 产 `dist/` + `manifests.yaml` 锁）运行中，部署方改锁（装/卸/升级模块的版本目录 + `manifests.yaml` 条目，即 ojm 安装器的落盘动作）后 `POST reload` 即生效，**无需重启**：
+
+- **`applied` 模块条目契约**：`+<name>@<ver>`（安装/升级后新版本上线）、`-<name>@<ver>`（卸载）；按模块名排序；**升级 = `-旧@v` + `+新@v` 成对出现**。段 diff 条目与模块条目同列一数组。
+- **空锁 = 卸载全部**：reload 路径放行空 `manifests.yaml`（合法空装配，模块路由全 404、health 仍 200）；**冷启动空锁仍 fail-fast**（忘跑 `oj build` 的报错不变）。
+- **抢注拦截**：`platform.modules` 名单内的模块名**不可热装**——新代新增的特权名（旧代没有）→ reload 返回 **400 点名**：`platform module '<name>' must not be hot-installed (deploy it in a platform-controlled directory under platform.root, then restart)`。特权模块只能由部署方放入 `platform.root` 后重启；失败零副作用（代际不动、路由不上树）。
+- **换代原子性**：registry/modules 白名单每请求钉住单一快照（卸载模块的在途请求按旧代语义 drain，不混代）；cron 任务跨换代**仍触发且恰一次**（换代闸：新代任务池 hold 到旧代收场统一放闸）。
+- **可观测**：`GET {base}/_system/config` 新增 **`modules`** 键——当前生效代挂载模块清单（`["a@0.1.0","b@1.0.0"]` 按名排序）；`ojInfo()` / `oj info` 的 `build` 段新增 **`capabilities`**：`reload.assemble_modules`（锁热装配）、`reload.anon_per_reload`（匿名清单随换代生效）、`reload.cron_survives`（cron 换代存活）——客户端按位探测再依赖。
 
 **守卫**：`server.reload_api` 开启后 `_system/config` 受保护——`auth:` 配置了 → 需 Bearer 验签（401 详情在响应体）；未配 `auth:` → 仅**回环地址**（loopback）可调，非回环 403（响应体 `"reload_api requires loopback or auth"`）。`GET` 同样受此守卫。
 
 **并发**：同一时刻只允许一个热更（HTTP POST 与 JS `server.reloadConfig()` 共享同一把串行锁）；第二个并发触发在拿不到锁时返回 **409 `reload in progress`**（JS 侧抛 `server.reloadConfig: reload in progress (busy)`）。
 
-**代际与可观测**：`GET {base}/_system/config` 返回 `{config_path, sha256, loaded_at, generation}`；`GET {base}/_system/health` 返回 `{status:"OK", generation, config_path}`（旧路径 `{base}/health` 仍可用，但会告警建议改用 `_system/health`）。
+**代际与可观测**：`GET {base}/_system/config` 返回 `{config_path, sha256, loaded_at, generation, modules}`（`modules` v0.1.122 起）；`GET {base}/_system/health` 返回 `{status:"OK", generation, config_path}`（旧路径 `{base}/health` 仍可用，但会告警建议改用 `_system/health`）。
 
 **限制（v1 边界）**：
 - 热更**复用首代已建立的连接池与插件后端**——不重建后端、不二次 `init` 插件、迁移强制 `verify`-only（dev 默认 `auto` 会打生产库，故热更路径强制 `verify`）、不重放 seed。需要新后端/新迁移的改动请走 `restart_pending` 提示并**重启进程**。
 - 触发源是**落盘配置文件**：进程生命周期内 CLI 覆盖（`--api-path`/`--cert-path`）不变，故以文件内容为热更真触发源。改文件 → `POST` 即生效。
-- 装配失败（如 `admission_gate` 不通过、新模块编译错）→ `POST` 返回 400 + 原因，**旧代继续服务**（失败不破坏在跑实例）；任务池交接为先建新池 fail-fast、再停旧池，新池建不起来则旧池仍跑（回滚完整）。
+- 装配失败（如 `admission_gate` 不通过、新模块编译错、热装特权名抢注）→ `POST` 返回 400 + 原因，**旧代继续服务**（失败不破坏在跑实例，代际不动）；任务池交接为先建新池 fail-fast、再停旧池，新池建不起来则旧池仍跑（回滚完整）。
 
 | `reload_api` | `false` | （v1 配置热更新）开启后 `oj serve` 走「永生 listener + 外层单一 fallback」形态：监听 `POST {base}/_system/config` 触发热更、`GET {base}/_system/config` 看当前代际、`GET {base}/_system/health` 看健康 + 代际。详见下「配置热更新（reload_api）」。关闭则维持原 `serve_graceful` 行为（零变化） |
 

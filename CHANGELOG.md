@@ -16,6 +16,64 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.122
+
+**feat（serve/oj，热装配）**：`_system/config/reload` 覆盖 manifests 锁——release 部署
+（`oj build` 产 `dist/` + 版本锁）运行中**装/卸/升级模块免重启**。源需求：oj-module
+`docs/plans/20261105-upstream-oj-pr.md`（方案市场安装闭环的上游宿主侧）。
+
+- **锁纳入 reload 检测**：`POST {base}/_system/config`（或特权 JS `server.reloadConfig()`）
+  除 config sha 外**同时 diff `dist/manifests.yaml` 锁**；锁变 → 影子装配（与冷启动
+  **同一装配函数**，重建 registry/modules 白名单）→ 单指针换代。幂等判定升级为
+  「sha **与** 锁**双双未变**才 `unchanged`」。
+- **`applied` 模块条目契约**：`+<name>@<ver>`（安装/升级新版本上线）、`-<name>@<ver>`
+  （卸载），按名排序；**升级 = `-旧@v` + `+新@v` 成对**。只改锁不改 config 也会触发。
+- **空锁 = 卸载全部**：reload 路径放行空锁（合法空装配，模块路由全 404、health 存活）；
+  **冷启动空锁仍 fail-fast**（忘跑 `oj build` 报错不变）。
+- **抢注拦截（B16）**：复用路径新代**新增**的模块名命中 `platform.modules` 特权名单 →
+  reload 400 点名 `must not be hot-installed`（热装特权名 = 继承特权，必须阻断）；
+  特权模块只能由部署方放入 `platform.root` 后重启。旧代已有的特权名豁免（不误伤受控根
+  产物）。失败零副作用：影子装配失败零指针移动，旧代继续服务、代际不动。
+- **换代原子性（D3）**：registry/modules/guards 每请求钉住单一 `PerGenAssembly` 快照
+  （8 个读点全部经代际槽）——卸载模块的在途请求按旧代语义 drain，无混代、无 `bound_db`
+  改道（B12）。
+- **可观测**：`GET {base}/_system/config` 新增 **`modules`** 键（当前代挂载模块清单
+  `name@ver` 排序）；`ojInfo()` / `oj info` 的 `build` 段新增 **`capabilities`**：
+  `reload.assemble_modules` / `reload.anon_per_reload` / `reload.cron_survives`。
+
+**行为修正（如实登记，可能由绿变红）**：
+- **冻结段三清单纠正**：`vars` / `oidc` / `db_query` / `db_trace` / `ws` 段改动旧版被
+  默认臂**静默误标进 `applied`**（实际从未热生效——装配期冻结红线），现如实归入
+  `restart_pending`，须重启生效。依赖「改 vars 后 reload 即生效」假象的部署需改流程。
+- **`auth.anonymous_paths` 命中即前置管线短路**（B19 配套）：命中条目的请求**不再调用
+  守卫 `verify`**（回环/无 auth 形态本就不调）；自研 auth 守卫若依赖「匿名请求也有
+  verify 调用」的计数会看到下降。`tenant.anonymous_paths` 不变——它仍不免验签（只豁免
+  缺租户头 400）。
+- **保留段黑名单**：`auth.anonymous_paths` 条目落在 `_platform` / `_system` /
+  `_lifecycle` / `tasks` 前缀下 → 装配期 fail-fast（报错点名）；`auth` 段不在黑名单
+  （`/auth/login` 是业务匿名路由）。
+
+**fix（tasks，cron driver 宿主迁移 + 换代 resume 闸；如实登记）**：
+- **宿主 bug**：cron driver 原挂在**调用方 runtime** 的 `tokio::spawn` 上——reload 经
+  `spawn_blocking` 线程装配换代时，该 runtime 随线程消亡，driver 被 kill（reload 后
+  cron 永不再触发的隐性炸点）。现迁**独立 std 线程 + 自持 current_thread runtime**
+  （`cron-driver`），随进程存活。
+- **双发窗口关闭（US-3）**：换代交接旧池 flag 置位 → 新池**闭门装配**（cron driver /
+  Worker / TLA 任务全部 hold 在 `resume` 闸门口）→ 旧池 `shutdown_and_join`（10s 有界，
+  超时 500 拒绝本次 reload 且回滚完整）→ 统一放闸。消灭「新旧两池同时在跑」的双发窗口；
+  reload 后 cron 仍触发且**恰一次**（B11，e2e 分钟对齐腿钉住）。
+
+**e2e**：热装配 BDD 四腿——`hot_apply_install_uninstall_cycle`（装→applied⊇`+b@1.0.0`→
+GET 200→卸→`-b@1.0.0`→GET 404）、`hot_apply_squatting_rejected`（受控根摘除后热装特权名
+400 点名、特权不继承、代际不动）、`hot_apply_uninstall_last_module`（空锁卸载全部、health
+存活）、`cron_survives_reload_fires_once`（`* * * * *` 跨换代恰一次）；单测腿见各任务
+（锁 diff/空锁门/抢注/闸）。
+
+**文档**：api-manual「配置热更新」（热装配小节 + applied 契约 + GET `modules` +
+ojInfo `capabilities`）、「匿名路径」（保留段黑名单 + 命中即短路）、`server.reloadConfig`
+错误表（抢注 400）、ojInfo 示例；scenarios 场景 71（热装/卸照抄）；SKILL 陷阱速查六行；
+devkit README v0.1.122 落地段。
+
 ## v0.1.121
 
 **feat（seed，按方言选文件）**：模块 seed 此前只认 `seed.sql` 一个文件名，一旦内容带

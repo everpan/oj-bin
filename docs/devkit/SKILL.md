@@ -267,6 +267,11 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `POST {base}/_system/config` 报 403 | 未配 `auth:` 时只允许**回环**调用；远程调度走 Bearer 守卫须先配 `auth:` 段 |
 | `POST {base}/_system/config` 报 409 | 上一次热更还在跑（串行锁占用）——等上一次完成再发 |
 | `POST {base}/_system/config` 报 400 且 body 非空 | 该端点**只接受空 body**，改配置请直接改落盘文件再 POST 触发 |
+| 热装模块报 400 `platform module '…' must not be hot-installed`（v0.1.122） | 装的是 `platform.modules` 特权名——热装特权名 = 继承特权，被抢注拦截（零副作用）。特权模块由部署方放入 `platform.root` 后**重启**生效 |
+| 只改了 `dist/manifests.yaml`（没动 config.yaml），POST reload 却返回了新 `applied` | **特性不是 bug**（v0.1.122）：锁纳入变化检测，装/卸/升级模块免重启；`applied` 里 `+name@ver`/`-name@ver` 就是模块条目（升级成对 `-旧 +新`）。空锁 = 卸载全部（reload 放行；冷启动空锁仍 fail-fast） |
+| 改 `vars:` 段 POST reload 后新模块没读到新值 / 返回里 `vars` 出现在 `restart_pending`（v0.1.122 行为修正） | `vars`/`oidc`/`db_query`/`db_trace`/`ws` 是**冻结段**——旧版误标进 `applied`（实际从未热生效），现如实报 `restart_pending`，须**重启**生效。模块热装（锁）与 vars 热生效是两回事 |
+| `tenant.anonymous_paths` 命中却还是 401 | 它只豁免**缺租户头 400**，**不免 Bearer 验签**——免验签只能配 `auth.anonymous_paths`（v0.1.122 起命中即在前置管线短路、不再调守卫 verify；清单随换代即时生效） |
+| `auth.anonymous_paths` 配了 `/_system/**`、`/tasks/**` 启动失败 | 保留段黑名单（v0.1.122）：`_platform`/`_system`/`_lifecycle`/`tasks` 前缀下的匿名条目 fail-fast 拒装——平台保留面有自己的守卫，匿名豁免进不来；`auth` 段不设限（`/auth/login` 本就是业务匿名路由） |
 | `--module-root` 下 WS 路由 404 / 握手 401（v0.1.87） | WS 与 api.ts **同口径**：`src/wiki/api/ws.ts`（manifest 在 `src/wiki/api/`）→ `GET {base}/wiki/ws`，`api` 是模块根（布局分隔符）不是路由段；`anonymous_paths` 按守卫面写 `/wiki/ws`。release 仍带版本段（`…/wiki-0.1.0/ws`），与 dev 不同源。新增/删除 `ws.ts` 要重启。**唯一权威面是启动打印的 `ws: N mount(s)` 清单**——别从目录结构推 |
 | WS 路由 404（文件明明在） | 文件名必须小写 `ws.ts`/`ws.js`——`WS.ts` 无效（v0.1.5 约定）；路径拿不准就看启动打印的挂载清单 |
 | （v0.1.9 已消除）旧帧循环的 const 重复声明 | 新契约为生命周期钩子：模块每 Worker 预载一次——无需处理；可变跨帧状态放 `sess.state`（模块作用域只是只读缓存），见 api-manual §ws.ts |
