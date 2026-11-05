@@ -174,10 +174,45 @@ pub enum SqlGuard {
 }
 
 /// StableState：跨请求共享、创建后不可变（内部句柄均为 Arc）。
+/// 每代装配产物（v0.1.122 热装配）：SchemaRegistry 白名单 + ModuleCtx 表 + tenant 三旗标。
+/// reload 换代的最小原子——registry 必须与 modules 同代（SQL 红线：动态标识符只来自
+/// registry；分两次换会造出「新 modules + 旧 schema」瞬态，被本结构在类型上排除）。
+pub struct PerGenAssembly {
+    pub registry: Arc<SchemaRegistry>,
+    pub modules: Arc<HashMap<String, ModuleCtx>>,
+    /// tenant.sql_guard（随代：tenant 段真正可热更，构建/执法同代）。
+    pub sql_guard: SqlGuard,
+    /// 表归属守卫模式（P2 §5.3）：false=warn；true=deny。
+    pub ownership_deny: bool,
+    /// `db.asTenant` 开关（tenant.allow_as_tenant，v0.1.20）：默认 false。
+    pub allow_as_tenant: bool,
+}
+
+/// 换代槽：单实例跨全部 Bridge/StableState 共享（Extras 穿参，reload_slot 同款）；
+/// 读侧锁内 clone 外层 Arc 即出锁，不引 arc-swap（QPS 下无争用）。
+pub type AssemblySlot = Arc<std::sync::RwLock<Arc<PerGenAssembly>>>;
+
+impl StableState {
+    /// 当前代快照（请求期持快照跨 await 安全；中毒按仓库惯例 into_inner）。
+    pub fn assembly_snapshot(&self) -> Arc<PerGenAssembly> {
+        self.assembly
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// 换代（reload commit 后调用；单指针赋值，读侧阻塞纳秒级）。
+    pub fn swap_assembly(&self, next: PerGenAssembly) {
+        *self.assembly.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(next);
+    }
+}
+
 pub struct StableState {
     pub kv: Arc<dyn KVStore>,
     pub dbs: HashMap<String, Arc<dyn DataAccessor>>,
-    pub registry: Arc<SchemaRegistry>,
+    /// 每代装配槽（v0.1.122 热装配）：registry + modules + tenant 三旗标打包，
+    /// reload 在 commit 后单指针换代（读侧经 ReqState 快照，请求代际原子）。
+    pub assembly: AssemblySlot,
     /// oj 模块加载配置（node_modules 回溯上界 + CJS require 的 project_root）。
     /// T9 装配注入；devserver 旧路径不配（裸 specifier / __ojRequire 不可用）。
     pub loader: Option<Arc<module_loader::LoaderShared>>,
@@ -193,15 +228,6 @@ pub struct StableState {
     pub es: Option<Arc<dyn es::EsBackend>>,
     /// 已装配插件自省信息（op_plugins 输出源；装配层注入）。
     pub plugins: Vec<PluginInfo>,
-    /// 模块执行上下文（键 = 模块目录绝对路径；P2 §5.3）。空 = 无模块上下文（守卫不设防）。
-    pub modules: Arc<HashMap<String, ModuleCtx>>,
-    /// 表归属守卫模式（P2 §5.3）：false=warn（默认，日志告警）；true=deny（违规拒绝）。
-    pub ownership_deny: bool,
-    /// 多租户 SQL 防护模式（tenant.sql_guard；Off=不设防）。
-    pub sql_guard: SqlGuard,
-    /// `db.asTenant` 开关（tenant.allow_as_tenant，v0.1.20）：默认 false。
-    /// 匿名请求显式声明租户身份的逃生口 —— 面向公开面且 id 无从校验，故 fail-closed。
-    pub allow_as_tenant: bool,
     /// 运行期默认库重定向（`oj test` 的 db.test；v0.1.20）。仅重定向字面 "default"。
     pub db_override: Option<String>,
     /// 构造器 LIMIT：隐式默认 + 显式硬顶（db_query 段，v0.1.20）。
@@ -326,8 +352,11 @@ pub struct Extras {
     pub es: Option<Arc<dyn es::EsBackend>>,
     /// 已装配插件自省信息（op_plugins 数据源；装配层注入）。
     pub plugins: Vec<PluginInfo>,
-    /// 模块执行上下文（§5.3；缺省空表 = 守卫不设防）。
+    /// 模块执行上下文（§5.3；缺省空表 = 守卫不设防）。槽 Some 时仅作初代 fallback 源。
     pub modules: Arc<HashMap<String, ModuleCtx>>,
+    /// 每代装配槽（v0.1.122 热装配）：Some = 装配层穿参的共享槽（跨 Bridge 单实例）；
+    /// None = 由 registry 参数 + 上述 fallback 字段包新槽（oj test / 嵌入式）。
+    pub assembly: Option<AssemblySlot>,
     /// 表归属守卫 deny 模式（缺省 false = warn）。
     pub ownership_deny: bool,
     /// 多租户 SQL 防护模式（缺省 Off = 不设防）。
@@ -454,6 +483,10 @@ pub struct ReqState {
     /// 本请求所属模块版本（与 module 同点注入，唯一写点在 checkout_reset；
     /// `http.module.version` 的数据源；None = 无上下文）。
     pub module_version: Option<String>,
+    /// 本请求钉住的装配快照（v0.1.122 热装配）：checkout_reset 唯一写点，与 module
+    /// 同源取自 run_module 先取的快照——同请求内多次读持同一代，请求中途换代不混代。
+    /// 读点：guard/query/db_import 的 registry、modules、tenant 旗标。
+    pub assembly: Option<Arc<PerGenAssembly>>,
     /// db.asSystem() 逃生口：本请求以系统身份绕过租户防护（reset 即失效；
     /// sql_guard 活跃时调用处记审计日志）。默认 false。
     pub system: bool,
@@ -500,6 +533,7 @@ impl ReqState {
         self.ws_sess = None;
         self.module = None;
         self.module_version = None;
+        self.assembly = None;
         self.system = false;
         self.stream_tx.borrow_mut().take();
         self.stream_rx.borrow_mut().take();
@@ -791,7 +825,7 @@ impl Bridge {
             Ok(s) => s,
             Err(e) => return TaskExit::Crashed(format!("task spec: {e}")),
         };
-        let mut rt = match self.checkout_reset(RequestInfo::default(), None).await {
+        let mut rt = match self.checkout_reset(RequestInfo::default(), None, &self.pool.stable().assembly_snapshot()).await {
             Ok(rt) => rt,
             Err(e) => return TaskExit::Crashed(e.to_string()),
         };
@@ -994,10 +1028,22 @@ impl Bridge {
             ))
         });
         let secret_keys = extras.secret_keys.clone();
+        // 每代装配槽：装配层穿参（Extras.assembly，跨 Bridge 单实例）优先；
+        // 缺省 = registry 参数 + Extras fallback 字段包初代（oj test / 嵌入式形态）。
+        let assembly: AssemblySlot = match extras.assembly.clone() {
+            Some(slot) => slot,
+            None => Arc::new(std::sync::RwLock::new(Arc::new(PerGenAssembly {
+                registry: Arc::new(registry),
+                modules: extras.modules.clone(),
+                sql_guard: extras.sql_guard,
+                ownership_deny: extras.ownership_deny,
+                allow_as_tenant: extras.allow_as_tenant,
+            }))),
+        };
         let stable = Arc::new(StableState {
             kv,
             dbs,
-            registry: Arc::new(registry),
+            assembly,
             loader,
             module_index: extras.module_index,
             seq_ensured: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -1007,10 +1053,6 @@ impl Bridge {
             bus: extras.bus.unwrap_or_else(|| Arc::new(bus::Bus::new())),
             es: extras.es,
             plugins: extras.plugins,
-            modules: extras.modules,
-            ownership_deny: extras.ownership_deny,
-            sql_guard: extras.sql_guard,
-            allow_as_tenant: extras.allow_as_tenant,
             db_override: extras.db_override,
             query_limits: extras.query_limits,
             sql_trace: extras.sql_trace,
@@ -1109,7 +1151,7 @@ impl Bridge {
     /// 带请求上下文执行。
     pub async fn run_with(&self, source: &str, req: RequestInfo) -> Result<Capture, CoreError> {
         // boot 失败（含超时）→ CoreError：run_with 无超时语义，不引入 RunError。
-        let mut rt = match self.checkout_reset(req, None).await {
+        let mut rt = match self.checkout_reset(req, None, &self.pool.stable().assembly_snapshot()).await {
             Ok(rt) => rt,
             Err(e) => return Err(CoreError::from(std::io::Error::other(e.to_string()))),
         };
@@ -1135,6 +1177,7 @@ impl Bridge {
         &self,
         req: RequestInfo,
         module: Option<&ModuleCtx>,
+        assembly: &Arc<PerGenAssembly>,
     ) -> Result<JsRuntime, RunError> {
         let rt = self.pool.checkout().await?;
         let stable = self.pool.stable().clone();
@@ -1149,6 +1192,9 @@ impl Bridge {
                 rs.module = module.map(|c| c.name.clone());
                 rs.module_version = module.map(|c| c.version.clone());
                 debug_assert_eq!(rs.module.is_some(), rs.module_version.is_some());
+                // 快照钉请求（v0.1.122）：与 module 同源（run_module 先取的同一 Arc），
+                // 请求全程持单代——请求中途换代不混代，guard/query 读 ReqState.assembly。
+                rs.assembly = Some(assembly.clone());
             }
             // fs 轴第二道防线按模块特权级换装（ojm 批次，设计稿 §1.6）：特权模块
             // （ReqState.module ∈ platform.modules）的 read/write 授权面 =
@@ -1187,8 +1233,9 @@ impl Bridge {
         req: RequestInfo,
         timeout: std::time::Duration,
         module: Option<&ModuleCtx>,
+        assembly: &Arc<PerGenAssembly>,
     ) -> Result<JsRuntime, RunError> {
-        let mut rt = self.checkout_reset(req, module).await?;
+        let mut rt = self.checkout_reset(req, module, assembly).await?;
         let handle = rt.v8_isolate().thread_safe_handle();
         self.kill.arm(handle, timeout);
         Ok(rt)
@@ -1200,7 +1247,7 @@ impl Bridge {
     /// 若只依赖启动期内省的间接失败，线程 panic 会被 `routes::bridge_introspector` 的
     /// `join()` 吞成路由 failure，而路由 failure 在装配层只 warn 不致命（路由全空、服务照常监听）。
     pub async fn prewarm(&self) -> Result<(), RunError> {
-        let rt = self.checkout_reset(RequestInfo::default(), None).await?;
+        let rt = self.checkout_reset(RequestInfo::default(), None, &self.pool.stable().assembly_snapshot()).await?;
         self.pool.checkin(rt);
         Ok(())
     }
@@ -1216,7 +1263,7 @@ impl Bridge {
             return None;
         }
         let rt = self
-            .checkout_reset(RequestInfo::default(), None)
+            .checkout_reset(RequestInfo::default(), None, &self.pool.stable().assembly_snapshot())
             .await
             .ok()?;
         let insp = rt.inspector();
@@ -1302,7 +1349,9 @@ impl Bridge {
         req: RequestInfo,
         timeout: std::time::Duration,
     ) -> Result<WsOutcome, RunError> {
-        let mut rt = self.checkout_armed(req, timeout, None).await?;
+        let mut rt = self
+            .checkout_armed(req, timeout, None, &self.pool.stable().assembly_snapshot())
+            .await?;
         let result = runtime::run_to_completion(&mut rt, "handler.js", source.to_string()).await;
         if self.kill.disarm() {
             // runtime 已被 terminate，不可复用，直接丢弃（不 checkin）。
@@ -1369,7 +1418,12 @@ impl Bridge {
         let driver_spec = deno_core::ModuleSpecifier::parse("file:///oj/ws_connect.js")
             .map_err(|e| RunError::Core(CoreError::from(std::io::Error::other(e.to_string()))))?;
         let mut rt = self
-            .checkout_armed(RequestInfo::default(), WS_CONNECT_TIMEOUT, None)
+            .checkout_armed(
+                RequestInfo::default(),
+                WS_CONNECT_TIMEOUT,
+                None,
+                &self.pool.stable().assembly_snapshot(),
+            )
             .await?;
         // 顺序同 run_side_driver（0.410 签名）：mod_evaluate 先启动、驱动 event loop、
         // 再 await 求值 future 取 TLA/import 错误。
@@ -1443,7 +1497,12 @@ impl Bridge {
         let driver_spec = deno_core::ModuleSpecifier::parse("file:///oj/task_connect.js")
             .map_err(|e| RunError::Core(CoreError::from(std::io::Error::other(e.to_string()))))?;
         let mut rt = self
-            .checkout_armed(RequestInfo::default(), WS_CONNECT_TIMEOUT, None)
+            .checkout_armed(
+                RequestInfo::default(),
+                WS_CONNECT_TIMEOUT,
+                None,
+                &self.pool.stable().assembly_snapshot(),
+            )
             .await?;
         let result: Result<(), CoreError> = async {
             let id = rt.load_side_es_module_from_code(&driver_spec, code).await?;
@@ -1497,7 +1556,13 @@ impl Bridge {
         );
         let code = driver_script(&body);
         let cap = self
-            .run_side_driver(RequestInfo::default(), code, INTROSPECT_TIMEOUT, None)
+            .run_side_driver(
+                RequestInfo::default(),
+                code,
+                INTROSPECT_TIMEOUT,
+                None,
+                self.pool.stable().assembly_snapshot(),
+            )
             .await?;
         let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap_or_default();
         Ok(v["data"]["loop"].as_bool() == Some(true))
@@ -1598,16 +1663,19 @@ impl Bridge {
                 raw: false,
             });
         }
+        // 快照先于祖先命中（v0.1.122）：module 与钉进 ReqState 的快照同一代——
+        // 命中查表与请求全程读的是同一份 PerGenAssembly，请求中途换代不混代。
+        let assembly = stable.assembly_snapshot();
         let mut module: Option<&ModuleCtx> = None;
         let mut anc = api_path.parent();
         while let Some(d) = anc {
-            if let Some(ctx) = stable.modules.get(&d.to_string_lossy().into_owned()) {
+            if let Some(ctx) = assembly.modules.get(&d.to_string_lossy().into_owned()) {
                 module = Some(ctx);
                 break;
             }
             anc = d.parent();
         }
-        self.run_side_driver(req, code, timeout, module).await
+        self.run_side_driver(req, code, timeout, module, assembly.clone()).await
     }
 
     /// 启动期内省：import api 模块，**递归**遍历 default 导出的键（v0.1.64 嵌套 handler 组），
@@ -1727,7 +1795,13 @@ impl Bridge {
         );
         let code = driver_script(&body);
         let cap = self
-            .run_side_driver(RequestInfo::default(), code, INTROSPECT_TIMEOUT, None)
+            .run_side_driver(
+                RequestInfo::default(),
+                code,
+                INTROSPECT_TIMEOUT,
+                None,
+                self.pool.stable().assembly_snapshot(),
+            )
             .await?;
         let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap_or_default();
         Ok(v["data"].clone())
@@ -1746,7 +1820,13 @@ impl Bridge {
         );
         let code = driver_script(&body);
         let cap = self
-            .run_side_driver(RequestInfo::default(), code, INTROSPECT_TIMEOUT, None)
+            .run_side_driver(
+                RequestInfo::default(),
+                code,
+                INTROSPECT_TIMEOUT,
+                None,
+                self.pool.stable().assembly_snapshot(),
+            )
             .await?;
         let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap_or_default();
         Ok(v["data"].clone())
@@ -1781,8 +1861,9 @@ impl Bridge {
         code: String,
         timeout: std::time::Duration,
         module: Option<&ModuleCtx>,
+        assembly: Arc<PerGenAssembly>,
     ) -> Result<Capture, RunError> {
-        let mut rt = self.checkout_armed(req, timeout, module).await?;
+        let mut rt = self.checkout_armed(req, timeout, module, &assembly).await?;
         // `__ojRun` catch 后经 op_driver_error 回传；promise 恒 resolve，event loop
         // 排空即完成——错误通道走 ReqState.driver_error（不再有 mod_evaluate future）。
         let result: Result<(), CoreError> = async {

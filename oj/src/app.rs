@@ -29,7 +29,9 @@ use only_js::bridge::{
     Bridge, EsBackend, Extras, InMemoryKV, JwtCfg, KVStore, LoaderShared, ModuleCtx, ModuleIndex,
     NamedRegistry, SchemaRegistry,
 };
-use only_js::bridge::{EventBroker, SqlGuard, StableState};
+use only_js::bridge::{
+    AssemblySlot, EventBroker, PerGenAssembly, SqlGuard, StableState,
+};
 use only_js::config::{self, Config};
 use only_js::contract::{InputContract, InputContractRegistry};
 use serve::CertificateStatus;
@@ -1597,6 +1599,15 @@ pub async fn assemble_backend(
     // reload not available，fail-closed）。解析成 owned Arc——工厂闭包 Extras 与
     // StableState 注入同一 Arc，槽指针构造期冻结、内容由装配层后填。
     let reload_slot = reload_slot.unwrap_or_else(|| Arc::new(std::sync::OnceLock::new()));
+    // 单实例换代槽（v0.1.122 D3）：registry/modules/tenant 旗标打包单指针，
+    // make_bridge_of 与 Backend 共享同一 Arc —— 热更 swap 后全 Bridge 同步可见。
+    let assembly_slot: AssemblySlot = Arc::new(std::sync::RwLock::new(Arc::new(PerGenAssembly {
+        registry: Arc::new(registry.clone()),
+        modules: modules.clone(),
+        sql_guard,
+        ownership_deny,
+        allow_as_tenant: cfg.tenant.allow_as_tenant,
+    })));
     let make_bridge_of = {
         let (dbs, kv, loader, es, bus) = (
             dbs.clone(),
@@ -1612,6 +1623,8 @@ pub async fn assemble_backend(
             (registry.clone(), modules.clone(), ownership_deny);
         // 影子绑定：`move` 捕获的是这里的副本，外层 `boot` 仍可供后续 StableState 使用。
         let plugins = (*plugin_infos).clone();
+        // 换代槽（v0.1.122 D3）：闭包与 Backend 共享同一 Arc。
+        let assembly_slot = assembly_slot.clone();
         let boot = boot.clone();
         let jwt = jwt.clone();
         let oidc = oidc.clone();
@@ -1664,6 +1677,9 @@ pub async fn assemble_backend(
                 false,
                 Some(loader.clone()),
                 Extras {
+                    // 换代槽（v0.1.122 D3）：Some = registry/modules/tenant 旗标全部走槽
+                    // （StableState.with_dbs_and_loader 的 extras 回退臂不生效）。
+                    assembly: Some(assembly_slot.clone()),
                     module_index: module_index.clone(),
                     blobs: blobs.clone(),
                     es: es.clone(),
@@ -1735,7 +1751,9 @@ pub async fn assemble_backend(
         kv: kv.clone(),
         seq_ensured: std::sync::Mutex::new(std::collections::HashSet::new()),
         dbs: dbs.clone(),
-        registry: Arc::new(registry),
+        // registry/modules/tenant 旗标（v0.1.122 D3）迁移进换代槽：读写统一走
+        // stable.assembly_snapshot() / swap_assembly()。
+        assembly: assembly_slot,
         loader: Some(loader.clone()),
         module_index: module_index.clone(),
         blobs: blobs
@@ -1744,10 +1762,6 @@ pub async fn assemble_backend(
         bus: bus.clone(),
         es: es.clone(),
         plugins: (*plugin_infos).clone(),
-        modules,
-        ownership_deny,
-        sql_guard,
-        allow_as_tenant: cfg.tenant.allow_as_tenant,
         db_override: profiles.db.clone(),
         query_limits,
         sql_trace,

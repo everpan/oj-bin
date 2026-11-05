@@ -756,7 +756,13 @@ async fn oj_require_cjs_interop_end_to_end() {
     let stable = Arc::new(StableState {
         kv: Arc::new(InMemoryKV::new()),
         dbs: HashMap::new(),
-        registry: Arc::new(SchemaRegistry::new()),
+        assembly: Arc::new(std::sync::RwLock::new(Arc::new(super::PerGenAssembly {
+            registry: Arc::new(SchemaRegistry::new()),
+            modules: Arc::new(HashMap::new()),
+            sql_guard: SqlGuard::Off,
+            ownership_deny: false,
+            allow_as_tenant: false,
+        }))),
         input_contracts: None, // 单测路径不注入契约（默认不校验）
         seq_ensured: std::sync::Mutex::new(std::collections::HashSet::new()),
         secret_keys: None,
@@ -769,10 +775,6 @@ async fn oj_require_cjs_interop_end_to_end() {
         bus: Arc::new(bus::Bus::new()),
         es: None,
         plugins: Vec::new(),
-        modules: Arc::new(HashMap::new()),
-        ownership_deny: false,
-        sql_guard: SqlGuard::Off,
-        allow_as_tenant: false,
         db_override: None,
         query_limits: query::QueryLimits::default(),
         sql_trace: sql_trace::SqlTraceConfig::default(),
@@ -2825,4 +2827,52 @@ async fn inspector_checkout_resets_privileged_container() {
         PermissionState::Granted,
         "root must stay reachable"
     );
+}
+
+// ----- PerGenAssembly 换代槽（v0.1.122 热装配：registry/modules/tenant 旗标单指针换代） -----
+
+/// Extras 默认（槽 None）→ 由 registry 参数 + Extras fallback 字段包初代槽：
+/// oj test / 嵌入式（无装配层穿参）路径必须照旧可用。
+#[test]
+fn slot_fallback_from_registry_and_extras() {
+    let registry = SchemaRegistry::new().table("user", &["id"], &["id", "name"]);
+    let db = Arc::new(InMemoryAccessor::new());
+    let b = Bridge::with_opts(db, Arc::new(InMemoryKV::new()), registry, false);
+    let snap = b.stable_for_test().assembly_snapshot();
+    assert!(snap.registry.has_table("user"));
+    assert!(snap.modules.is_empty());
+    assert_eq!(snap.sql_guard, SqlGuard::Off);
+    assert!(!snap.ownership_deny);
+    assert!(!snap.allow_as_tenant);
+}
+
+/// swap_assembly 后快照读到新代：registry 白名单、modules 表、tenant 旗标同代一致。
+#[test]
+fn swap_assembly_visible_in_snapshot() {
+    let db = Arc::new(InMemoryAccessor::new());
+    let b = Bridge::with_opts(db, Arc::new(InMemoryKV::new()), SchemaRegistry::new(), false);
+    let stable = b.stable_for_test();
+    assert!(!stable.assembly_snapshot().registry.has_table("order"));
+    let mut modules = std::collections::HashMap::new();
+    modules.insert(
+        "/x/order-1.0.0".to_string(),
+        ModuleCtx {
+            name: "order".into(),
+            version: "1.0.0".into(),
+            deps: Arc::new(std::collections::HashSet::new()),
+            db: None,
+        },
+    );
+    stable.swap_assembly(PerGenAssembly {
+        registry: Arc::new(SchemaRegistry::new().table("order", &["id"], &["id"])),
+        modules: Arc::new(modules),
+        sql_guard: SqlGuard::Deny,
+        ownership_deny: true,
+        allow_as_tenant: true,
+    });
+    let snap = stable.assembly_snapshot();
+    assert!(snap.registry.has_table("order"));
+    assert_eq!(snap.modules.get("/x/order-1.0.0").unwrap().name, "order");
+    assert_eq!(snap.sql_guard, SqlGuard::Deny);
+    assert!(snap.ownership_deny && snap.allow_as_tenant);
 }
