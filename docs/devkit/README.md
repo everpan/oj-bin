@@ -40,6 +40,11 @@ cp bin/devkit/global.d.ts bin/devkit/oj-modules.d.ts .                       # �
 手册与 skill 随 oj 版本一起发布。升级 oj 后，用新包里的 `devkit/` 覆盖旧拷贝即可。
 源文件与反馈入口在仓库 `docs/devkit/`。
 
+v0.1.124 已落地部分：**reload force 值口径收紧**——裸 `?force`（query 中无 `=` 的旗）
+视同**未强制**（fail-closed：未记载的输入绝不触发特权强制，对齐「值取 `1`/`true`」的
+既有契约）；并钉死 force+busy 串行——持锁下 `?force=1` 仍 409。契约不变，自动化工具
+请始终发 `force=1`/`force=true`。见 api-manual §10、SKILL 陷阱速查、scenarios 场景 72。
+
 v0.1.123 已落地部分：**reload force 旁路——强制热更不再需要凑 config diff**——
 `POST {base}/_system/config?force=1` 或特权 JS `server.reloadConfig(true)` 跳过 unchanged
 幂等闸门强制影子装配换代（零差异也换代，`applied` 可空；busy 409 与空 body 400 不豁免；

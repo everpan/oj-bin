@@ -2926,7 +2926,7 @@ mounts:
 
 > **保留路径**：`_system` 是平台保留前缀，业务模块勿占用；`{base}/_system/config`（`GET`/`POST`）与 `{base}/_system/health` 由外层 fallback 直接响应，不经业务路由，也不走证书过期门禁（运维换证窗口仍可探活）。
 
-**触发**：`POST {base}/_system/config`（**空 body**，非空 body 一律 400，`?force=1` 不豁免），或特权模块在 JS 侧调 `server.reloadConfig(force?)`（同一 executor 实例与同一把串行锁，见「server」一节）。**`?force=1`（v0.1.123）**：query 取 `force=1`/`force=true`（值不区分大小写，键名精确匹配；其余值 `force=0`/`force=yes` 等视同未强制）——跳过幂等闸门强制换代。服务端重新 `load_cfg` → `fold_cli_mounts` 重放 CLI 覆盖 → 证书/公钥路径重放 → `admission_gate`，再与当前代做幂等/段 diff：
+**触发**：`POST {base}/_system/config`（**空 body**，非空 body 一律 400，`?force=1` 不豁免），或特权模块在 JS 侧调 `server.reloadConfig(force?)`（同一 executor 实例与同一把串行锁，见「server」一节）。**`?force=1`（v0.1.123）**：query 取 `force=1`/`force=true`（值不区分大小写，键名精确匹配；其余值 `force=0`/`force=yes` 等视同未强制；裸旗 `?force`——query 中只有键没有 `=`——同样视同未强制，v0.1.124 收紧：未记载的输入绝不触发特权强制）——跳过幂等闸门强制换代。服务端重新 `load_cfg` → `fold_cli_mounts` 重放 CLI 覆盖 → 证书/公钥路径重放 → `admission_gate`，再与当前代做幂等/段 diff：
 
 - **幂等**：归一后落盘文件 sha256 **与 manifests 锁（`dist/manifests.yaml`，release 树）双双未变** → 返回 `{"code":0,"msg":"unchanged","generation":<n>}`，不装配、不 swap。（v0.1.122 起锁纳入变化检测：只改锁不改 config 也会触发装配——装/卸模块免重启的检测面。）`unchanged` 的语义是「**活代已与盘上一致**」（闸门状态只在 commit 成功时更新）——调用方（如安装器）应把它当**幂等成功**处理，要强制重装配用 `?force=1`，不要改 config 凑 diff。force 不改变闸门基线。
 - **段 diff 三清单**（每次成功 swap 返回）：

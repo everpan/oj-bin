@@ -16,6 +16,16 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.124（2026-11-05）
+
+- **fix（serve，reload force 值口径收紧）**：裸 `?force`（query 中只有键、无 `=` 的旗）
+  此前被视同强制——与对外文档「值取 `1`/`true`」的契约相悖且未记载（v0.1.123 终审
+  M1）。收紧为**未强制**（fail-closed：未记载的输入绝不触发特权强制换代）。文档契约
+  本就如此声明，调用方无需变更；自动化工具请始终发 `force=1`/`force=true`。
+- **test（serve，force+busy 串行钉死）**：持锁下 `trigger(true)`/`trigger_sync(true)`
+  仍 409——force 仅在 `try_lock` 之后消费，串行化优先于强制旁路；`query_flag` 用例补
+  裸旗断言（终审 M3）。
+
 ## v0.1.123（2026-11-05）
 
 **feat（serve/oj，reload force 旁路）**：`POST {base}/_system/config?force=1`（取值

@@ -4710,5 +4710,6 @@ curl -X POST 'http://127.0.0.1:9778/v1/api/_system/config'   # → msg:"unchange
 - **force 不是重试键**：busy（并发 409）与空 body 校验（400）不豁免；并发触发仍会
   撞锁，与普通 reload 同语义。
 - **force 值口径**：query 取 `1`/`true`（值不区分大小写、键名精确匹配）；`force=0`/
-  `force=yes` 等一律视同未强制——别指望 `force=yes` 生效。
+  `force=yes` 等一律视同未强制——别指望 `force=yes` 生效；裸 `?force`（无 `=` 的旗）
+  同样不算强制（v0.1.124 收紧）——自动化工具请始终发 `force=1`。
 - **JS 面缺省即旧语义**：`reloadConfig()` 不带参 = 未强制，行为与 v0.1.122 逐字一致。
