@@ -1630,6 +1630,8 @@ server.reloadConfig(): Promise<{
 | `server.reloadConfig: reload in progress (busy)` | 并发触发撞串行锁（HTTP 侧同语义 409） |
 | `server.reloadConfig: HTTP 400: <原因>` | 归一/装配失败（旧代继续服务，不破坏在跑实例） |
 | `server.reloadConfig: HTTP 400: platform module '<name>' must not be hot-installed …`（v0.1.122） | 热装 `platform.modules` 特权名被抢注拦截——特权模块只能放入 `platform.root` 后重启（失败零副作用，代际不动） |
+| `server.reloadConfig: HTTP 500: old task pool did not stop within 10s — reload aborted`（下一版） | 旧代任务池停滞超时——reload 拒绝、代际不动；已闭门装配的新代任务**就地收场**（置位换代 flag + 停池 join，不泄漏空转线程），旧代继续服务 |
+| `server.reloadConfig: HTTP 500: spawn cron-driver: …`（下一版） | cron driver 线程拉起失败（线程资源耗尽）——装配中止、旧代继续服务（**不静默降级**为无 cron 运行） |
 
 ### bus —— 订阅发布
 
@@ -2947,7 +2949,7 @@ mounts:
 **限制（v1 边界）**：
 - 热更**复用首代已建立的连接池与插件后端**——不重建后端、不二次 `init` 插件、迁移强制 `verify`-only（dev 默认 `auto` 会打生产库，故热更路径强制 `verify`）、不重放 seed。需要新后端/新迁移的改动请走 `restart_pending` 提示并**重启进程**。
 - 触发源是**落盘配置文件**：进程生命周期内 CLI 覆盖（`--api-path`/`--cert-path`）不变，故以文件内容为热更真触发源。改文件 → `POST` 即生效。
-- 装配失败（如 `admission_gate` 不通过、新模块编译错、热装特权名抢注）→ `POST` 返回 400 + 原因，**旧代继续服务**（失败不破坏在跑实例，代际不动）；任务池交接为先建新池 fail-fast、再停旧池，新池建不起来则旧池仍跑（回滚完整）。
+- 装配失败（如 `admission_gate` 不通过、新模块编译错、热装特权名抢注）→ `POST` 返回 400 + 原因，**旧代继续服务**（失败不破坏在跑实例，代际不动）；任务池交接为先建新池 fail-fast（cron driver 拉起失败同样中止，不静默无 cron）、再停旧池，新池建不起来则旧池仍跑（回滚完整）；旧池 **10s** 内停不下来 / join 失败 → 500 `old task pool did not stop within 10s — reload aborted`，已闭门装配的新代任务**就地收场**（置位换代 flag + 停池 join，不泄漏空转线程），代际不动。
 
 | `reload_api` | `false` | （v1 配置热更新）开启后 `oj serve` 走「永生 listener + 外层单一 fallback」形态：监听 `POST {base}/_system/config` 触发热更、`GET {base}/_system/config` 看当前代际、`GET {base}/_system/health` 看健康 + 代际。详见下「配置热更新（reload_api）」。关闭则维持原 `serve_graceful` 行为（零变化） |
 
@@ -3427,6 +3429,7 @@ ldap:                            # 不透明段里的 bind_pw 同样支持
 | release 下迁移账本落后（verify 门禁） | M004 拒启，报错附 `oj migrate` 命令 |
 | `ext_boot.js` 存在但语法错/导入失败/顶层 await 抛错 | 启动期预热即 `ext_boot: …` 退出（服务不监听） |
 | crontab.yaml 坏行（非 5 字段 cron + 路径 / 路径不存在） | fail-fast 退出，报错带 `:行号:`（v0.1.28） |
+| cron driver 线程拉起失败（线程资源耗尽） | **不静默降级**：启动期 fail-fast 退出 / reload 500，报错 `spawn cron-driver: …`（下一版；旧版 eprintln 吞错会静默无 cron） |
 | `server.cors.credentials: true` 且 `server.cors.origins` 为空 | `cors: credentials requires explicit origins (wildcard '*' is rejected by browsers)` 退出（v0.1.35；带凭据的 `*` 非法）。其余字段缺省回落安全值 |
 | `platform.modules` 非空但 `platform.root` 缺失 / root 未列为 api mount / 与其他挂载树同径或父子 / 名单悬空 | platform 段装配 fail-fast 退出（v0.1.75，报错原文见 §10「platform」——抢注绊线必须在装配期生效，运行期拦截为时已晚） |
 | `platform.trusted_paths` 条目不存在 | `platform.trusted_paths canonicalize failed (…): …` 退出（v0.1.75） |
