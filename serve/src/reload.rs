@@ -352,15 +352,14 @@ async fn handle_config(
 }
 
 /// query 布尔解析：`key` 取 `1`/`true`（值不区分大小写）= true；键名精确匹配
-/// （HTTP query 惯例），其余值/缺省/无 query = false。
+/// （HTTP query 惯例），其余值/裸旗（无 `=`）/缺省/无 query = false——未记载的
+/// 输入绝不触发特权强制（fail-closed，v0.1.124）。
 fn query_flag(query: Option<&str>, key: &str) -> bool {
-    query
-        .unwrap_or("")
-        .split('&')
-        .any(|kv| match kv.split_once('=') {
-            Some((k, v)) => k == key && matches!(v.to_ascii_lowercase().as_str(), "1" | "true"),
-            None => kv == key,
+    query.unwrap_or("").split('&').any(|kv| {
+        kv.split_once('=').is_some_and(|(k, v)| {
+            k == key && matches!(v.to_ascii_lowercase().as_str(), "1" | "true")
         })
+    })
 }
 
 /// outcome → HTTP 响应（唯一映射点；v1 线上行为逐字节不变）：
@@ -421,6 +420,7 @@ mod tests {
         assert!(!super::query_flag(Some("force=0"), "force"));
         assert!(!super::query_flag(Some("force="), "force"));
         assert!(!super::query_flag(Some("force=yes"), "force"));
+        assert!(!super::query_flag(Some("force"), "force")); // 裸旗（无值）= 未强制（v0.1.124 收紧）
         assert!(!super::query_flag(Some("other=1&x=2"), "force"));
         assert!(!super::query_flag(None, "force"));
     }
@@ -447,7 +447,8 @@ mod tests {
         }
     }
 
-    /// 撞 reload_lock → busy（共享串行化语义，HTTP 与 JS 同一把锁）。
+    /// 撞 reload_lock → busy（共享串行化语义，HTTP 与 JS 同一把锁）；
+    /// force 不豁免串行锁（v0.1.124 钉死——force 仅在 try_lock 之后消费）。
     #[tokio::test(flavor = "current_thread")]
     async fn trigger_busy_when_reload_lock_held() {
         let rs = state();
@@ -459,6 +460,11 @@ mod tests {
         let e = rs.trigger_sync(false).unwrap_err();
         assert_eq!(e.0, 409);
         assert_eq!(e.1, "reload in progress");
+        // force=true 同样 busy：串行化优先于强制旁路。
+        let e = rs.trigger(true).await.unwrap_err();
+        assert_eq!(e.0, 409);
+        let e = rs.trigger_sync(true).unwrap_err();
+        assert_eq!(e.0, 409);
     }
 
     /// executor 缺席 → 503；注入后 async/sync 两形态同源。
