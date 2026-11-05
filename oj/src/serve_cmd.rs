@@ -567,15 +567,23 @@ async fn do_reload(ctx: &HotReloadCtx) -> Result<serve::reload::ReloadOutcome, (
                 s.shutdown();
             }
         });
-        tokio::time::timeout(std::time::Duration::from_secs(10), stop_old)
-            .await
-            .map_err(|_| {
-                (
-                    500u16,
-                    "old task pool did not stop within 10s — reload aborted".to_string(),
-                )
-            })?
-            .map_err(|e| (500u16, format!("join old task pool: {e}")))?;
+        let outcome = match tokio::time::timeout(std::time::Duration::from_secs(10), stop_old).await
+        {
+            Ok(r) => r.map_err(|e| (500u16, format!("join old task pool: {e}"))),
+            Err(_) => Err((
+                500u16,
+                "old task pool did not stop within 10s — reload aborted".to_string(),
+            )),
+        };
+        if let Err(e) = outcome {
+            // 交接中断（旧池 10s 未停 / join Err）：新代已闭门装配 → 就地收场
+            // （置位换代 flag 放出 hold 线程 + 停池 join），防闭门线程泄漏空转
+            // （spec D5 ③ / 终审 Finding 1）；本次 reload 照常拒绝。
+            let flag = new_flag.clone();
+            let _ =
+                tokio::task::spawn_blocking(move || crate::tasks::abort_tasking(t, &flag)).await;
+            return Err(e);
+        }
         // 旧代收场 → 放闸：新代 cron / Worker / TLA 任务开工（恰在此刻，无双发窗口）。
         resume.store(true, std::sync::atomic::Ordering::SeqCst);
         t

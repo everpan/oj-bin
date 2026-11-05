@@ -116,7 +116,7 @@ impl TaskSupervisor {
         backoff_base: Duration,
     ) -> Result<Self, String> {
         let grace = Duration::from_secs(cfg.stop_grace_secs);
-        let mut handles = Vec::with_capacity(tasks.len());
+        let mut handles: Vec<TaskHandle> = Vec::with_capacity(tasks.len());
         for (name, path) in tasks {
             eprintln!(
                 "task: {name} ({}) → started",
@@ -137,7 +137,15 @@ impl TaskSupervisor {
                         task_loop(&name, &path, make_bridge, flag, grace, backoff_base)
                     }
                 })
-                .map_err(|e| format!("spawn task {name}: {e}"))?;
+                .map_err(|e| {
+                    // 半装配自清（终审 Finding 1 同族）：线程拉起失败 → 置位停机
+                    // flag 放出已 hold 线程 + join 已拉起句柄，防闭门泄漏。
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    for h in std::mem::take(&mut handles) {
+                        let _ = h.join.join();
+                    }
+                    format!("spawn task {name}: {e}")
+                })?;
             handles.push(TaskHandle { name, join: j });
         }
         eprintln!("task: {} task(s) → started", handles.len());
@@ -225,6 +233,20 @@ pub struct Tasking {
     pub sup: Option<TaskSupervisor>,
     /// 池化任务执行体（含 cron 一次性作业派发；无池化/cron 任务 = None）。
     pub pool: Option<Arc<only_js::bridge::task_pool::TaskPool>>,
+}
+
+/// 交接失败兜底（v0.1.122 终审 Finding 1，spec D5 ③）：新代已闭门装配但交接
+/// 中断（旧池停机超时 / join Err）→ 就地收场新代——置位换代 flag 放出 hold 的
+/// TLA / cron driver 线程，再停池 join 全部 Worker。阻塞调用，宜在 blocking
+/// 上下文；调用方即放弃该代（reload 以 Err 拒绝），无指针移动、无副作用。
+pub(crate) fn abort_tasking(mut t: Tasking, flag: &Arc<AtomicBool>) {
+    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    if let Some(p) = t.pool.take() {
+        p.shutdown_and_join();
+    }
+    if let Some(s) = t.sup.take() {
+        s.shutdown();
+    }
 }
 
 /// 任务域装配（PRD v2 §9 阶段 1）：扫描 → 探测 loop_body 导出分流（池化/TLA）→
@@ -1134,6 +1156,95 @@ mod tests {
         }
         flag.store(true, Ordering::Relaxed);
         pool.shutdown_and_join();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// BDD（终审 Finding 1，spec D5 ③）：交接中断（旧池停机超时 / join Err）时
+    /// 新代已闭门装配 —— 兜底收场必须放出全部 hold 线程（Worker / cron driver /
+    /// TLA）并 join，闭门线程不得泄漏空转；且 cron 恰不触发（gate 未开、flag 先落）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_closed_gate_new_pool_when_handover_aborts_then_all_threads_wound_down() {
+        use only_js::bridge::KVStore;
+        let d = tmpdir("abort-handover");
+        std::fs::create_dir_all(d.join("tasks/task")).unwrap();
+        std::fs::create_dir_all(d.join("tasks/jobs")).unwrap();
+        std::fs::write(
+            d.join("tasks/task/crontab.yaml"),
+            "0 3 * * * ./jobs/tick.ts\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("tasks/jobs/tick.ts"),
+            "const n = Number((await kv.get(\"cron:n\")) ?? \"0\");\n\
+             await kv.set(\"cron:n\", String(n + 1));\n",
+        )
+        .unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        let kv = Arc::new(only_js::bridge::InMemoryKV::new());
+        let make_bridge = {
+            let kv = kv.clone();
+            let flag = flag.clone();
+            let root = d.clone();
+            Arc::new(move || {
+                only_js::bridge::Bridge::with_dbs_and_loader(
+                    HashMap::new(),
+                    kv.clone(),
+                    SchemaRegistry::new(),
+                    false,
+                    Some(Arc::new(only_js::bridge::LoaderShared {
+                        project_root: root.clone(),
+                        ts: true,
+                    })),
+                    only_js::bridge::Extras {
+                        tasks_flag: Some(flag.clone()),
+                        ..Default::default()
+                    },
+                )
+            }) as Arc<dyn Fn() -> Bridge + Send + Sync>
+        };
+        // 闭门新代 + 近未来触发点：driver 在门口悬着，收场不得让它开火。
+        let resume = Arc::new(AtomicBool::new(false));
+        let tasking = assemble_tasking(
+            &cfg("tasks", 64),
+            &d,
+            make_bridge,
+            flag.clone(),
+            resume.clone(),
+        )
+        .unwrap();
+        let pool = tasking
+            .pool
+            .clone()
+            .expect("cron entry must assemble a pool");
+        assert!(pool.registry.set_next_run(
+            "tick",
+            Some(std::time::SystemTime::now() + Duration::from_millis(300))
+        ));
+        // 交接中断 → 兜底（blocking 上下文执行：shutdown_and_join 阻塞 join）。
+        let flag2 = flag.clone();
+        let jh = std::thread::spawn(move || abort_tasking(tasking, &flag2));
+        // 有界等待 join 完成：闭门线程任一泄漏即此处超时 panic。
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !jh.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "abort_tasking must wind down all gate-held threads"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        jh.join().unwrap();
+        // 收场后 cron 不得触发（放闸前 flag 已置位，驱动退出）。
+        let deadline = Instant::now() + Duration::from_millis(800);
+        while Instant::now() < deadline {
+            let n = kv
+                .get("cron:n")
+                .await
+                .unwrap()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            assert_eq!(n, 0, "aborted generation must not fire cron");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 }
