@@ -464,13 +464,13 @@ fn build_reload_executor(ctx: Arc<HotReloadCtx>) -> serve::reload::ReloadExecuto
 }
 
 /// 单次热更全流程（§5）：归一 → 影子装配（复用后端）→ 任务池交接 → swap + 三清单。
-/// `force=true`（v0.1.123）：跳过 unchanged 幂等闸门强制换代（applied 可空）——
-/// `?force=1` / `reloadConfig(force)` 同源；Task 2 接线闸门，此参暂占位。
+/// `force=true`（v0.1.123）：跳过 unchanged 幂等闸门强制影子装配换代（applied
+/// 可空、`unchanged` 恒 false）——`?force=1` / `reloadConfig(force)` 同源；
+/// force 不改变闸门基线（commit 后 current_* 照常更新）。
 async fn do_reload(
     ctx: &HotReloadCtx,
     force: bool,
 ) -> Result<serve::reload::ReloadOutcome, (u16, String)> {
-    let _ = force; // TODO(v0.1.123 Task 2): 闸门消费，届时移除
     // ① 归一：load_cfg（解密→类型→mounts→legacy 键）→ fold_cli_mounts 重放 →
     //    cert/key 覆盖重放 → admission_gate。
     let (mut cfg, _, _) = load_cfg(ctx.args.config.as_deref(), true).map_err(|e| (400u16, e))?;
@@ -489,6 +489,7 @@ async fn do_reload(
     let sha = doc_sha(&doc).map_err(|e| (400u16, e))?;
     // 幂等（v0.1.122 D1）：config sha 与 manifests 锁**双双未变**才 unchanged
     // （不装配、不 swap）。只看 sha 会漏「config 未动、锁变」的装/卸（卸载空转）。
+    // force=true 跳过本闸门（v0.1.123）。
     let cur_gen = ctx.committer().await.generation().await;
     let sha_same = {
         let cur = ctx.current_sha.lock().await;
@@ -500,7 +501,7 @@ async fn do_reload(
         let cur = ctx.current_locks.lock().await;
         !locks_changed(&cur, &new_locks)
     };
-    if sha_same && locks_same {
+    if !force && sha_same && locks_same {
         return Ok(serve::reload::ReloadOutcome {
             generation: cur_gen,
             applied: vec![],

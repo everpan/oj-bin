@@ -2256,6 +2256,31 @@ async fn given_reload_api_when_post_config_then_swaps_and_reports_diff() {
     assert_eq!(body["msg"].as_str(), Some("unchanged"), "{body}");
     assert_eq!(body["generation"].as_u64(), Some(1), "{body}");
 
+    // force 旁路（v0.1.123）：?force=1 零改动仍强制换代——applied 空、代际推进。
+    let (st, body) = req(addr, "POST", "/v1/api/_system/config?force=1", None).await;
+    assert_eq!(st, 200, "force post ok");
+    assert_ne!(body["msg"].as_str(), Some("unchanged"), "{body}");
+    assert_eq!(body["data"]["applied"], serde_json::json!([]), "{body}");
+    let gen_forced = body["data"]["generation"].as_u64().expect("generation");
+    assert!(gen_forced > 1, "generation must advance on force: {body}");
+    // force 不污染闸门基线：随后无 force 无改动 → 恢复 unchanged。
+    let (st, body) = req(addr, "POST", "/v1/api/_system/config", None).await;
+    assert_eq!(st, 200, "post-force idempotent");
+    assert_eq!(body["msg"].as_str(), Some("unchanged"), "{body}");
+    // 非 1/true 值 = 未强制。
+    let (st, body) = req(addr, "POST", "/v1/api/_system/config?force=0", None).await;
+    assert_eq!(st, 200);
+    assert_eq!(body["msg"].as_str(), Some("unchanged"), "{body}");
+    // ?force=1 不豁免空 body 校验。
+    let (st, _) = req(
+        addr,
+        "POST",
+        "/v1/api/_system/config?force=1",
+        Some(r#"{"x":1}"#),
+    )
+    .await;
+    assert_eq!(st, 400, "force must not bypass empty-body rule");
+
     // 停机。
     let _ = std::process::Command::new("kill")
         .arg("-TERM")

@@ -309,7 +309,9 @@ async fn handle_config(
             .into_response()
         }
         Method::POST => {
-            // 无 body：非空 body 拒收 400。
+            // `?force=1`（v0.1.123）：query 在 `into_body` 消耗 `req` 前取出。
+            let force = query_flag(req.uri().query(), "force");
+            // 无 body：非空 body 拒收 400（force 不豁免）。
             let body = match axum::body::to_bytes(req.into_body(), 1024).await {
                 Ok(b) => b,
                 Err(e) => {
@@ -336,8 +338,7 @@ async fn handle_config(
             // JS 侧经 spawn_blocking 调用（executor 同步闭包，Send+Sync 已成立）；
             // **既定语义**：触发 reload 的 handler 所在 actor 在热更期间被占用
             // （秒级，DB verify + 转译），完成前不归还池。
-            match rs.trigger(false).await {
-                // TODO(v0.1.123 Task 2): 改 `rs.trigger(query_flag(...))`——`?force=1` 接线。
+            match rs.trigger(force).await {
                 Ok(outcome) => outcome_response(outcome),
                 Err((status, msg)) => (
                     StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
@@ -348,6 +349,18 @@ async fn handle_config(
         }
         _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
     }
+}
+
+/// query 布尔解析：`key` 取 `1`/`true`（值不区分大小写）= true；键名精确匹配
+/// （HTTP query 惯例），其余值/缺省/无 query = false。
+fn query_flag(query: Option<&str>, key: &str) -> bool {
+    query
+        .unwrap_or("")
+        .split('&')
+        .any(|kv| match kv.split_once('=') {
+            Some((k, v)) => k == key && matches!(v.to_ascii_lowercase().as_str(), "1" | "true"),
+            None => kv == key,
+        })
 }
 
 /// outcome → HTTP 响应（唯一映射点；v1 线上行为逐字节不变）：
@@ -396,6 +409,21 @@ mod tests {
     use super::*;
 
     use std::time::Duration;
+
+    /// `force` query 解析口径（v0.1.123）：值 `1`/`true`（不区分大小写）= 强制，
+    /// 其余值/缺省/无 query = 未强制；键名精确匹配（大小写敏感）。
+    #[test]
+    fn query_flag_parses_force_values() {
+        assert!(super::query_flag(Some("force=1"), "force"));
+        assert!(super::query_flag(Some("force=true"), "force"));
+        assert!(super::query_flag(Some("force=TRUE"), "force")); // 值不区分大小写
+        assert!(!super::query_flag(Some("FORCE=TRUE"), "force")); // 键名精确匹配
+        assert!(!super::query_flag(Some("force=0"), "force"));
+        assert!(!super::query_flag(Some("force="), "force"));
+        assert!(!super::query_flag(Some("force=yes"), "force"));
+        assert!(!super::query_flag(Some("other=1&x=2"), "force"));
+        assert!(!super::query_flag(None, "force"));
+    }
 
     fn state() -> Arc<ReloadState> {
         ReloadState::new(
@@ -460,8 +488,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn trigger_propagates_executor_error() {
         let rs = state();
-        rs.set_executor(Arc::new(|_force: bool| Err((400u16, "bad config".to_string()))))
-            .await;
+        rs.set_executor(Arc::new(|_force: bool| {
+            Err((400u16, "bad config".to_string()))
+        }))
+        .await;
         let e = rs.trigger(false).await.unwrap_err();
         assert_eq!(e.0, 400);
         assert_eq!(e.1, "bad config");
