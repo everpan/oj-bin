@@ -60,10 +60,21 @@ impl PlatformGrant {
     }
 }
 
+/// 命令解析结果：待 execve 的程序 + 固定前置参数（`prog` 之后、用户 argv 之前）。
+/// `fixed` 仅打包形态（OJ-10）非空：`[--library-path, <lib>, <oj.bin>]`，此时
+/// `prog` 为随包 ld-linux——serve 进程映像即加载器，current_exe 不能直接 spawn。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedCommand {
+    pub prog: PathBuf,
+    pub fixed: Vec<std::ffi::OsString>,
+}
+
 /// 命令解析器（DIP，设计稿 §1.1「模板首 token 宿主侧解析」）：模板首 token →
-/// 绝对路径。默认实现 [`crate::bridge::exec::default_resolve_command`]
-/// （`"oj"` → `current_exe()`，其余父进程 PATH 解析）；测试注入哨兵解析器。
-pub type CommandResolver = std::sync::Arc<dyn Fn(&str) -> Result<PathBuf, String> + Send + Sync>;
+/// [`ResolvedCommand`]。默认实现 [`crate::bridge::exec::default_resolve_command`]
+/// （`"oj"` → `current_exe()`，打包形态经随包加载器前缀，其余父进程 PATH 解析）；
+/// 测试注入哨兵解析器。
+pub type CommandResolver =
+    std::sync::Arc<dyn Fn(&str) -> Result<ResolvedCommand, String> + Send + Sync>;
 
 /// exec 授权（config `platform.exec:` 段；阶段 3 `exec.run` 消费）。
 /// resolver 字段不参与 Debug 输出（函数对象），手写实现。
@@ -91,7 +102,7 @@ pub struct ModuleExecGrant {
 
 impl ExecGrant {
     /// 装配期构建：本阶段只搬运形状，不校验模板语法（阶段 3 解析期报错点名）。
-    /// 解析器取生产默认（`"oj"` → current_exe，其余 PATH 解析）。
+    /// 解析器取生产默认（`"oj"` → current_exe / 打包形态经随包加载器，其余 PATH 解析）。
     pub fn new(per_module: BTreeMap<String, (Vec<String>, Vec<String>)>) -> Self {
         Self::with_resolver(
             per_module,

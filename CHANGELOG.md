@@ -16,6 +16,29 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.126（2026-11-08）
+
+**fix（bridge / exec，`"oj"` token 打包形态重定向，OJ-10）**：linux glibc 发行包的 `bin/oj`
+启动器以「ld-linux 作程序」拉起 `oj.bin`（绕开宿主 glibc 版本限制），serve 进程映像是随包
+加载器，`current_exe()` 指向 `ld-linux` 而非可执行体。`exec.run(["oj","migrate",…])` 因此
+spawn 出 `[ld-linux, "migrate", …]`——ld 把 `"migrate"` 当共享对象加载，exit 127（
+`error while loading shared libraries: migrate: cannot open shared object file`），
+`@oj-bin/oj` glibc 包默认启动方式下 `ojm install` 等 `_lifecycle` 迁移全线不可用。
+修复：`"oj"` 解析对齐 `daemon_reexec_cmd`（oj/src/serve_cmd.rs）的既有判定、候选序与
+理由——双闸门（启动器导出的 `OJ_BUNDLED_LD` 在 **且** 进程映像确为 `ld-linux*` /
+`ld-*.so*`；双闸门排除测试进程内并发 `set_var` 的误触发）命中时自动解析为
+`随包 ld-linux --library-path <bin>/lib <bin>/oj.bin`，子链零宿主组件、用户 argv 原样接在
+前缀之后；`oj.bin` 缺失回退 `<bin>/oj` 启动器脚本（kernel shebang），两者皆缺 →
+fail-fast 点名（不静默回落 `current_exe()`，杜绝重放 127）。非打包形态（macOS / Windows /
+musl）行为逐字节不变；`exec.allow` 裸名首 token 与 fail-closed 语义不变；此前部署侧
+`ojmig` 类消费方 wrapper 补丁可撤。`CommandResolver` 返回类型 `PathBuf` →
+`ResolvedCommand { prog, fixed }`（DIP 契约内演化；`fixed` 固定前置参数仅打包形态非空），
+`PreparedExec` 与两个 spawn 点（`op_exec_run` / `op_exec_spawn`）同步消费。
+
+- 测试：`loader_image_detection`（加载器映像判定）、`oj_token_packaged_layout`（双闸门 /
+  打包前缀 / 脚本回退 / Err 点名 / env 缺省直通，tempfile 布局夹具、零 env 变异）。
+- 消费侧联动（oj-module，单独交付）：`ojm vendor` 的 `MIN_OJ_VERSION` 抬高到 ≥ 0.1.126。
+
 ## v0.1.125（2026-11-07）
 
 **feat（oj CLI，`oj migrate --with-seed`）**：为 `oj migrate` 增加 opt-in 旗标

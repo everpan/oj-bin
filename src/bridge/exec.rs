@@ -6,7 +6,8 @@
 //!   （fs.root ∪ trusted_paths，路径校验单点复用，勿复制语义）；
 //! - `${raw:NAME}` 吸收一个 token，拒绝 `-` 开头与绝对形态（防 option/路径注入）；
 //! - 命令名（模板首 token）宿主侧解析为绝对路径（[`default_resolve_command`]，
-//!   `"oj"` 特判 `current_exe`，其余父进程 PATH 解析；win32 下裸名再按 `PATHEXT`
+//!   `"oj"` 特判 `current_exe`（linux glibc 打包形态经随包 ld-linux 前缀重定向到
+//!   oj.bin，OJ-10），其余父进程 PATH 解析；win32 下裸名再按 `PATHEXT`
 //!   补全扩展名（`tar` → `tar.exe`），只搜 PATH 目录、绝不搜 CWD；解析器做成
 //!   `ExecGrant` 字段，测试可注入）；
 //! - cwd = fs.root；env 默认空表仅白名单透传；stdout/stderr 流式读取边计数
@@ -357,6 +358,9 @@ const STREAM_CHANNEL_BOUND: usize = 16;
 /// 不含 spawn/kill_tree——缓冲路径（op_exec_run）与流式路径（op_exec_spawn）共用。
 struct PreparedExec {
     prog: PathBuf,
+    /// 固定前置参数（resolver 解析结果携带；打包形态 oj 为
+    /// `[--library-path, <lib>, <oj.bin>]`），置于 final_argv[1..] 之前。
+    fixed: Vec<std::ffi::OsString>,
     final_argv: Vec<String>,
     env_names: Vec<String>,
     cwd: PathBuf,
@@ -416,7 +420,7 @@ fn prepare_exec(
         template::Token::Lit(s) => s.clone(),
         _ => unreachable!("parse_template enforces a literal command token"),
     };
-    let prog = (exec.resolver)(&first).map_err(|e| {
+    let resolved = (exec.resolver)(&first).map_err(|e| {
         JsErrorBox::generic(format!("exec: command resolve failed for '{first}': {e}"))
     })?;
 
@@ -470,7 +474,8 @@ fn prepare_exec(
         .unwrap_or(DEFAULT_TIMEOUT_MS)
         .min(MAX_TIMEOUT_MS);
     Ok(PreparedExec {
-        prog,
+        prog: resolved.prog,
+        fixed: resolved.fixed,
         final_argv,
         env_names: grant.env.clone(),
         cwd: fs.root.clone(),
@@ -610,6 +615,7 @@ pub async fn op_exec_spawn(
     let opts: ExecOpts = serde_json::from_value(opts).unwrap_or_default();
     let p = prepare_exec(&state, argv, &opts)?;
     let mut cmd = tokio::process::Command::new(&p.prog);
+    cmd.args(&p.fixed);
     cmd.args(&p.final_argv[1..]);
     cmd.current_dir(&p.cwd);
     cmd.env_clear();
@@ -792,6 +798,7 @@ pub async fn op_exec_run(
     let opts: ExecOpts = serde_json::from_value(opts).unwrap_or_default();
     let p = prepare_exec(&state, argv, &opts)?;
     let mut cmd = tokio::process::Command::new(&p.prog);
+    cmd.args(&p.fixed);
     cmd.args(&p.final_argv[1..]);
     cmd.current_dir(&p.cwd);
     cmd.env_clear();
@@ -970,14 +977,16 @@ fn kill_tree(child: &mut tokio::process::Child) {
 
 // ----- 默认命令解析器（ExecGrant 的生产实现；测试经 with_resolver 注入） -----
 
-/// 模板首 token → 绝对路径（设计稿 §1.1「宿主侧解析」）：
-/// - `"oj"` 特判 → `std::env::current_exe()`（serve 进程即 bin/oj，同版本自保证）；
+/// 模板首 token → [`super::platform::ResolvedCommand`]（设计稿 §1.1「宿主侧解析」）：
+/// - `"oj"` 特判 → [`resolve_oj_command`]（serve 进程自身；打包形态经随包加载器）；
 /// - 其余裸名 → 父进程 PATH 逐目录探测（win32 先精确名、再按 `PATHEXT` 补全扩展）；
 /// - 含路径分隔符 → Err（parse 期已拒绝，此处防御性兜底）；
 /// - 只搜 PATH 目录（空条目跳过，防 CWD 隐式劫持），解析失败 → Err 点名。
-pub fn default_resolve_command(name: &str) -> Result<PathBuf, String> {
+pub fn default_resolve_command(name: &str) -> Result<super::platform::ResolvedCommand, String> {
     if name == "oj" {
-        return std::env::current_exe().map_err(|e| format!("current_exe failed: {e}"));
+        let exe = std::env::current_exe().map_err(|e| format!("current_exe failed: {e}"))?;
+        let bundled_ld = std::env::var_os("OJ_BUNDLED_LD").map(PathBuf::from);
+        return resolve_oj_command(&exe, bundled_ld.as_deref());
     }
     if name.contains('/') || name.contains('\\') {
         return Err(format!(
@@ -996,7 +1005,77 @@ pub fn default_resolve_command(name: &str) -> Result<PathBuf, String> {
     #[cfg(not(windows))]
     let exts: Vec<String> = Vec::new();
 
-    search_in_path(name, &dirs, &exts)
+    Ok(super::platform::ResolvedCommand {
+        prog: search_in_path(name, &dirs, &exts)?,
+        fixed: Vec::new(),
+    })
+}
+
+/// `"oj"` token 解析（exe / bundled_ld 注入以便纯函数单测；OJ-10）：
+/// - **双闸门**（`bundled_ld` 在 **且** `exe` 确为加载器映像）→ 打包形态，走
+///   [`packaged_oj_command`]。双闸门是为排除测试进程内并发 `set_var("OJ_BUNDLED_LD")`
+///   的误触发（plugin_loader / serve_cmd 夹具均在测试进程内改该 env，单闸门会
+///   让裸名解析测试 flake）。
+/// - 否则 → `exe` 原样（serve 进程即 bin/oj，同版本自保证；macOS / Windows /
+///   musl / 非打包形态零回归）。
+fn resolve_oj_command(
+    exe: &std::path::Path,
+    bundled_ld: Option<&std::path::Path>,
+) -> Result<super::platform::ResolvedCommand, String> {
+    if let Some(ld) = bundled_ld.filter(|_| is_loader_image(exe)) {
+        return packaged_oj_command(ld);
+    }
+    Ok(super::platform::ResolvedCommand {
+        prog: exe.to_path_buf(),
+        fixed: Vec::new(),
+    })
+}
+
+/// 进程映像是否为 glibc / musl 动态加载器（`ld-linux*` / `ld-*.so*`）。
+fn is_loader_image(exe: &std::path::Path) -> bool {
+    let Some(name) = exe.file_name().map(|n| n.to_string_lossy()) else {
+        return false;
+    };
+    name.starts_with("ld-linux") || (name.starts_with("ld-") && name.contains(".so"))
+}
+
+/// 打包形态（OJ_BUNDLED_LD 指向 `<bin>/lib/ld-linux-*`）的 oj 命令构造：
+/// **刻意对齐 `daemon_reexec_cmd`（oj/src/serve_cmd.rs）的候选序与理由**——直接
+/// ld-linux + `--library-path` + `oj.bin`，子链零宿主组件（不走 `<bin>/oj` 脚本：
+/// kernel shebang 会拉宿主 /bin/sh + coreutils）；`oj.bin` 缺失 → 回退启动器脚本
+/// （它自会重放 ld 链）；两者皆缺 → Err 点名——**不静默回落 `current_exe()`**，
+/// 那会把 ld-linux 当程序重放 OJ-10（ld 把 `"migrate"` 当共享对象加载，exit 127）。
+fn packaged_oj_command(ld: &std::path::Path) -> Result<super::platform::ResolvedCommand, String> {
+    let lib = ld
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| format!("OJ_BUNDLED_LD has no parent dir: {}", ld.display()))?;
+    let bin_dir = lib
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| format!("OJ_BUNDLED_LD not under <bin>/lib: {}", ld.display()))?;
+    let oj_bin = bin_dir.join("oj.bin");
+    if oj_bin.is_file() {
+        return Ok(super::platform::ResolvedCommand {
+            prog: ld.to_path_buf(),
+            fixed: vec![
+                "--library-path".into(),
+                lib.to_path_buf().into(),
+                oj_bin.into(),
+            ],
+        });
+    }
+    let launcher = bin_dir.join("oj");
+    if launcher.is_file() {
+        return Ok(super::platform::ResolvedCommand {
+            prog: launcher,
+            fixed: Vec::new(),
+        });
+    }
+    Err(format!(
+        "oj: packaged layout broken under {}: neither oj.bin nor oj launcher found",
+        bin_dir.display()
+    ))
 }
 
 /// Windows 缺省 `PATHEXT`（env 缺失/为空时回落；与 cmd.exe 默认一致）。

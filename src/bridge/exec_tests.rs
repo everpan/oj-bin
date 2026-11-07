@@ -7,9 +7,10 @@ use crate::bridge::ModuleCtx;
 use crate::bridge::SchemaRegistry;
 use crate::bridge::fs::FsGrant;
 use crate::bridge::module_loader::LoaderShared;
-use crate::bridge::platform::{CommandResolver, ExecGrant, PlatformGrant};
+use crate::bridge::platform::{CommandResolver, ExecGrant, PlatformGrant, ResolvedCommand};
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -241,7 +242,8 @@ fn windows_fixture_templates_are_unambiguous() {
 fn default_resolver_oj_and_path() {
     // "oj" → current_exe（serve 进程即 bin/oj；测试里即测试二进制自身）。
     let oj = default_resolve_command("oj").unwrap();
-    assert_eq!(oj, std::env::current_exe().unwrap());
+    assert_eq!(oj.prog, std::env::current_exe().unwrap());
+    assert!(oj.fixed.is_empty());
     // 裸名 → 父进程 PATH 解析为绝对路径。探测名取「该平台恒在」者：
     // unix 用 sh；Windows 用 System32 常在 PATH 的 cmd（R1 起裸名按 PATHEXT
     // 补 .exe，故无需再写 cmd.exe）。
@@ -250,12 +252,81 @@ fn default_resolver_oj_and_path() {
     #[cfg(windows)]
     let probe = "cmd";
     let resolved = default_resolve_command(probe).unwrap();
-    assert!(resolved.is_absolute(), "{probe} -> {resolved:?}");
+    assert!(resolved.prog.is_absolute(), "{probe} -> {resolved:?}");
+    assert!(resolved.fixed.is_empty());
     // 未知命令 → Err 点名。
     let e = default_resolve_command("oj-no-such-command-xyz").unwrap_err();
     assert!(e.contains("not found in PATH"), "{e}");
     // 路径分隔符 → Err（parse 期已拒，此处防御性兜底）。
     assert!(default_resolve_command("./sh").is_err());
+}
+
+// ----- "oj" token 打包形态（OJ_BUNDLED_LD 双闸门；OJ-10） -----
+//
+// 背景：linux glibc 发行包的 bin/oj 启动器以「ld-linux 作程序」拉起 oj.bin，
+// current_exe() 指向加载器——若照原样 spawn，`["oj","migrate",…]` 变成
+// `[ld-linux,"migrate",…]`，ld 把 "migrate" 当共享对象加载（exit 127）。
+// 修复对齐 daemon_reexec_cmd（serve_cmd.rs）：打包形态直接
+// ld-linux + --library-path + oj.bin，子链零宿主组件。
+
+#[test]
+fn loader_image_detection() {
+    assert!(is_loader_image(Path::new("/pkg/lib/ld-linux-x86-64.so.2")));
+    assert!(is_loader_image(Path::new("/pkg/lib/ld-musl-x86_64.so.1")));
+    assert!(!is_loader_image(Path::new("/pkg/oj.bin")));
+    assert!(!is_loader_image(Path::new("/pkg/oj")));
+    assert!(!is_loader_image(Path::new("/usr/bin/ldconfig")));
+    assert!(!is_loader_image(Path::new("/")));
+}
+
+#[test]
+fn oj_token_packaged_layout() {
+    let base = tmp("oj-packaged");
+    let lib = base.join("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    let ld = lib.join("ld-linux-x86-64.so.2");
+    std::fs::write(&ld, b"").unwrap();
+    let oj_bin = base.join("oj.bin");
+    std::fs::write(&oj_bin, b"").unwrap();
+
+    // 双闸门之一：env 在但进程映像不是加载器（如测试进程自身，或 plugin_loader
+    // 夹具并发 set_var 的窗口）→ 原样返回 exe，绝不被打包分支劫持。
+    let exe = std::env::current_exe().unwrap();
+    let r = resolve_oj_command(&exe, Some(&ld)).unwrap();
+    assert_eq!(r.prog, exe);
+    assert!(r.fixed.is_empty());
+
+    // 双闸门齐（映像即加载器 + env 在）→ 打包形态：ld 作程序，
+    // 固定前缀 = [--library-path, <lib>, <oj.bin>]，用户 argv 紧随其后。
+    let r = resolve_oj_command(&ld, Some(&ld)).unwrap();
+    assert_eq!(r.prog, ld);
+    assert_eq!(
+        r.fixed,
+        vec![
+            OsString::from("--library-path"),
+            lib.clone().into(),
+            oj_bin.clone().into(),
+        ]
+    );
+
+    // oj.bin 缺失 → 回退 <bin>/oj 启动器脚本（kernel shebang，与
+    // daemon_reexec_cmd 的候选序一致），fixed 为空。
+    std::fs::remove_file(&oj_bin).unwrap();
+    let launcher = base.join("oj");
+    std::fs::write(&launcher, b"#!/bin/sh\n").unwrap();
+    let r = resolve_oj_command(&ld, Some(&ld)).unwrap();
+    assert_eq!(r.prog, launcher);
+    assert!(r.fixed.is_empty());
+
+    // 两者皆缺 → Err 点名（不静默回落 exe 重放 OJ-10）。
+    std::fs::remove_file(&launcher).unwrap();
+    let e = resolve_oj_command(&ld, Some(&ld)).unwrap_err();
+    assert!(e.contains("neither oj.bin nor oj launcher"), "{e}");
+
+    // env 缺省（macOS / Windows / 非打包形态直通）→ exe 原样。
+    let r = resolve_oj_command(&ld, None).unwrap();
+    assert_eq!(r.prog, ld);
+    assert!(r.fixed.is_empty());
 }
 
 // ----- 扩展名搜索纯函数（R1；平台无关，Given-When-Then） -----
@@ -366,6 +437,10 @@ fn test_resolver(map: &[(&str, &str)]) -> (CommandResolver, Arc<Mutex<Vec<String
             m.get(name)
                 .cloned()
                 .map(PathBuf::from)
+                .map(|prog| ResolvedCommand {
+                    prog,
+                    fixed: Vec::new(),
+                })
                 .ok_or_else(|| format!("command '{name}' not found"))
         }),
         seen,

@@ -1467,6 +1467,13 @@ platform:
     命令名 / literal 段落错开。
 - **命令解析（模板首 token）**：必须是**裸名**——不接受占位符、不含 `/` `\` 路径分隔符。
   `"oj"` 特判解析为服务进程自身（`current_exe()`，serve 进程即 bin/oj，同版本自保证）；
+  **linux glibc 打包形态例外**（v0.1.126，OJ-10）：该形态启动器以「ld-linux 作程序」拉起
+  `oj.bin`（绕开宿主 glibc 版本限制），进程映像是随包加载器，`current_exe()` 不能当可执行体——
+  双闸门（启动器导出的 `OJ_BUNDLED_LD` 在 **且** 进程映像确为 `ld-linux*` / `ld-*.so*`）命中时
+  `"oj"` 自动重定向为 `随包 ld-linux --library-path <bin>/lib <bin>/oj.bin`（与 daemon re-exec
+  同一判定、候选序与理由），用户 argv 原样接在前缀之后；`oj.bin` 缺失回退 `<bin>/oj` 启动器
+  脚本，两者皆缺 → 解析期 fail-fast 点名（不静默回落，杜绝 ld 把子命令当共享对象加载的
+  exit 127）；非打包形态（macOS / Windows / musl）行为逐字节不变。
   其余裸名在**宿主侧**按父进程 PATH 解析为**绝对路径**后 spawn（子进程 env 已清空、不继承
   PATH，宿主侧解析消除 execvp 回落默认路径的不确定性）。**Windows 额外按 `PATHEXT`
   补全扩展名**（`tar` → `tar.exe`、`cmd` → `cmd.exe`；`PATHEXT` 缺失时回落系统默认列表；
@@ -1589,7 +1596,7 @@ Error）：
 | `exec template ambiguous: argv matches <N> authorized templates` | NotCapable | ≥2 条模板同时命中（不静默择一） |
 | `exec ${path:NAME}: path outside fs.root and trusted_paths: <p> (resolved <abs>)` | NotCapable | 路径占位符越出 `fs.root ∪ trusted_paths` |
 | `exec template parse failed (<raw>): <e>` | Error | 模板语法错（未知占位符类型 / 未闭合 / 非法名 / 首 token 含路径分隔符等） |
-| `exec: command resolve failed for '<name>': …` | Error | 命令名解析失败（含 `command '<name>' not found in PATH`） |
+| `exec: command resolve failed for '<name>': …` | Error | 命令名解析失败（含 `command '<name>' not found in PATH`；v0.1.126 起打包形态还含 `oj: packaged layout broken under <dir>: neither oj.bin nor oj launcher found`——`OJ_BUNDLED_LD` 在但 `<bin>` 下两个候选都缺，属部署破损，点名而非回落） |
 | `exec: spawn failed for '<abs>': <e>` | Error | 进程启动失败 |
 | `exec timed out after <N> ms (process group killed)` | Error | 超时到期（整组击杀）——**仅无回调的 `exec.run` 抛**；回调 / `exec.spawn` 形态不抛，只把 `code` 打成 137 并截断输出（v0.1.79 订正） |
 | `exec output limit exceeded (10485760 bytes cap, stdout+stderr combined)` | Error | 输出合计超 10MB——**仅无回调的 `exec.run` 抛**；回调 / `exec.spawn` 形态同上为 `code = 137` + 截断（v0.1.79 订正） |

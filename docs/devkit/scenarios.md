@@ -2711,7 +2711,7 @@ curl -s -X POST http://localhost:9778/v1/platform/ojm-installer/install/ \
 | `exec.run` 报 `module 'ojm-installer' is not authorized for exec` | 步骤 4/7 的 tar / oj migrate 模板没进 `platform.exec.ojm-installer.allow`；**exec 授权 ≠ `platform.modules`**，两名单独立 |
 | `exec ${path:config}: path outside fs.root and trusted_paths` | `../config.yaml` 没落在 `platform.trusted_paths` 内——把 config 所在根加进 `trusted_paths`（场景 33） |
 | `server.reloadConfig` 报 `NotCapable: module 'x' is not platform-privileged` | 步骤 8 的调用模块不在 `platform.modules`，或没部署在 `platform.root` 下，或受控根没列为 `mounts[].api` 条目——三缺一 |
-| `oj migrate` 子进程里 `argv[0]` 不是 "oj" 原文 | 预期：宿主把 "oj" 解析为服务进程自身（`current_exe()`）——模板首 token 写裸名 `oj` 即可 |
+| `oj migrate` 子进程里 `argv[0]` 不是 "oj" 原文 | 预期：宿主把 "oj" 解析为服务进程自身（`current_exe()`）——模板首 token 写裸名 `oj` 即可；**linux glibc 打包形态**（v0.1.126 起）argv 更特殊：程序是随包 `ld-linux`，紧跟 `--library-path <bin>/lib <bin>/oj.bin` 前缀，`migrate` 及之后参数原样送达 oj.bin（旧版该形态 exit 127 是 OJ-10 缺陷，升级即消，见 SKILL 陷阱速查） |
 | `exec output limit exceeded` / `exec timed out after 600000 ms` | tar 大包成员列表可超 stdout 合计 10MB；大表迁移超 600s——本场景已显式把 migrate 的 `timeoutMs` 调到硬上限 600s，tar 调 120s |
 | 只 `JSON.parse(r.stdout)` 成功就当迁移成功 | json `error` 已脱敏、迁移失败仍成功解析——**退出码 `r.code` 才是真源**，必须 `r.code===0 && results.every(ok)` |
 | `yaml.stringify` 回写 config.yaml 后注释全丢 | 本场景刻意走「文本手术三步」而非 stringify 覆盖——serde_yaml 丢注释，config 回写禁走 stringify（§6 yaml） |

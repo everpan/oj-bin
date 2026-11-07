@@ -348,6 +348,7 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `exec.run` 报 `NotCapable: … not authorized for exec` / `template mismatch` / `ambiguous` | **exec 授权 ≠ `platform.modules`**（两名单独立，只配一边拿不到另一边）：`platform.exec.<模块>.allow` 里要有匹配的 argv 模板——literal token 逐字相等、`${path:}`/`${raw:}` 占位符恰吸一 token、同一 argv 命中两条模板即歧义拒绝（v0.1.75） |
 | `exec.run` 里给子进程传相对路径就以为出不了 jail | cwd 钉在 fs.root 但**不构成隔离边界**——路径越界防线在 `${path:}` 占位符校验（`fs.root ∪ trusted_paths`），别把越出集合的路径交给子进程（v0.1.75） |
 | exec 子进程里 `argv[0]` 和模板首 token 不一致 | 预期：宿主侧把首 token 解析为**绝对路径**（"oj"→服务进程自身；其余 PATH 解析，Windows 裸名再按 `PATHEXT` 补 `.exe`/`.cmd`）再传给子进程；模板首 token 必须是裸名（路径分隔符直接拒）（v0.1.75） |
+| linux glibc 打包部署里 `exec.run(["oj","migrate",…])` 子进程 exit 127、stderr 有 `error while loading shared libraries: migrate: cannot open shared object file` | v0.1.125 及更早的 OJ-10 缺陷：该形态进程映像是随包 `ld-linux`，旧解析照原样 spawn → ld 把 `"migrate"` 当共享对象加载。升 **v0.1.126+** 后 `"oj"` 自动经随包加载器重定向到 `oj.bin`（spawn 语义不变）；此前加的消费方 wrapper 补丁（如 `ojmig`）可撤（v0.1.126） |
 | `exec.run` 大 stdin 报 `exec timed out after N ms` | stdin 写入也在超时窗口内：子进程不读 stdin 且输入大时 write 阻塞 → 超时兜底组杀（缺省 30s）——大 DDL / 大输入显式调大 `timeoutMs`（硬上限 600s，超出钳制）（v0.1.75） |
 | `exec.run` 回调形态 / `exec.spawn` 里传 `stdin` 没生效 | v0.1.83 订正：此前仅无回调的 `exec.run` 支持 `stdin`，回调 / `spawn` 形态**静默丢弃**（子进程 stdin 恒 null，`sh -c cat` 直接吃空输入）；现在三形态语义一致（一次性写入后关写端）——老代码里为绕过而写的临时方案可以删了 |
 | `exec.run` 跑 `oj migrate` 大 DDL 报 `exec timed out after 30000 ms` | 经 `exec.run` 调 `oj migrate` 执行大表 `ALTER`/索引迁移时，30s 默认超时不够（迁移**不**走 stdin 写入，但仍受同一 `timeoutMs` 窗口约束）——显式 `timeoutMs` 调大（< 600s 硬上限），否则超时组杀留下半截账本（v0.1.75） |

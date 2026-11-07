@@ -40,6 +40,18 @@ cp bin/devkit/global.d.ts bin/devkit/oj-modules.d.ts .                       # �
 手册与 skill 随 oj 版本一起发布。升级 oj 后，用新包里的 `devkit/` 覆盖旧拷贝即可。
 源文件与反馈入口在仓库 `docs/devkit/`。
 
+v0.1.126 已落地部分：**`exec.run` 的 `"oj"` token 打包形态重定向——根治 glibc 发行包
+`["oj","migrate",…]` exit 127**（OJ-10）——linux glibc 发行包的 `bin/oj` 启动器以「ld-linux
+作程序」拉起 `oj.bin`（绕开宿主 glibc 版本限制），serve 进程映像是随包加载器，旧解析把
+`current_exe()`（= ld-linux）当可执行体 spawn，`"migrate"` 被 ld 当共享对象加载。修复对齐
+daemon re-exec 的既有判定：双闸门（`OJ_BUNDLED_LD` 在且映像确为 `ld-linux*` / `ld-*.so*`）
+命中时 `"oj"` 自动解析为 `随包 ld-linux --library-path <bin>/lib <bin>/oj.bin`，子链零宿主
+组件；`oj.bin` 缺失回退启动器脚本、两者皆缺 fail-fast 点名。非打包形态（macOS / Windows /
+musl）行为逐字节不变；`exec.allow` 裸名与 fail-closed 语义不变，消费方 `ojmig` 类 wrapper
+补丁可撤。`CommandResolver` 返回类型 `PathBuf` → `ResolvedCommand { prog, fixed }`（DIP
+契约内演化）。见 api-manual §6「exec / 命令解析」与错误表、SKILL 陷阱速查、scenarios
+场景 33/73 坑表。
+
 v0.1.125 已落地部分：**`oj migrate --with-seed`——迁移后同批重放 seed，补齐「装完数据面空」缺口**——
 为 `oj migrate` 增加 opt-in 旗标 `--with-seed`（与 `--baseline` 互斥）：迁移全部成功后，对同一批
 模块（含 `--module` 过滤）在同一命令、同一目标库连接上紧接着重放各自的 `seed.sql` /
