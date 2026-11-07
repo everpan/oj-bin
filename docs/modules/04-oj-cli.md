@@ -10,7 +10,7 @@
 | `serve` | `-c/--config`、`-b/--base`、`--api-path`、`--app-path`、`--cert-path`、`--key-path`、`--console-log`、`--daemon` | `serve_cmd.rs:21` |
 | `build [module]` | `-d/--dir`（默认 `src`）、`-o/--out`（默认 `dist`）、`--no-minify`、`--check` | `build_cmd.rs:16` |
 | `test` | `-c`、`-b`、`-d`、`-t/--tests`（默认 `tests`，相对 config_dir）、`--format`（human/tap/junit/json）、`--output` | `test_cmd.rs:46` |
-| `migrate` | `-c`、`-d`、`--db`、`--baseline`、`--module` | `migrate_cmd.rs:74` |
+| `migrate` | `-c`、`--site`、`-d`、`--module-root`、`--db`、`--baseline`、`--with-seed`（v0.1.125）、`--module`、`--format json\|human` | `migrate_cmd.rs:74` |
 | `test fixture` | `test` 的子命令：`-c`、`-d`、`--db`、`[module]` | `migrate_cmd.rs:115` |
 | `schema diff` | `-c`、`-d`、`--db` | `migrate_cmd.rs:130` |
 | `openapi` | `-c/--config`、`-d/--dir`、`-b/--base`、`--check`、`-o/--out` | `openapi_cmd.rs:18` |
@@ -48,6 +48,11 @@
 21. 证书加载校验 + `spawn_watcher` 热加载；
 22. `Pipeline` 组装 + `ws::mirror_routes` + `server::app(...).merge(ws_router)`；
 23. 构造**唯一** `StableState`（与 actor 共享后端 Arc，供测试运行时注入）。
+
+> 第 12 步是**冷启动** `seed::replay_all`（`app.rs` `!reused` 门禁，热更不重放）。它与
+> v0.1.125 的 `oj migrate --with-seed` **不是同一条路径**：后者属 §7 瘦身装配
+> （`migrate_cmd.rs` → `seed::replay_modules`），刻意绕开 `App::from_config`，
+> 与迁移共用 `s.modules` / `s.target`。
 
 ### 私有步骤函数（2026-09-06 拆分）
 
@@ -173,6 +178,13 @@ default 等于把迁移打在开发库上，与 `oj test --db`（`test_cmd.rs`�
 `App::from_config` 的 `db_override` 同一条纪律。注意迁移工具**不读**模块级
 `manifest.yaml` 的 `db:` 绑定（那是运行期路由，见 `src/bridge/guard.rs::bound_db`），
 多库部署须逐 profile 各跑一遍。`oj serve` 无此旗标，恒用 `default`。
+
+**`--with-seed`（v0.1.125）例外**：`--with-seed` 是**瘦身装配路径内**的 opt-in 分支
+（`migrate_cmd.rs::run_migrate` → `seed::replay_modules`），不是回到 `App::from_config`。
+迁移全部成功后，在 `slim()` 产物 `s.modules`（含 `--module` 过滤）与 `s.target` 同一连接上
+紧接着重放各模块的 `seed.sql`，严格 migrate→seed、全量预扫 fail-closed 门禁、逐模块
+continue-and-collect；seed 失败使整条命令非零退出。冷启动的 `seed::replay_all`（`app.rs`
+`!reused` 门禁）保持独立、未改动。
 
 ## 8. Rust 集成测试（`oj/tests/`）
 

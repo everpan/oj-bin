@@ -204,13 +204,28 @@ struct JsonResult {
     error: Option<String>,
 }
 
+/// `--with-seed` 的顶层 `seed` 字段（v0.1.125，spec §8）：逐模块 continue-and-collect
+/// 结果放 `results`；执行前全局失败（未知方言 / 运行期门禁 / S002 / 读文件）放 `error`。
+/// **不放顶层 `JsonOut.error`**——后者专属 migrate 装配期全局失败；也不污染 `results`。
+/// 下游 `parseMigrateOutput` 成功路径只取 `results`/`error`、忽略未知顶层键 → 零改动兼容。
+#[derive(serde::Serialize)]
+struct SeedJson {
+    results: Vec<crate::seed::SeedResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
 /// `--format json` 输出契约（stdout 恰一行）：模块循环产物在 `results`；
 /// 装配期（开库/目录解析）全局失败时 `results` 为空且 `error` 携脱敏原因。
+/// `seed`：仅 `--with-seed` 且迁移全成功时出现（opt-in；不带旗标时该键不出现，
+/// JSON 形状逐字不变 → 零回归）。
 #[derive(serde::Serialize)]
 struct JsonOut {
     results: Vec<JsonResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<SeedJson>,
 }
 
 fn json_line(out: &JsonOut) -> Result<String, String> {
@@ -255,11 +270,51 @@ async fn migrate_collect(
     (results, total)
 }
 
-/// `oj migrate [-c config] [-d dir] [--db name] [--baseline] [--module M] [--format json]`：
-/// 逐模块载入 migrations/ 并 apply 到最新；`--baseline` = 全量记账不执行
-/// （P0 建过表的存量库接入门，Q5）；`--db` = 目标库 profile（缺省 default）。
+/// seed 阶段（仅 `--with-seed` 且 migrate 全成功后调用）：执行 + 规整成
+/// (顶层 `seed` 字段, 失败原因)。失败原因专供 stderr 人话前置——下游
+/// `parseMigrateOutput` 在 `code !== 0` 提前 return，只取 `(stderr||stdout)` 头部，
+/// `seed.*` JSON 是死字段（评审 P-A）。
+async fn run_seed_phase(
+    target: &Arc<dyn DataAccessor>,
+    modules: &[(String, PathBuf)],
+) -> (SeedJson, Option<String>) {
+    match crate::seed::replay_modules(target, modules).await {
+        Ok(results) => {
+            // 逐模块 continue-and-collect：任一 ok=false 即整条命令失败。
+            let reason = results.iter().find(|r| !r.ok).map(|r| {
+                let file = r.file.as_deref().unwrap_or("seed.sql");
+                let detail = r.error.as_deref().unwrap_or("未知错误");
+                sanitize_dsn(&format!("模块 {} 的 {file}：{detail}", r.module))
+            });
+            (
+                SeedJson {
+                    results,
+                    error: None,
+                },
+                reason,
+            )
+        }
+        Err(e) => {
+            // 执行前全局失败（门禁 / S002 / 方言 / 读文件）：已脱敏 + 点名文件/下一步。
+            let reason = sanitize_dsn(&e);
+            (
+                SeedJson {
+                    results: Vec::new(),
+                    error: Some(reason.clone()),
+                },
+                Some(reason),
+            )
+        }
+    }
+}
+
+/// `oj migrate [-c config] [-d dir] [--db name] [--baseline] [--with-seed]
+/// [--module M] [--format json]`：逐模块载入 migrations/ 并 apply 到最新；
+/// `--baseline` = 全量记账不执行（P0 建过表的存量库接入门，Q5）；
+/// `--with-seed` = 迁移完成后对同一批模块同批重放 seed.sql（opt-in，与
+/// --baseline 互斥）；`--db` = 目标库 profile（缺省 default）。
 /// `--format json`：continue-and-collect（单模块失败不中断其余模块，聚合进
-/// results）+ stdout 一行 JSON + 错误脱敏；退出码任一模块失败即非 0。
+/// results）+ stdout 一行 JSON + 错误脱敏；退出码任一模块失败或 seed 失败即非 0。
 pub async fn run_migrate(a: &MigrateArgs) -> Result<(), String> {
     let json_mode = parse_format(a.format.as_deref())?;
     let s = match slim(
@@ -275,11 +330,13 @@ pub async fn run_migrate(a: &MigrateArgs) -> Result<(), String> {
         Ok(s) => s,
         Err(e) => {
             // 全局失败也出 json（安装器可稳定解析 stdout），错误统一脱敏。
+            // 装配期失败 → 没跑 seed，顶层 `seed` 不出现（skip_serializing_if）。
             let e = sanitize_dsn(&e);
             if json_mode {
                 let out = JsonOut {
                     results: Vec::new(),
                     error: Some(e.clone()),
+                    seed: None,
                 };
                 println!("{}", json_line(&out)?);
             }
@@ -293,10 +350,29 @@ pub async fn run_migrate(a: &MigrateArgs) -> Result<(), String> {
         .filter(|r| !r.ok)
         .map(|r| r.module.clone())
         .collect();
+    // --with-seed（v0.1.125）：仅在**迁移全成功**后，对同一批 s.modules 同批重放
+    // seed，共用 s.target 库连接、不另解析 config。迁移有失败 → 不跑 seed、顶层
+    // `seed` 也不出现（对齐 app.rs 迁移门禁先于 seed）。seed 任一失败 → 整条命令
+    // 非零退出（安装器 parseMigrateOutput 以 exit code 为成败真源）。
+    let (seed_out, seed_failure) = if a.with_seed && failed.is_empty() {
+        let (sj, reason) = run_seed_phase(&s.target, &s.modules).await;
+        (Some(sj), reason)
+    } else {
+        (None, None)
+    };
+    // 下游失败路径只取 (stderr||stdout).slice(0,500) 头部：seed 失败的脱敏具体
+    // 原因（点名文件 / 语句 / 下一步）放最前、单独一行、简洁（评审 P-A）。
+    if let Some(reason) = &seed_failure {
+        eprintln!("oj migrate --with-seed 失败：{reason}");
+        eprintln!(
+            "  迁移已成功提交但 seed 未灌；修复 seed.sql 后重跑本命令即可（幂等、安全重试）。"
+        );
+    }
     if json_mode {
         let out = JsonOut {
             results,
             error: None,
+            seed: seed_out,
         };
         println!("{}", json_line(&out)?);
     } else {
@@ -305,16 +381,22 @@ pub async fn run_migrate(a: &MigrateArgs) -> Result<(), String> {
             s.modules.len(),
             a.db.as_deref().unwrap_or("default")
         );
+        if let Some(sj) = &seed_out {
+            let ok = sj.results.iter().filter(|r| r.ok).count();
+            println!("oj migrate: seed 重放 {ok}/{} 模块", sj.results.len());
+        }
     }
-    if failed.is_empty() {
-        Ok(())
-    } else {
+    if !failed.is_empty() {
         Err(format!(
             "{} of {} module(s) failed: {}",
             failed.len(),
             s.modules.len(),
             failed.join(", ")
         ))
+    } else if seed_failure.is_some() {
+        Err("--with-seed: seed 重放失败（详见上方 stderr 诊断）".to_string())
+    } else {
+        Ok(())
     }
 }
 

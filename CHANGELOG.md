@@ -16,6 +16,41 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.125（2026-11-07）
+
+**feat（oj CLI，`oj migrate --with-seed`）**：为 `oj migrate` 增加 opt-in 旗标
+`--with-seed`（与 `--baseline` 互斥）。迁移成功后，对同一批模块（`s.modules`，
+含 `--module` 过滤）在同一命令、同一目标库连接上**紧接着重放各自的 `seed.sql` /
+`seed.<dialect>.sql`**，执行顺序严格 migrate→seed。补齐 U7 缺口：此前 `ojm install`
+安装带 seed 的模块要等下次冷启动（app.rs `!reused` 门禁）才灌数据。seed 走幂等
+INSERT（`INSERT OR IGNORE` / `INSERT IGNORE` / `ON CONFLICT DO NOTHING` 等），
+可重复执行；作用域严格按模块根 `pick`，不整树扩散、不跨模块串台；无 seed 文件即
+no-op，不传旗标行为逐字节不变。
+
+- **fix（checks，`lead_word` 注释绕过根因修复）**：`lead_word` 改取
+  `code_tokens(stmt)[0]`，`/*x*/ DROP TABLE t` 这类行首块注释不再让语句头误判为
+  注释内容；`code_tokens` 提为 `pub(crate)` 供运行期门禁复用。
+- **security（`--with-seed` fail-closed 运行期门禁）**：新入口 `seed_stmt_allowed`
+  采用白名单——只放行幂等 INSERT，拒绝 DDL / UPDATE / DELETE / REPLACE /
+  PRAGMA / ATTACH / 事务控制 / `INSERT … SELECT`；执行前对全部 seed 文本**完整预扫**，
+  任一语句不合规即整轮拒绝、零副作用。方言以目标库为准（冷启动既有 S006 仍按文件
+  方言，互不干扰）。这是 opt-in 新入口的纵深防御，不是针对已签名恶意包的完整沙箱。
+- **contract（JSON 输出与退出码）**：`--format json` 在保留 `results` 的前提下新增
+  顶层可选 `seed` 对象（逐模块 `ok` / `file` / `dialect` / `stmts` / `error`），不污染
+  迁移 `results`；顶层 `error` 仍只表迁移装配失败。seed 失败使整条命令**退非 0**，
+  并在 stderr 前置人类可读诊断（下游 `code !== 0` 先于 JSON 解析返回，stdout 的
+  `seed` 字段主要面向运维/CI 直跑）。
+- **test（对抗性探测钉死）**：补 args/flag 冲突、checks 注释绕过与白名单、
+  seed 全预扫零副作用 / 幂等 / 逐模块作用域 / `--module` 过滤 / 迁移失败跳过 seed /
+  seed 执行失败退非 0 等用例（`cargo test --release -p oj --lib` 311 passed）。
+- **docs**：devkit 四件（api-manual / scenarios / SKILL / README）、`db-guide.md`、
+  `docs/modules/04-oj-cli.md` 与本版用户可见变更对齐。
+
+**交付边界**：本轮只交付 oj-bin 侧 CLI 能力并验证；下游 `oj-module`（安装器）为只读，
+`buildMigrateCmd` 尚未传 `--with-seed`、`platform.exec` 白名单与 `MIN_OJ_VERSION` 未联动，
+U7「装完即数据面就绪」的安装端到端闭环留待下游单独交付（设计见
+`docs/superpowers/specs/2026-11-07-oj-seed-on-install-design.md`）。
+
 ## v0.1.124（2026-11-05）
 
 - **fix（serve，reload force 值口径收紧）**：裸 `?force`（query 中只有键、无 `=` 的旗）

@@ -310,7 +310,7 @@ tables:
 | 文件 | 时机 | 纪律 |
 |---|---|---|
 | `migrations/{seq:04}__{desc}[.方言].sql` | 启动（auto）/ `oj migrate` | 只前向；账本 `_oj_migrations`（`module` 列区分模块）；序列空洞/乱序 S007 报错 |
-| `seed.sql` / `seed.<方言>.sql`（模块级） | 每次启动重放 | 方言件（`.sqlite` / `.mysql` / `.pg`）胜出、`seed.sql` 兜底，**绝不双跑**（v0.1.121）；幂等 `INSERT OR IGNORE`（方言件可用本方言原生幂等写法）；按 `;` 切分，语句内不得含分号字面量（S006）；语句前置 `--` 注释行允许（v0.1.66 起，改写判定先剥注释） |
+| `seed.sql` / `seed.<方言>.sql`（模块级） | 每次启动重放 / `oj migrate --with-seed`（v0.1.125，随安装即时灌） | 方言件（`.sqlite` / `.mysql` / `.pg`）胜出、`seed.sql` 兜底，**绝不双跑**（v0.1.121）；幂等 `INSERT OR IGNORE`（方言件可用本方言原生幂等写法）；按 `;` 切分，语句内不得含分号字面量（S006）；语句前置 `--` 注释行允许（v0.1.66 起，改写判定先剥注释）。`--with-seed` 新入口另有 fail-closed 运行期白名单（只放行幂等 INSERT，见下节） |
 | `fixtures/*.sql` | 仅 `oj test` / `oj test fixture` 灌入 | 演示/测试数据，不进 release 产物 |
 
 ### 命令
@@ -318,6 +318,7 @@ tables:
 | 命令 | 用途 |
 |---|---|
 | `oj migrate -c config.yaml -d <dir>` | 应用待执行迁移（`--baseline`：存量库接入，≤head 记为已应用不执行） |
+| `oj migrate --with-seed -c config.yaml -d <dir> [module]` | （v0.1.125）迁移成功后，对同一批模块（含 `--module` 过滤）紧接着重放各自 `seed.sql`，严格 migrate→seed、同一目标库连接；opt-in，与 `--baseline` 互斥，详见下节 |
 | `oj schema diff -c config.yaml -d <dir>` | 声明 vs 实库对账（D001 漂移 / D002 未声明表），只读，漂移 exit 1 |
 | `oj test fixture -c config.yaml -d <dir>` | 灌 `fixtures/*.sql` 演示数据（dev/test 用，不进 release 产物）。v0.1.52 起有**幂等门禁**：非幂等 INSERT（判据同 S006）灌入前报错，改 `INSERT OR IGNORE` / `ON CONFLICT DO NOTHING` 写法即可重复灌 |
 | `oj openapi -c config.yaml [-d dir] [--base B] [-o out.json]` | 从路由表生成 OpenAPI 3.1（dev 内省 `.route` / release 读 `dist/routes.js`），打印或落盘（v0.1.43）；v0.1.52 起 dev 分支内省失败同样 fail-fast（对齐 release，不再静默缺路由）；**v0.1.70 起补齐响应侧**：`.schema.response`（v0.1.72 起亦可写平级 `.response`，优先级 动词 `.response` > 组 `.response` > 动词 `.schema.response` > 组 `.schema.response`）→ `responses.200`（外裹 `{code,msg,data}` 信封）、每个 operation 与 spec 根带 **`tags: [<module>]`**、生成前审计全部 `.schema`（非法契约不再原样进 spec）、`operationId` 重复即报错、**v0.1.73 起 `del` 动词归一为 `delete` 操作键**（OpenAPI 3.x 只认标准 HTTP 方法） |
@@ -356,6 +357,51 @@ tables:
 定向（release 锁聚合形态 `<dir>/<m>-<v>/`）。**不解析 `<m>-<v>` 字符串**（version 可含 `-` 如
 `0.1.0-beta`，拆分有歧义），直接对已发现目录名匹配：`--module modA` 与 `--module modA-1.0.0`
 在 release 下等价只动 modA。多库项目：`--db X --module M` 逐组合跑（场景 6）。
+
+### `oj migrate --with-seed`：迁移后同批重放 seed（v0.1.125）
+
+补 U7 缺口：过去 `ojm install` 装完带 seed 的模块，要等**下次冷启动**（`app.rs` 的
+`!reused` 门禁）才灌 seed 数据。加 `--with-seed` 后，一条命令把迁移与 seed 一起做完：
+
+```bash
+./bin/oj migrate --with-seed -c config.yaml -d dist              # 全模块
+./bin/oj migrate --with-seed -c config.yaml -d src --module books  # 定向单模块
+./bin/oj migrate --with-seed --format json -c config.yaml -d dist books  # 安装器/CI
+```
+
+- **执行顺序严格 migrate→seed**：迁移全部成功提交后，才在**同一条命令、同一目标库连接**
+  上重放 seed（seed 的 INSERT 目标表须由迁移先建好，与冷启动顺序一致）。迁移有任一模块
+  失败即**整轮跳过 seed**。
+- **作用域 = 迁移的同一批模块**：复用 `s.modules`（`--module` 过滤同样生效），每个模块
+  只在自己的模块根 `pick` 本模块的 `seed.sql` / `seed.<方言>.sql`；不整树扩散、不跨模块
+  串台、不递归子目录。无 seed 文件即 no-op。
+- **opt-in、缺省关**：不传旗标行为逐字节不变；与 `--baseline` 互斥（同参即 clap 报参数冲突）。
+- **幂等**：seed 走 `INSERT OR IGNORE` / `INSERT IGNORE` / `ON CONFLICT DO NOTHING` 等
+  幂等写法，重复执行不翻倍；修复 seed.sql 后重跑本命令即安全重试。
+- **fail-closed 运行期门禁（新入口纵深防御）**：`--with-seed` 只放行**幂等 INSERT**，拒绝
+  DDL / `UPDATE` / `DELETE` / `REPLACE` / `PRAGMA` / `ATTACH` / 事务控制 / `INSERT … SELECT`
+  等一切其它语句头（含 `/*x*/ DROP TABLE t` 这类行首注释绕过——语句头取
+  `code_tokens(stmt)[0]`）。执行前对全部 seed 文本**完整预扫**，任一语句不合规即整轮拒绝、
+  **零副作用**。方言以**目标库**为准；冷启动既有 S006 仍按文件方言，两者互不干扰。
+  这是 opt-in 新入口的纵深防御，不是针对已签名恶意包的完整沙箱。
+- **JSON 契约**：`--format json` 在保留 `results` 的前提下，顶层新增可选 `seed` 对象
+  （**不污染** `results`，顶层 `error` 仍只表迁移装配失败）：
+
+  ```json
+  { "results": [ { "module": "books", "ok": true, "applied": [ { "version": 1, "name": "0001__init" } ] } ],
+    "seed": { "results": [ { "module": "books", "ok": true, "file": "seed.sql", "dialect": "sqlite", "stmts": 3 } ] } }
+  ```
+
+  `seed.results[]` 逐模块一条：`ok` / `file`（仅文件名，不含绝对路径）/ `dialect` /
+  `stmts`（本轮执行语句数）/ `error`（失败原因，脱敏、裁剪）。**seed 失败使整条命令退非 0**，
+  并在 **stderr 前置人类可读诊断**（`oj migrate --with-seed 失败：…` + 重试指引）——下游
+  安装器以 `code !== 0` 为成败真源、先于 JSON 解析返回，故 stdout 的 `seed` 字段主要面向
+  运维 / CI 直跑；未加 `--with-seed` 时输出不含 `seed` 字段。
+
+> **交付边界**：本轮只交付 oj-bin 侧 CLI 能力。下游 `ojm install` 尚未在 `buildMigrateCmd`
+> 传入 `--with-seed`，`platform.exec` 白名单（argv 逐 token 精确模板）与 `MIN_OJ_VERSION`
+> 也需联动，装完即数据面就绪的安装端到端闭环留待下游单独交付——运维 / CI 直跑本命令
+> 不受影响。
 
 ### 门禁配置（第 10 章 server 表）
 
@@ -3760,6 +3806,9 @@ RUST_LOG=oj=info ./oj serve -c config.yaml --api-path dist
 | 500 报跨模块表访问被拒 | `ownership_guard: deny` 且未声明 deps | manifest 补 `deps:`；或临时 SQL 注释 `/* oj:allow-table=x */` |
 | `oj schema diff` exit 1 | 声明与实库漂移（D001/D002） | 按输出对齐 schema.yaml 或补迁移；存量库用 `oj migrate --baseline` |
 | `oj migrate` 报 `--db "x" not declared in config (db keys: [...])` | `--db` 的库名不在 config `db:` 段（工具**不**回落 default，防迁错库） | 按报错里的 `db keys` 核对拼写；多库逐 profile 各跑一遍 |
+| `oj migrate --with-seed` 报 `seed <模块>/<文件> 第 N 条语句被 --with-seed 运行期门禁拒绝：语句类型 … 不在白名单` / `非幂等 INSERT（… 方言）` | 新入口 fail-closed 白名单只放行幂等 INSERT；seed.sql 里有 DDL / UPDATE / DELETE / REPLACE / PRAGMA / ATTACH / 事务控制 / `INSERT … SELECT` / 裸 `INSERT`，或 INSERT 不带幂等写法（v0.1.125） | 把 seed.sql 改成幂等 INSERT（`INSERT OR IGNORE` / `INSERT IGNORE` / `ON CONFLICT DO NOTHING` / `ON DUPLICATE KEY` / `OR REPLACE`）后重跑 `oj migrate --with-seed`；或去掉 `--with-seed` 交由下次冷启动重放。全量预扫命中即零行落库 |
+| `oj migrate --with-seed 失败：…` / `--with-seed: seed 重放失败（详见上方 stderr 诊断）` | 迁移已成功提交但某模块 seed 执行失败（表不存在 / 约束冲突 / 方言不支持），整条命令退非 0 | 看 stderr 前置诊断点名的模块 / 文件 / 语句；修复后重跑本命令（幂等、安全重试），`--format json` 的 `seed.results[]` 里 `ok=false` 携脱敏、裁剪原因 |
+| 同时传 `--with-seed` 与 `--baseline` | clap 参数冲突（两者互斥：baseline 只记账不执行，不该连带灌 seed） | 去掉其中一个；存量库接入用 `--baseline`，要灌 seed 单独再跑 `oj migrate --with-seed` |
 | 启动报 `ext_boot: …` 并拒启 | ext_boot.js 语法错/导入失败/顶层 await 抛错 | 看报错定位；改完重启 |
 | 启动没打印 `ext_boot: loaded` | 文件不在 config.yaml 同目录，或文件名不是 `ext_boot.js` | 挪到 config 同级；核对文件名 |
 | 改了 `ext_boot.js` 没生效 | 不做热重载，装配期已冻结 spec | 重启进程 |
@@ -3936,6 +3985,8 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | `db_access.allow` 四维是并集，多维只会放宽（v0.1.89） | 「模块 X **且**角色 admin 才可访问」本阶段做不到：写两维 = 任一命中即过。需要「且」语义请在 handler 里自己判 |
 | 语句风险分类是 best-effort 词法（v0.1.89） | 不是 SQL 解析器：CTE / 窗口函数 / 存储过程体 / 串未闭合等复杂形态会落 `unknown` 并**按最严档拒**（fail-closed）。`deny` 档上线前先用 `warn` 灰度看日志，别直接 deny |
 | `db_access` 不约束平台自生成 SQL 与 CLI 通道（v0.1.89） | `db.nextSeq` 的序列表 DDL、`db.listTables` 的内省查询不适用；`oj migrate` / `oj schema` / `oj build` 不经 bridge，也不适用 |
+| `oj migrate --with-seed` 的门禁是词法白名单、非完整沙箱（v0.1.125） | 只放行幂等 INSERT、按语句头（`code_tokens[0]`）词法判定：复杂形态（CTE / 串未闭合 / 注释断词）会 fail-closed 按「拒绝」处理。它拦的是**不合规/误写的 seed.sql**，不是对抗已签名恶意包——模块包的完整性由安装侧 `verifyEd25519` 负责，别把这道门禁当签名校验替代品 |
+| `oj migrate --with-seed` 不自动接进 `ojm install`（v0.1.125，交付边界） | 本轮只交付 CLI 能力；安装器 `buildMigrateCmd` 未传 `--with-seed`、`platform.exec` 白名单（argv 逐 token 精确模板）与 `MIN_OJ_VERSION` 未联动，装完即数据面就绪的安装端到端闭环留待下游单独交付。运维 / CI 直接调 `oj migrate --with-seed` 不受影响 |
 | `sql_guard=deny` 下 raw SELECT 未登记表的敞口**原样保留**（v0.1.89） | 本策略只管「库别名 + 风险类别」，只读语句一律放行——不要把 `db_access` 读成「该敞口已修」 |
 | 结构内省默认钉在当前库 / 当前 schema；跨 schema 走 `forSchema`（v0.1.90 → v0.1.105 REQ-04） | 默认件 PG 走 `current_schema()`、mysql 走 `DATABASE()`；`db.forSchema(name)` 受限句柄（只读五件内视，scope 走绑定参数）可跨 schema/mysql 跨库。**边界**：sqlite 无 schema 概念（forSchema 各件 `OJ_DB_UNSUPPORTED`，capability=`for_schema`）；pg 的 forDatabase 视图同 unsupported（database=独立连接）——`listDatabases()` 只出清单。视图 / 触发器 / 数据类型字典 / CHECK 不在内省范围（待做） |
 | 内省是目录读，不是标识符白名单（v0.1.90） | `listColumns` 的列名不可回填构造器或裸 SQL；构造器只认 `SchemaRegistry`。`information_schema` 只返回**当前连接账号可见**的对象，不等于「库的完整结构」 |

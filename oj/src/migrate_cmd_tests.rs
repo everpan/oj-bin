@@ -110,6 +110,7 @@ async fn migrate_and_fixture_end_to_end() {
         dir: src(&t),
         module_root: None,
         baseline: false,
+        with_seed: false,
         module: None,
         db: None,
         format: None,
@@ -125,6 +126,7 @@ async fn migrate_and_fixture_end_to_end() {
         dir: src(&t),
         module_root: None,
         baseline: false,
+        with_seed: false,
         module: None,
         db: None,
         format: None,
@@ -149,6 +151,7 @@ async fn migrate_and_fixture_end_to_end() {
         dir: src(&t),
         module_root: None,
         baseline: false,
+        with_seed: false,
         module: Some("ghost".into()),
         db: None,
         format: None,
@@ -175,6 +178,7 @@ async fn db_flag_targets_declared_profile_and_rejects_unknown() {
         dir: src(&t),
         module_root: None,
         baseline: false,
+        with_seed: false,
         module: None,
         db: Some("test".into()),
         format: None,
@@ -226,6 +230,7 @@ async fn db_flag_targets_declared_profile_and_rejects_unknown() {
             dir: src(&t),
             module_root: None,
             baseline: false,
+            with_seed: false,
             module: None,
             db: Some("ghost".into()),
             format: None,
@@ -269,6 +274,7 @@ async fn db_flag_edge_cases_never_fall_back_to_default() {
         dir: src(&t),
         module_root: None,
         baseline: false,
+        with_seed: false,
         module: None,
         db: Some(String::new()),
         format: None,
@@ -289,6 +295,7 @@ async fn db_flag_edge_cases_never_fall_back_to_default() {
         dir: src(&t),
         module_root: None,
         baseline: false,
+        with_seed: false,
         module: None,
         db: None,
         format: None,
@@ -303,6 +310,7 @@ async fn db_flag_edge_cases_never_fall_back_to_default() {
         dir: src(&t),
         module_root: None,
         baseline: false,
+        with_seed: false,
         module: None,
         db: Some("test".into()),
         format: None,
@@ -323,6 +331,7 @@ async fn baseline_records_without_executing() {
         dir: src(&t),
         module_root: None,
         baseline: true,
+        with_seed: false,
         module: None,
         db: None,
         format: None,
@@ -359,6 +368,7 @@ async fn schema_diff_in_sync_when_decls_match_or_absent() {
         dir: src(&t),
         module_root: None,
         baseline: false,
+        with_seed: false,
         module: None,
         db: None,
         format: None,
@@ -386,6 +396,7 @@ async fn schema_diff_flags_missing_table_as_drift() {
         dir: src(&t),
         module_root: None,
         baseline: false,
+        with_seed: false,
         module: None,
         db: None,
         format: None,
@@ -550,6 +561,7 @@ async fn s_json_two_empty_modules_ok() {
         dir: Some(t.join("dist").display().to_string()),
         module_root: None,
         baseline: false,
+        with_seed: false,
         module: None,
         db: None,
         format: Some("json".into()),
@@ -581,6 +593,7 @@ async fn s_json_continue_on_module_failure() {
         dir: Some(t.join("dist").display().to_string()),
         module_root: None,
         baseline: false,
+        with_seed: false,
         module: None,
         db: None,
         format: Some("json".into()),
@@ -619,6 +632,7 @@ async fn s_json_idempotent_rerun() {
         dir: Some(t.join("dist").display().to_string()),
         module_root: None,
         baseline: false,
+        with_seed: false,
         module: None,
         db: None,
         format: Some("json".into()),
@@ -633,6 +647,7 @@ async fn s_json_idempotent_rerun() {
         dir: Some(t.join("dist").display().to_string()),
         module_root: None,
         baseline: false,
+        with_seed: false,
         module: None,
         db: None,
         format: Some("json".into()),
@@ -664,6 +679,7 @@ async fn s_json_failure_site_seq() {
     let out = JsonOut {
         results,
         error: None,
+        seed: None,
     };
     let line = json_line(&out).unwrap();
     assert!(
@@ -690,6 +706,7 @@ async fn s_dirversion_targets_named_version_dir() {
         dir: Some(t.join("dist").display().to_string()),
         module_root: None,
         baseline: false,
+        with_seed: false,
         module: Some("modA-1.0.0".into()),
         db: None,
         format: Some("json".into()),
@@ -723,6 +740,7 @@ async fn s_dirversion_bare_name_targets_only_module() {
         dir: Some(t.join("dist").display().to_string()),
         module_root: None,
         baseline: false,
+        with_seed: false,
         module: Some("modA".into()),
         db: None,
         format: Some("json".into()),
@@ -746,6 +764,7 @@ async fn s_unsupported_format_rejected() {
         dir: None,
         module_root: None,
         baseline: false,
+        with_seed: false,
         module: None,
         db: None,
         format: Some("xml".into()),
@@ -753,4 +772,297 @@ async fn s_unsupported_format_rejected() {
     .await
     .unwrap_err();
     assert!(e.contains("unsupported"), "须点名 unsupported：{e}");
+}
+
+// ===== `--with-seed`（v0.1.125，spec 2026-11-07）================================
+
+/// CLI 全链路（§9 #1 的 oj-bin 等价验证）：`run_migrate --with-seed` 同一次调用、
+/// 不重启，迁移建表 + seed 灌入即得种子行；重跑幂等不翻倍。
+#[tokio::test(flavor = "current_thread")]
+async fn with_seed_replays_after_migrate_and_is_idempotent() {
+    let t = project("wseed-ok");
+    std::fs::write(
+        t.join("src/m/migrations/0001__init.sql"),
+        "CREATE TABLE g (id INTEGER PRIMARY KEY, x TEXT);",
+    )
+    .unwrap();
+    std::fs::write(
+        t.join("src/m/seed.sql"),
+        "INSERT OR IGNORE INTO g (id, x) VALUES (1, 'neo');",
+    )
+    .unwrap();
+    let args = || MigrateArgs {
+        site: None,
+        config: Some(cfg(&t)),
+        dir: src(&t),
+        module_root: None,
+        baseline: false,
+        with_seed: true,
+        module: None,
+        db: None,
+        format: Some("json".into()),
+    };
+    run_migrate(&args()).await.unwrap();
+    let acc = connect_db(&t.join("db.sqlite")).await;
+    let n = || async {
+        acc.query("select count(*) as n from g").await.unwrap()[0]["n"]
+            .as_i64()
+            .unwrap()
+    };
+    assert_eq!(n().await, 1, "seed 须随 migrate 同批灌入、不重启即得行");
+    // 重跑幂等：行数不翻倍（§9 #2）。
+    run_migrate(&args()).await.unwrap();
+    assert_eq!(n().await, 1, "重复 --with-seed 不得翻倍");
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+/// 门禁击穿（§9 #7）：seed 含 DDL → 整条命令非零退出、全量预扫零副作用；
+/// 迁移本身不受影响（迁移门禁先于 seed）。
+#[tokio::test(flavor = "current_thread")]
+async fn with_seed_rejects_ddl_with_zero_side_effects() {
+    let t = project("wseed-ddl");
+    std::fs::write(t.join("src/m/seed.sql"), "/*x*/ CREATE TABLE injected (x);").unwrap();
+    let e = run_migrate(&MigrateArgs {
+        site: None,
+        config: Some(cfg(&t)),
+        dir: src(&t),
+        module_root: None,
+        baseline: false,
+        with_seed: true,
+        module: None,
+        db: None,
+        format: Some("json".into()),
+    })
+    .await
+    .unwrap_err();
+    assert!(
+        e.contains("--with-seed"),
+        "Exit 非 0，原因须点名 --with-seed：{e}"
+    );
+    assert!(has_table(&t, "g").await, "迁移照常成功建 g");
+    assert!(
+        !has_table(&t, "injected").await,
+        "DDL 不得落库（全量预扫零副作用）"
+    );
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+/// 不带旗标：JSON 逐字不变（无 `seed` 键，§9 #5）；带旗标：顶层 `seed.results[]`
+/// 出现，且 `file` 只出文件名、不含绝对路径（§6.8）。
+#[test]
+fn seed_json_field_absent_without_flag_present_with() {
+    let no = json_line(&JsonOut {
+        results: Vec::new(),
+        error: None,
+        seed: None,
+    })
+    .unwrap();
+    assert!(!no.contains("seed"), "不带旗标 JSON 不得出现 seed 键：{no}");
+    let yes = json_line(&JsonOut {
+        results: Vec::new(),
+        error: None,
+        seed: Some(SeedJson {
+            results: vec![crate::seed::SeedResult {
+                module: "m".into(),
+                ok: true,
+                file: Some("seed.sql".into()),
+                dialect: Some("sqlite".into()),
+                stmts: Some(1),
+                error: None,
+            }],
+            error: None,
+        }),
+    })
+    .unwrap();
+    assert!(yes.contains("\"seed\":{"), "带旗标须出现顶层 seed：{yes}");
+    assert!(yes.contains("seed.sql"), "{yes}");
+    assert!(
+        !yes.contains("src/m/seed.sql"),
+        "file 不得含绝对路径：{yes}"
+    );
+}
+
+/// 语义钉死（用户 2026-11-07）：「单独模块只执行本模块 sql」——seed 作用域严格 =
+/// `s.modules`，每个模块只在自己的模块根下 `pick` 本模块的 seed.sql，不整树扩散、
+/// 不跨模块串台、不递归子目录。两个模块各写各的 seed，全量 `--with-seed` 后各表
+/// 各得自己的一行；模块内 nested/ 里的 seed.sql 不得被 scan 到。
+#[tokio::test(flavor = "current_thread")]
+async fn with_seed_scope_is_per_module_no_cross_talk() {
+    let t = project("wseed-scope");
+    std::fs::write(
+        t.join("src/m/migrations/0001__init.sql"),
+        "CREATE TABLE g (id INTEGER PRIMARY KEY, tag TEXT);",
+    )
+    .unwrap();
+    std::fs::write(
+        t.join("src/m/seed.sql"),
+        "INSERT OR IGNORE INTO g (id, tag) VALUES (1, 'from-m');",
+    )
+    .unwrap();
+    // 模块 m2：独立的迁移 + 独立的 seed。
+    std::fs::create_dir_all(t.join("src/m2/migrations")).unwrap();
+    std::fs::write(
+        t.join("src/m2/manifest.yaml"),
+        "name: m2\ndesc: d\nversion: 0.1.0\n",
+    )
+    .unwrap();
+    std::fs::write(
+        t.join("src/m2/migrations/0001__init.sql"),
+        "CREATE TABLE h (id INTEGER PRIMARY KEY, tag TEXT);",
+    )
+    .unwrap();
+    std::fs::write(
+        t.join("src/m2/seed.sql"),
+        "INSERT OR IGNORE INTO h (id, tag) VALUES (1, 'from-m2');",
+    )
+    .unwrap();
+    // 模块内子目录里再放一份 seed.sql：scan 只读模块根首层文件，不得递归执行。
+    std::fs::create_dir_all(t.join("src/m/nested")).unwrap();
+    std::fs::write(
+        t.join("src/m/nested/seed.sql"),
+        "INSERT OR IGNORE INTO g (id, tag) VALUES (9, 'nested');",
+    )
+    .unwrap();
+    run_migrate(&MigrateArgs {
+        site: None,
+        config: Some(cfg(&t)),
+        dir: src(&t),
+        module_root: None,
+        baseline: false,
+        with_seed: true,
+        module: None,
+        db: None,
+        format: Some("json".into()),
+    })
+    .await
+    .unwrap();
+    let acc = connect_db(&t.join("db.sqlite")).await;
+    let g = acc.query("select tag from g").await.unwrap();
+    let h = acc.query("select tag from h").await.unwrap();
+    assert_eq!(g.len(), 1, "g 只应有 m 自己的一行：{g:?}");
+    assert_eq!(g[0]["tag"].as_str(), Some("from-m"));
+    assert_eq!(h.len(), 1, "h 只应有 m2 自己的一行：{h:?}");
+    assert_eq!(h[0]["tag"].as_str(), Some("from-m2"));
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+/// `--module` 定向：seed 作用域跟随 `--module` 过滤后的 `s.modules`，不扩散到未入选
+/// 的模块（设计 §5 组合语义 + 阶段 3「模块定向」待办）。
+#[tokio::test(flavor = "current_thread")]
+async fn with_seed_module_filter_scopes_seed() {
+    let t = project("wseed-filter");
+    std::fs::write(
+        t.join("src/m/migrations/0001__init.sql"),
+        "CREATE TABLE g (id INTEGER PRIMARY KEY, tag TEXT);",
+    )
+    .unwrap();
+    std::fs::write(
+        t.join("src/m/seed.sql"),
+        "INSERT OR IGNORE INTO g VALUES (1, 'from-m');",
+    )
+    .unwrap();
+    std::fs::create_dir_all(t.join("src/m2/migrations")).unwrap();
+    std::fs::write(
+        t.join("src/m2/manifest.yaml"),
+        "name: m2\ndesc: d\nversion: 0.1.0\n",
+    )
+    .unwrap();
+    std::fs::write(
+        t.join("src/m2/migrations/0001__init.sql"),
+        "CREATE TABLE h (id INTEGER PRIMARY KEY, tag TEXT);",
+    )
+    .unwrap();
+    std::fs::write(
+        t.join("src/m2/seed.sql"),
+        "INSERT OR IGNORE INTO h VALUES (1, 'from-m2');",
+    )
+    .unwrap();
+    run_migrate(&MigrateArgs {
+        site: None,
+        config: Some(cfg(&t)),
+        dir: src(&t),
+        module_root: None,
+        baseline: false,
+        with_seed: true,
+        module: Some("m2".into()),
+        db: None,
+        format: Some("json".into()),
+    })
+    .await
+    .unwrap();
+    let acc = connect_db(&t.join("db.sqlite")).await;
+    let h = acc.query("select count(*) as n from h").await.unwrap();
+    assert_eq!(h[0]["n"].as_i64().unwrap(), 1, "m2 的 seed 须随迁移生效");
+    assert!(
+        !has_table(&t, "g").await,
+        "--module m2 时 m 不在 s.modules，其 seed 不得被扩散执行"
+    );
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+/// 组合语义（设计 §5）：migrate 有模块失败 → 不跑 seed，整条命令失败。预建 g 表，
+/// 使「万一 seed 被错误执行」会成功插入一行——以此反证 seed 确实没跑。
+#[tokio::test(flavor = "current_thread")]
+async fn with_seed_migrate_failure_skips_seed() {
+    let t = project("wseed-migfail");
+    std::fs::write(
+        t.join("src/m/migrations/0001__init.sql"),
+        "CREATE TABLE zz (x) GARBAGE;",
+    )
+    .unwrap();
+    let acc = connect_db(&t.join("db.sqlite")).await;
+    acc.exec_with_params("CREATE TABLE g (x)", &[])
+        .await
+        .unwrap();
+    std::fs::write(
+        t.join("src/m/seed.sql"),
+        "INSERT OR IGNORE INTO g VALUES (1);",
+    )
+    .unwrap();
+    let e = run_migrate(&MigrateArgs {
+        site: None,
+        config: Some(cfg(&t)),
+        dir: src(&t),
+        module_root: None,
+        baseline: false,
+        with_seed: true,
+        module: None,
+        db: None,
+        format: Some("json".into()),
+    })
+    .await
+    .unwrap_err();
+    assert!(!e.contains("--with-seed"), "失败须来自迁移、不是 seed：{e}");
+    let n = acc.query("select count(*) as n from g").await.unwrap();
+    assert_eq!(n[0]["n"].as_i64().unwrap(), 0, "迁移失败时 seed 一律不跑");
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+/// FR5 / §8：seed **执行期**失败（门禁放行的幂等 INSERT 打到不存在的表）也要让整条
+/// 命令非零退出——覆盖 `run_seed_phase` 的 `Ok` 分支里逐模块 `ok=false` 的折返路径
+/// （与 DDL 被门禁全局拒绝的 `Err` 分支不同）。
+#[tokio::test(flavor = "current_thread")]
+async fn with_seed_exec_failure_is_nonzero() {
+    let t = project("wseed-execfail");
+    std::fs::write(
+        t.join("src/m/seed.sql"),
+        "INSERT OR IGNORE INTO missing_table VALUES (1);",
+    )
+    .unwrap();
+    let e = run_migrate(&MigrateArgs {
+        site: None,
+        config: Some(cfg(&t)),
+        dir: src(&t),
+        module_root: None,
+        baseline: false,
+        with_seed: true,
+        module: None,
+        db: None,
+        format: Some("json".into()),
+    })
+    .await
+    .unwrap_err();
+    assert!(e.contains("--with-seed"), "seed 失败须整体非零退出：{e}");
+    assert!(has_table(&t, "g").await, "迁移本身应照常成功");
+    let _ = std::fs::remove_dir_all(&t);
 }

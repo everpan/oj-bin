@@ -666,3 +666,71 @@ fn js_strings_and_lead_word_basics() {
     assert_eq!(lead_word("create table x"), "CREATE");
     assert_eq!(lead_word(""), "");
 }
+
+/// v0.1.125 根因修复（评审 S-blocker）：旧 lead_word 逐行找「首个不以 `--`/`/*`
+/// 起头的行」，`/*x*/ DROP TABLE t` 整行被略过 → DDL / 非幂等 INSERT 双绕过。
+/// 改用 code_tokens 后，块注释/行注释/字符串一概剥除，首词取真实关键字。
+#[test]
+fn lead_word_strips_inline_block_comment_bypass() {
+    assert_eq!(lead_word("/*x*/ DROP TABLE t"), "DROP");
+    assert_eq!(lead_word("/*c*/ INSERT INTO t VALUES (1)"), "INSERT");
+    assert_eq!(lead_word("/* a\n b\n */ UPDATE t SET x = 1"), "UPDATE");
+    assert_eq!(
+        lead_word("-- heading\n/* block */\nINSERT OR IGNORE INTO t VALUES (1)"),
+        "INSERT"
+    );
+    assert_eq!(lead_word("   "), "");
+    assert_eq!(lead_word("-- only a comment\n"), "");
+}
+
+/// `--with-seed` 运行期 fail-closed 门禁：只放行幂等 INSERT，其余语句类型一律拒；
+/// 按目标库方言判幂等（mysql 上 pg 的 ON CONFLICT 形态提前拒，不起服才 1064）。
+#[test]
+fn seed_stmt_allowed_is_fail_closed_and_dialect_aware() {
+    // 放行：幂等 INSERT（含前置注释、方言件原生写法）。
+    for s in [
+        "INSERT OR IGNORE INTO t VALUES (1)",
+        "/*c*/ INSERT OR IGNORE INTO t VALUES (1)",
+        "INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING",
+        "INSERT OR REPLACE INTO t VALUES (1)",
+    ] {
+        assert!(seed_stmt_allowed(s, Dialect::Sqlite).is_ok(), "应放行：{s}");
+    }
+    // 拒：DDL（含 /*x*/ 绕过）、写/删/危险指令、事务、非幂等 INSERT、INSERT…SELECT。
+    for s in [
+        "/*x*/ DROP TABLE t",
+        "CREATE TABLE x (a)",
+        "ALTER TABLE t ADD COLUMN a int",
+        "TRUNCATE TABLE t",
+        "RENAME TABLE a TO b",
+        "GRANT ALL ON t TO u",
+        "UPDATE t SET a = 1",
+        "DELETE FROM t",
+        "ATTACH DATABASE 'x' AS y",
+        "PRAGMA foreign_keys = OFF",
+        "VACUUM",
+        "BEGIN",
+        "COMMIT",
+        "CALL rebuild()",
+        "INSERT INTO t VALUES (1)",
+        "/*x*/ INSERT INTO t VALUES (1)",
+        "INSERT OR IGNORE INTO t SELECT * FROM u",
+    ] {
+        assert!(
+            seed_stmt_allowed(s, Dialect::Sqlite).is_err(),
+            "应拒绝：{s}"
+        );
+    }
+    // 按目标库方言：pg 的 ON CONFLICT 在 mysql 目标库上不是幂等写法，提前拒。
+    assert!(
+        seed_stmt_allowed(
+            "INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING",
+            Dialect::MySql
+        )
+        .is_err()
+    );
+    // mysql 原生 INSERT IGNORE 在 mysql 目标库上放行。
+    assert!(seed_stmt_allowed("INSERT IGNORE INTO t VALUES (1)", Dialect::MySql).is_ok());
+    // 纯注释 chunk：无可执行的词，放行（不该把注释当危险语句）。
+    assert!(seed_stmt_allowed("-- just a note", Dialect::Sqlite).is_ok());
+}

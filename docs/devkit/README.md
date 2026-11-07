@@ -40,6 +40,16 @@ cp bin/devkit/global.d.ts bin/devkit/oj-modules.d.ts .                       # �
 手册与 skill 随 oj 版本一起发布。升级 oj 后，用新包里的 `devkit/` 覆盖旧拷贝即可。
 源文件与反馈入口在仓库 `docs/devkit/`。
 
+v0.1.125 已落地部分：**`oj migrate --with-seed`——迁移后同批重放 seed，补齐「装完数据面空」缺口**——
+为 `oj migrate` 增加 opt-in 旗标 `--with-seed`（与 `--baseline` 互斥）：迁移全部成功后，对同一批
+模块（含 `--module` 过滤）在同一命令、同一目标库连接上紧接着重放各自的 `seed.sql` /
+`seed.<方言>.sql`，严格 migrate→seed、幂等可重跑、逐模块作用域不串台。`--format json` 顶层新增
+可选 `seed` 对象（不污染 `results`），seed 失败使整条命令退非 0 并在 stderr 前置诊断。新入口有
+fail-closed 运行期白名单（只放行幂等 INSERT、执行前全量预扫零副作用）。本轮只交付 oj-bin CLI
+能力；下游 `ojm install` 接入（`buildMigrateCmd` / `platform.exec` 白名单 / `MIN_OJ_VERSION`）留待
+单独交付。见 api-manual §3「三层 SQL 文件」与 §10「`oj migrate --with-seed`」/ 命令与错误表、
+scenarios 场景 73、SKILL 陷阱速查。
+
 v0.1.124 已落地部分：**reload force 值口径收紧**——裸 `?force`（query 中无 `=` 的旗）
 视同**未强制**（fail-closed：未记载的输入绝不触发特权强制，对齐「值取 `1`/`true`」的
 既有契约）；并钉死 force+busy 串行——持锁下 `?force=1` 仍 409。契约不变，自动化工具

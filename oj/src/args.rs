@@ -1,5 +1,6 @@
 //! oj 命令行（clap derive）。子命令：serve / build / test / migrate / schema / secret /
-//! exec / openapi / info。
+//! exec / openapi / info。migrate 另支持 `--with-seed`（迁移完成后同批重放 seed.sql，
+//! opt-in；见 `oj migrate --help`）。
 //! 帮助 `oj --help` / `oj <cmd> --help`；空参打印帮助、非法参数报错均由 clap 退出（code 2）。
 //! 所有命令的 `-c/--config` 均可省（v0.1.57）：缺省按 CWD 逐级向上 config.yaml →
 //! $HOME/.oj/config.yaml 搜索，未找到用内置默认值；显式 -c 缺失仍报错。
@@ -153,6 +154,9 @@ pub struct MigrateArgs {
     pub module_root: Option<String>,
     /// 存量库接入门：全部迁移记为已应用而不执行（P0 建过表的库，Q5）。
     pub baseline: bool,
+    /// `--with-seed`（v0.1.125）：迁移完成后对**同一批模块**同批重放 seed.sql
+    /// （opt-in，缺省关；与 `--baseline` 互斥）。seed 失败 → 整条命令非零退出。
+    pub with_seed: bool,
     /// 只迁移指定模块。裸模块名精确匹配（现状）；未命中时按 dist 版本目录名
     /// `<module>-<version>` 定向（dev 树目录名即裸名，版本目录定向仅 dist 有意义）。
     pub module: Option<String>,
@@ -400,6 +404,10 @@ enum Commands {
         /// 存量库接入门：≤head 的迁移全部记为已应用而不执行（P0 建过表的库）
         #[arg(long)]
         baseline: bool,
+        /// 迁移完成后对同一批模块同批重放 seed.sql（opt-in，缺省关；与 --baseline 互斥）。
+        /// seed 失败 → 整条命令非零退出（安装器以 exit code 为成败真源）
+        #[arg(long = "with-seed", conflicts_with = "baseline")]
+        with_seed: bool,
         /// 只迁移指定模块（裸模块名 / dist 版本目录名 `<module>-<version>`）
         module: Option<String>,
         /// 输出格式：`json`（stdout 一行 `{"results":[...]}`，错误脱敏）；
@@ -796,6 +804,7 @@ fn to_command(cli: Cli) -> Command {
             module_root,
             db,
             baseline,
+            with_seed,
             module,
             format,
         } => Command::Migrate(MigrateArgs {
@@ -804,6 +813,7 @@ fn to_command(cli: Cli) -> Command {
             dir,
             module_root,
             baseline,
+            with_seed,
             module,
             db,
             format,

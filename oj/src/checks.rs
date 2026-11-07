@@ -420,20 +420,17 @@ fn nested_manifests(src: &Path, index: Option<&ModuleIndex>) -> Result<Vec<Strin
     Ok(out)
 }
 
-/// 语句首词（跳过 `--` 行注释与空白；大小写归一）。S006 与 fixtures 门禁共用。
+/// 语句首词（大小写归一）：取 [`code_tokens`] 的首个关键字 token。S006 与
+/// fixtures 门禁共用同一口径。
+///
+/// 根因修复（v0.1.125）：旧实现逐行找「首个不以 `--` / `/*` 起头的行」，
+/// 于是 `/*x*/ DROP TABLE t` 整行以 `/*` 起头被略过 → DDL / 非幂等 INSERT
+/// 双绕过（`find` 返回 None → 空首词）。改用统一词法器剥注释/字符串后取首词，
+/// 与幂等判据 [`insert_is_idempotent_in`] 及新运行期门禁 [`seed_stmt_allowed`]
+/// 同源，一举堵住绕过且让 S006 / fixtures 一并受益；准入口径不变（正常语句
+/// 仍返回同一首词）。
 pub(crate) fn lead_word(stmt: &str) -> String {
-    stmt.lines()
-        .find(|l| {
-            let t = l.trim_start();
-            !t.is_empty() && !t.starts_with("--") && !t.starts_with("/*")
-        })
-        .and_then(|l| {
-            l.trim_start()
-                .split(|c: char| !c.is_ascii_alphabetic())
-                .next()
-                .map(|w| w.to_ascii_uppercase())
-        })
-        .unwrap_or_default()
+    code_tokens(stmt).into_iter().next().unwrap_or_default()
 }
 
 /// INSERT 幂等判据（S006 seed 与 `load_fixtures` 门禁共用同一口径）：两者都随启动/
@@ -468,10 +465,47 @@ pub(crate) fn insert_is_idempotent_in(stmt: &str, dialect: Option<Dialect>) -> b
     }
 }
 
+/// `oj migrate --with-seed` 的**运行期 fail-closed 门禁**（spec 2026-11-07 §6）。
+///
+/// 只放行**幂等 INSERT**，其余语句类型一律拒。执行对象可能是安装器刚解包的第三方
+/// `.tgz` 内的 seed，未必过 `oj check` S006（构建期静态、按文件方言、仅拦 7 个 DDL
+/// 词 + 非幂等 INSERT），故此处按**目标库方言** `Some(d)` 收敛、首词用 [`code_tokens`]
+/// 取（已剥注释/字符串，堵住 `/*x*/ DROP` 绕过）。定位是 opt-in 新入口的纵深防御，
+/// 非对抗已签名恶意包的完整沙箱；写他模块表 / 单 DSN 全库权限属剩余风险（设计 §12 登记）。
+///
+/// 与 S006 有意不对称：冷启动 `replay_all` 逐字不变、不加门禁（部署方自持工程，
+/// 依赖构建期过 `oj check`）；本门禁只装在新旗标这条信任边界不同的入口上。
+pub(crate) fn seed_stmt_allowed(stmt: &str, dialect: Dialect) -> Result<(), String> {
+    let toks = code_tokens(stmt);
+    let Some(head) = toks.first().map(String::as_str) else {
+        // 纯注释 / 空 chunk：无可执行的词，放行（`split_statements` 已滤空串）。
+        return Ok(());
+    };
+    if head != "INSERT" {
+        return Err(format!(
+            "语句类型 {head:?} 不在白名单（--with-seed 只放行幂等 INSERT，\
+             禁 DDL / UPDATE / DELETE / REPLACE / PRAGMA / ATTACH / 事务控制等）"
+        ));
+    }
+    // INSERT … SELECT 会读他表（运行期无模块归属图），即便带幂等前缀也拒（§6.1）。
+    if toks.iter().any(|t| t == "SELECT") {
+        return Err("INSERT … SELECT 不允许（--with-seed 不接受子查询 / 跨表读取）".to_string());
+    }
+    if !insert_is_idempotent_in(stmt, Some(dialect)) {
+        return Err(format!(
+            "非幂等 INSERT（{} 方言）：--with-seed 可重复执行，须幂等写法 \
+             （INSERT OR IGNORE / INSERT IGNORE / ON CONFLICT / ON DUPLICATE KEY / OR REPLACE）",
+            dialect.as_str()
+        ));
+    }
+    Ok(())
+}
+
 /// SQL 关键字 token（大写）：剥 `--` 行注释、`/* */` 块注释与 `'…'` 字符串字面量，
 /// 只留标识符/数字。幂等判据按 token 相邻匹配，避免「注释里提到 INSERT IGNORE」
-/// 「字符串值里出现 ON CONFLICT」这类误判。
-fn code_tokens(sql: &str) -> Vec<String> {
+/// 「字符串值里出现 ON CONFLICT」这类误判。`pub(crate)`：新入口的运行期门禁
+/// （[`seed_stmt_allowed`]）与 S006 / fixtures 共用这一份词法结果。
+pub(crate) fn code_tokens(sql: &str) -> Vec<String> {
     fn flush(out: &mut Vec<String>, cur: &mut String) {
         if !cur.is_empty() {
             out.push(std::mem::take(cur));

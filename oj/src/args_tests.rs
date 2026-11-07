@@ -408,6 +408,32 @@ fn migrate_baseline_and_module_positional() {
         (a.baseline, a.module.as_deref(), a.dir.as_deref()),
         (true, Some("user"), None)
     );
+    assert!(!a.with_seed);
+}
+
+/// v0.1.125 `--with-seed`：缺省关、显式开透传、与 --baseline 互斥（clap exit 2）。
+#[test]
+fn migrate_with_seed_flag_parses_and_conflicts_with_baseline() {
+    let cli =
+        |argv: &[&str]| Cli::try_parse_from(std::iter::once("oj").chain(argv.iter().copied()));
+    let Command::Migrate(a) = cmd(&[
+        "migrate",
+        "--with-seed",
+        "--format",
+        "json",
+        "-d",
+        "dist",
+        "books",
+    ]) else {
+        panic!()
+    };
+    assert!(a.with_seed);
+    assert_eq!(a.module.as_deref(), Some("books"));
+    assert_eq!(a.format.as_deref(), Some("json"));
+    assert!(!a.baseline);
+    // 与 --baseline 互斥（存量库表可能未建、且已有数据，不许同批灌种）。
+    let e = cli(&["migrate", "--with-seed", "--baseline"]).unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::ArgumentConflict, "{e}");
 }
 
 #[test]

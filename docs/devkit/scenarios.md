@@ -43,6 +43,7 @@
 | [40](#sc40) | 长任务中途 kill：`exec.run` 超时整组击杀 / `exec.spawn().kill()` 主动击杀（v0.1.78） | §6 exec |
 | [41](#场景-41通知回执合并--幂等写入构造器补齐能力v0181) | 通知回执合并 + 幂等写入：join ON 值条件 / 字面量列 `scope` / `orIgnore` / `fromSelect`（v0.1.81 补齐，替代手写 `db.query`） | §6 db / 查询构造器 |
 | [42](#场景-42运行期动态登记数据源-client-轴v0191) | 运行期把 DSN 登记为命名库：`db.client.register("rep", dsn)` → `DB("rep")` 直接可用（复用 L1 访问控制 + L2 内省）；未声明 `db_access.<name>` 的动态库默认 deny | §6 db / `db.client` |
+| [73](#场景-73装完部署后让-seed-随迁移即时灌oj-migrate---with-seedv01125) | 带 `seed.sql` 的模块装完数据面空：`oj migrate --with-seed` 把迁移+seed 一起做完（严格 migrate→seed、幂等、fail-closed 门禁、`--format json` 顶层 `seed`、exit code 成败真源） | §3 数据层 / §10 `oj migrate --with-seed` |
 
 ---
 
@@ -2715,6 +2716,15 @@ curl -s -X POST http://localhost:9778/v1/platform/ojm-installer/install/ \
 | 只 `JSON.parse(r.stdout)` 成功就当迁移成功 | json `error` 已脱敏、迁移失败仍成功解析——**退出码 `r.code` 才是真源**，必须 `r.code===0 && results.every(ok)` |
 | `yaml.stringify` 回写 config.yaml 后注释全丢 | 本场景刻意走「文本手术三步」而非 stringify 覆盖——serde_yaml 丢注释，config 回写禁走 stringify（§6 yaml） |
 
+> **关于「装完带 seed 的模块数据面空」（U7 / v0.1.125，交付边界）**：本场景步骤 7 仍
+> 只跑纯迁移（`oj migrate --format json`），带 `seed.sql` 的模块要等下次冷启动才灌——
+> 这是 v0.1.125 前的既有行为，本场景代码依旧成立（不加旗标行为逐字节不变）。新能力
+> `oj migrate --with-seed` 由**下游安装器**接入时需要三处联动：① `buildMigrateCmd` 的
+> argv 加 `--with-seed`；② `platform.exec` 白名单新增一条**逐 token 精确**的模板（旧模板
+> 不带旗标、不会自动兼容，见 ① 上方 allow 列表）；③ `MIN_OJ_VERSION` 抬到 `0.1.125`。
+> 本轮 oj-bin 只交付 CLI 能力、未改下游，端到端闭环留待 `oj-module` 单独交付。运维 / CI
+> 想立即做到「装完即就绪」，直接跑 `oj migrate --with-seed` 即可——照抄见 **场景 73**。
+
 ---
 
 
@@ -4713,3 +4723,65 @@ curl -X POST 'http://127.0.0.1:9778/v1/api/_system/config'   # → msg:"unchange
   `force=yes` 等一律视同未强制——别指望 `force=yes` 生效；裸 `?force`（无 `=` 的旗）
   同样不算强制（v0.1.124 收紧）——自动化工具请始终发 `force=1`。
 - **JS 面缺省即旧语义**：`reloadConfig()` 不带参 = 未强制，行为与 v0.1.122 逐字一致。
+
+---
+
+## 场景 73：装完/部署后让 seed 随迁移即时灌（`oj migrate --with-seed`，v0.1.125）
+
+> 何时抄我：市场/解决方案模块带 `seed.sql`（字典、初始配置、演示数据），但装完发现
+> **数据面是空的**——v0.1.125 前 seed 只在**冷启动**（`app.rs` 的 `!reused` 门禁）
+> 重放，而安装器 `ojm install` 只跑 `oj migrate`、不跑 seed，两者被一次重启隔开。
+> 现在一条命令把迁移 + seed 一起做完，装完即就绪（运维 / CI 直跑；安装器端到端
+> 接入见下方「交付边界」）。
+> 手册 §3 数据层 / §10「`oj migrate --with-seed`」、`api-manual.md` 命令与错误表。
+
+```bash
+# 全模块：迁移成功后紧接着重放各模块自己的 seed.sql（严格 migrate→seed、同一目标库连接）
+./bin/oj migrate --with-seed -c config.yaml -d dist
+
+# 定向单模块（seed 作用域 = 迁移的同一批 s.modules，只跑本模块的 seed.sql）
+./bin/oj migrate --with-seed -c config.yaml -d src --module books
+
+# 安装器 / CI 机器可读：--format json 顶层多一个可选 seed 对象（不污染 results）
+./bin/oj migrate --with-seed --format json -c config.yaml -d dist books
+# → {"results":[{"module":"books","ok":true,"applied":[{"version":1,"name":"0001__init"}]}],
+#    "seed":{"results":[{"module":"books","ok":true,"file":"seed.sql","dialect":"sqlite","stmts":3}]}}
+
+# 幂等、安全重试：修复 seed.sql 后原样重跑即可（INSERT OR IGNORE 不翻倍）
+./bin/oj migrate --with-seed -c config.yaml -d dist books
+```
+
+`seed.sql` 必须是**幂等 INSERT**（方言件 `seed.<dialect>.sql` 优先、`seed.sql` 兜底，
+绝不双跑）：
+
+```sql
+-- src/books/seed.sql（sqlite；mysql 用 INSERT IGNORE、pg 用 ON CONFLICT DO NOTHING）
+INSERT OR IGNORE INTO category VALUES (1, '小说');
+INSERT OR IGNORE INTO category VALUES (2, '技术');
+```
+
+**若经特权模块 `exec.run` 调用（安装器路径，见场景 35）**：`platform.exec` 白名单是
+**逐 token 精确模板**，加 `--with-seed` 必须**新增一条** argv 模板（旧模板不带旗标、
+不会自动兼容），否则 `NotCapable: … template mismatch`：
+
+```yaml
+# config.yaml（示意：下游安装器接入后需要的新模板，本轮 oj-bin 未改下游）
+platform:
+  exec:
+    ojm-installer:
+      allow:
+        - "oj migrate -c ${path:config} --format json -d ${path:root} ${raw:module}"                    # 旧：纯迁移
+        - "oj migrate --with-seed -c ${path:config} --format json -d ${path:root} ${raw:module}"     # 新：迁移+seed
+```
+
+| 坑 | 解 |
+|---|---|
+| 报「语句类型 … 不在白名单」/「非幂等 INSERT」 | fail-closed 门禁只放行幂等 INSERT，拒绝 DDL / `UPDATE` / `DELETE` / `REPLACE` / `PRAGMA` / `ATTACH` / 事务控制 / `INSERT … SELECT` / 裸 `INSERT`（含 `/*x*/ DROP` 行首注释绕过）。**执行前全量预扫、命中即零行落库**——改 `INSERT OR IGNORE` / `INSERT IGNORE` / `ON CONFLICT DO NOTHING` 后重跑；或去掉旗标交由下次冷启动 |
+| 迁移成功却退非 0 | seed 失败使**整条命令**退非 0（迁移已提交、seed 未灌）。看 stderr 前置诊断 `oj migrate --with-seed 失败：…` 点名的模块/文件/语句；`--format json` 的 `seed.results[].ok=false` 携脱敏、裁剪原因。修复后重跑本命令（幂等、安全重试） |
+| seed 目标表不存在 | 执行顺序严格 migrate→seed：seed INSERT 的目标表须由**迁移**先建好；若表只在 `schema.yaml` 声明、没写迁移，先补 `migrations/` 再跑 |
+| 同时传 `--with-seed` 与 `--baseline` | clap 参数冲突（互斥）——存量库接入用 `--baseline`（只记账不执行），要灌 seed 单独再跑 `oj migrate --with-seed` |
+| 默认（不加旗标）行为 | 逐字节不变：只跑迁移、不碰 seed；`--format json` 输出不含 `seed` 字段 |
+| 装完数据面还是空（安装器路径） | **交付边界**：本轮只交付 oj-bin 的 CLI 能力，下游 `ojm install` 尚未在 `buildMigrateCmd` 传 `--with-seed`，`platform.exec` 白名单与 `MIN_OJ_VERSION` 也未联动——「装完即数据面就绪」的安装端到端闭环留待下游单独交付。运维 / CI 直接调上面命令不受影响 |
+
+> 相关：§3「三层 SQL 文件」的 seed 行、`SKILL.md` 陷阱速查「装完带 seed 的模块数据面空」、
+> `api-manual.md` §13「门禁是词法白名单、非完整沙箱 / 不自动接进 ojm install」。

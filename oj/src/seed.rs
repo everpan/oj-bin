@@ -472,6 +472,182 @@ fn leak_str(s: String) -> &'static str {
     Box::leak(s.into_boxed_str())
 }
 
+// ===== `oj migrate --with-seed`（v0.1.125，spec 2026-11-07）====================
+//
+// 与冷启动 `replay_all` 的关系：**只共享执行核心**，不复用其 `collect` / 门控 /
+// skipped+misnamed 告警 / `any_seed` 早退（那些逐字留给冷启动，保持 12 个单测基线）。
+// 新入口吃 `run_migrate` 现成的 `s.modules`（已过 `--module` 过滤）与 `s.target`，
+// 并把信任边界不同的运行期 fail-closed 门禁装在这条 opt-in 路径上（§6）。
+
+/// `--with-seed` 逐模块结果（JSON 顶层 `seed.results[]` 元素）。逐模块
+/// continue-and-collect，与 `migrate_collect` 同形；`file` 只出**文件名**（不含
+/// 绝对路径，§6.8 信息泄漏面收敛）。
+#[derive(Debug, serde::Serialize)]
+pub struct SeedResult {
+    pub module: String,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dialect: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stmts: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// 一次收集产物：模块名 + 文件名（诊断用）+ 文本。门禁与执行共用**同一份文本**
+/// （§6.5「同一 chunk 既判又跑」），且避免同进程二次读盘的 TOCTOU。
+struct SeedText {
+    module: String,
+    label: String,
+    text: String,
+}
+
+/// seed 错误文本脱敏 + 限长：`sanitize_dsn` 抹 DSN 凭据、按 `log_snip` 口径裁到
+/// 300 字，避免把绝对路径 / 完整 SQL 回显到 JSON / stderr（§6.8）。
+fn seed_err(e: impl std::fmt::Display) -> String {
+    let s = crate::migrate_cmd::sanitize_dsn(&e.to_string());
+    s.chars().take(300).collect()
+}
+
+/// 收齐全部模块的 seed 文本（`pick` 选方言件/通用件、绝不双跑）；模块无匹配
+/// seed → 跳过（no-op，对齐冷启动纪律：不告警、零日志噪音）。
+fn collect_texts(modules: &[(String, PathBuf)], dialect: Dialect) -> Result<Vec<SeedText>, String> {
+    let mut out = Vec::new();
+    for (name, root) in modules {
+        let p = pick(root, dialect);
+        let Some(f) = p.chosen else {
+            continue;
+        };
+        let label = f
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| show(&f));
+        let text = std::fs::read_to_string(&f)
+            .map_err(|e| format!("读取 seed {name}/{label} 失败：{}", seed_err(e)))?;
+        out.push(SeedText {
+            module: name.clone(),
+            label,
+            text,
+        });
+    }
+    Ok(out)
+}
+
+/// 全量预扫门禁（FR11）：收齐的**全部** chunk 统一过 fail-closed 门禁后，调用方
+/// 才进 S002 与 exec——命中即零行落库，杜绝「A 已提交、B 才命中 DDL」。
+fn gate_texts(texts: &[SeedText], dialect: Dialect) -> Result<(), String> {
+    for st in texts {
+        for (i, stmt) in split_statements(&st.text).into_iter().enumerate() {
+            if let Err(reason) = crate::checks::seed_stmt_allowed(stmt, dialect) {
+                return Err(format!(
+                    "seed {}/{} 第 {i} 条语句被 --with-seed 运行期门禁拒绝：{reason}\n  \
+                     下一步：把 seed.sql 改成幂等 INSERT 后重跑 oj migrate --with-seed；\
+                     或去掉 --with-seed，交由下一次冷启动重放",
+                    st.module, st.label
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 运行期门禁的**纯前置入口**（FR10，评审 A-major）：只收集 + 门禁、不执行，
+/// 不带任何 policy 参数。与 [`replay_modules`] 共用 [`collect_texts`] / [`gate_texts`]，
+/// 供单测直接钉死击穿尝试（评审：插旗式声明会漏防护）。
+pub fn pre_validate_seeds(modules: &[(String, PathBuf)], dialect: Dialect) -> Result<(), String> {
+    gate_texts(&collect_texts(modules, dialect)?, dialect)
+}
+
+/// `oj migrate --with-seed` 的 seed 重放入口：对**同一批 `s.modules`**、共用
+/// `s.target` 库连接。内部由 `dialect_info()` → `Dialect::known` 解析方言（fail-loud，
+/// 不复制两份门控，评审 E-B6），先全量门禁 + S002（零副作用）才逐语句 exec、
+/// 逐模块 continue-and-collect。
+///
+/// `Ok(results)`：执行完成，逐模块 `ok/error`（任一 `ok=false` 由调用方折成命令
+/// 非零退出）。`Err(e)`：执行前的**全局**失败（未知方言 / 门禁 / S002 / 读文件），
+/// 此时零语句落库——与「单点 Err 吞掉逐模块结果」不同，逐模块失败仍在 `Ok` 内，
+/// 故 §8 的 `seed.results[].ok=false` 不受影响。
+pub async fn replay_modules(
+    db: &Arc<dyn DataAccessor>,
+    modules: &[(String, PathBuf)],
+) -> Result<Vec<SeedResult>, String> {
+    // 方言门控（T8，与 replay_all 同源）：未知方言 fail-loud，绝不回落 Sqlite。
+    let dialect_name = db.dialect_info().name.clone();
+    let Some(dialect) = Dialect::known(&dialect_name) else {
+        return Err(only_js::bridge::db_error::unsupported(&dialect_name, "seed").message);
+    };
+    let texts = collect_texts(modules, dialect)?;
+    // 全量预扫：门禁 + S002 都跑在 exec 之前（FR11 零副作用）。
+    gate_texts(&texts, dialect)?;
+    // S002 冲突检查（选中集内）：表 → 首见文件。用 owned String 避免冷启动那份
+    // `leak_str` 的进程级泄漏；语义一致：表→模块 单射，不静默合并。
+    let mut owner: HashMap<String, String> = HashMap::new();
+    for st in &texts {
+        for t in create_tables(&st.text) {
+            if let Some(prev) = owner.get(&t) {
+                return Err(format!(
+                    "S002: 表 `{t}` 被多处建表：{prev} 与 {}/{}\n  \
+                     原因：模块自治要求 表→模块 单射（§8-1），不静默合并。\n  \
+                     下一步：保留唯一归属处的建表与数据，删除另一处后重试。",
+                    st.module, st.label
+                ));
+            }
+            owner.insert(t, st.label.clone());
+        }
+    }
+    let mut results = Vec::new();
+    for st in &texts {
+        let mut applied = 0usize;
+        let mut failure = None;
+        for (i, stmt) in split_statements(&st.text).into_iter().enumerate() {
+            // 门禁判原文、执行判改写后（§6.5 同一 chunk 既判又跑）。
+            let sql = translate_insert(stmt, dialect);
+            if let Err(e) = db.exec_with_params(&sql, &[]).await {
+                let msg = seed_err(e);
+                tracing::error!(
+                    module = %st.module,
+                    file = %st.label,
+                    seq = i,
+                    "seed failed: {msg}"
+                );
+                failure = Some(format!("第 {i} 条语句执行失败：{msg}"));
+                break; // 模块内首错即停（与迁移模块内 abort 同形）
+            }
+            applied += 1;
+        }
+        match failure {
+            None => {
+                tracing::info!(
+                    module = %st.module,
+                    file = %st.label,
+                    dialect = dialect.as_str(),
+                    stmts = applied,
+                    "seed ok"
+                );
+                results.push(SeedResult {
+                    module: st.module.clone(),
+                    ok: true,
+                    file: Some(st.label.clone()),
+                    dialect: Some(dialect.as_str().to_string()),
+                    stmts: Some(applied),
+                    error: None,
+                });
+            }
+            Some(error) => results.push(SeedResult {
+                module: st.module.clone(),
+                ok: false,
+                file: Some(st.label.clone()),
+                dialect: Some(dialect.as_str().to_string()),
+                stmts: None,
+                error: Some(error),
+            }),
+        }
+    }
+    Ok(results)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -816,6 +992,101 @@ mod tests {
         std::fs::create_dir_all(t.join("src/u")).unwrap();
         let tables = replay(&t, &t.join("src")).await.unwrap();
         assert!(tables.is_empty());
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    // ===== `oj migrate --with-seed`（v0.1.125）新增用例 ==========================
+
+    /// 纯前置门禁入口能独立钉死 `/*x*/ DROP` 击穿（评审：插旗式声明会漏防护），
+    /// 且合法幂等件放行、错误给下一步。
+    #[test]
+    fn pre_validate_seeds_blocks_bypass_and_accepts_idempotent() {
+        let t = tmp("preval");
+        let mods = vec![("u".to_string(), t.join("src/u"))];
+        write(t.join("src/u/seed.sql"), "/*x*/ DROP TABLE t;");
+        let e = pre_validate_seeds(&mods, Dialect::Sqlite).unwrap_err();
+        assert!(e.contains("门禁"), "{e}");
+        assert!(e.contains("下一步"), "错误须给下一步：{e}");
+        write(
+            t.join("src/u/seed.sql"),
+            "INSERT OR IGNORE INTO t VALUES (1);",
+        );
+        assert!(pre_validate_seeds(&mods, Dialect::Sqlite).is_ok());
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// 无 seed 的模块 → 成功 no-op（FR4 零噪音）。
+    #[test]
+    fn pre_validate_seeds_no_seed_is_noop() {
+        let t = tmp("noseed");
+        std::fs::create_dir_all(t.join("src/u")).unwrap();
+        let mods = vec![("u".to_string(), t.join("src/u"))];
+        assert!(pre_validate_seeds(&mods, Dialect::Sqlite).is_ok());
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// 直连真 sqlite 内存库（供 replay_modules 直测，绕开 config/插件装配）。
+    async fn seed_db(t: &Path) -> Arc<dyn DataAccessor> {
+        only_js::bridge::DbBackendRegistry::builtin()
+            .connect("sqlite::memory:", t)
+            .await
+            .unwrap()
+    }
+
+    /// FR11 全量预扫零副作用（击穿尝试）：模块 A 合法 + 模块 B 含 DDL → A 也零行
+    /// 落库，杜绝「A 已提交、B 才命中门禁」。
+    #[tokio::test(flavor = "current_thread")]
+    async fn replay_modules_full_prescan_leaves_zero_rows() {
+        let t = tmp("prescan");
+        write(
+            t.join("src/a/seed.sql"),
+            "INSERT OR IGNORE INTO g VALUES (1);",
+        );
+        write(t.join("src/b/seed.sql"), "CREATE TABLE leaked (x);");
+        let db = seed_db(&t).await;
+        db.exec_with_params("CREATE TABLE g (x)", &[])
+            .await
+            .unwrap();
+        let mods = vec![
+            ("a".to_string(), t.join("src/a")),
+            ("b".to_string(), t.join("src/b")),
+        ];
+        let e = replay_modules(&db, &mods).await.unwrap_err();
+        assert!(e.contains("门禁"), "B 的 DDL 须被门禁拒：{e}");
+        // A 的合法 INSERT 也不得落库（全量预扫在 exec 之前）。
+        let rows = db.query("select count(*) as n from g").await.unwrap();
+        assert_eq!(rows[0]["n"].as_i64().unwrap(), 0, "全量预扫须零行落库");
+        let leaked = db
+            .query("select name from sqlite_master where type='table' and name='leaked'")
+            .await
+            .unwrap();
+        assert!(leaked.is_empty(), "DDL 不得建表");
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// 重复 replay_modules 行数不翻倍（§9 #2）；结果形状 file 只出文件名。
+    #[tokio::test(flavor = "current_thread")]
+    async fn replay_modules_is_idempotent_and_shapes_result() {
+        let t = tmp("idem");
+        // OR IGNORE 需要主键 / 唯一约束才真正幂等；无约束时每次 INSERT 都成功。
+        write(
+            t.join("src/u/seed.sql"),
+            "INSERT OR IGNORE INTO g VALUES (1, 'a');\nINSERT OR IGNORE INTO g VALUES (2, 'b');",
+        );
+        let db = seed_db(&t).await;
+        db.exec_with_params("CREATE TABLE g (id INTEGER PRIMARY KEY, x TEXT)", &[])
+            .await
+            .unwrap();
+        let mods = vec![("u".to_string(), t.join("src/u"))];
+        let r1 = replay_modules(&db, &mods).await.unwrap();
+        assert_eq!(r1.len(), 1);
+        assert!(r1[0].ok);
+        assert_eq!(r1[0].stmts, Some(2));
+        assert_eq!(r1[0].file.as_deref(), Some("seed.sql"));
+        assert_eq!(r1[0].dialect.as_deref(), Some("sqlite"));
+        replay_modules(&db, &mods).await.unwrap();
+        let rows = db.query("select count(*) as n from g").await.unwrap();
+        assert_eq!(rows[0]["n"].as_i64().unwrap(), 2, "重放不得翻倍");
         let _ = std::fs::remove_dir_all(&t);
     }
 }
