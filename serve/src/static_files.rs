@@ -827,7 +827,10 @@ pub(crate) async fn compressed_body_or_cache(
             // guard 不能横跨 await（!Send 污染 future）：clone Arc 即放锁
             let cur = INFLIGHT.lock().unwrap().get(&key).cloned();
             match cur {
-                None => return None, // leader 已收尾且缓存未命中（无收益路径）→ 同答 None
+                // leader 已收尾。guard drop 在 rename 之后，键移除 ⇒ 文件必已落盘；
+                // 但 follower 上一轮 cached() 的 miss 可能早于 rename（macOS CI 实 flake），
+                // 收尾前再查一次缓存，勿把已落盘字节答成 None。
+                None => return cached(dir, &key).await,
                 Some(cur) => {
                     if !cur.same_channel(&wait) {
                         rx = cur.subscribe(); // 换代：改盯当前 sender
