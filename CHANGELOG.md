@@ -16,6 +16,15 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## 下一版（未发布）
+
+- **fix（serve，静态压缩 single-flight 收尾竞态）**：并发同键请求在 macOS CI 偶发
+  `concurrent_misses_compress_once` 红。follower 循环内「查缓存」与「读 INFLIGHT 登记」
+  之间有 await，leader 在间隙完成 rename 落盘 + guard drop 清键后，follower 见键已移除
+  直接答 `None`——把已落盘的压缩字节错答成 miss（并发请求响应体不一致）。改为键移除后
+  先复查一次缓存再答 `None`（guard drop 在 rename 之后，键移除 ⇒ 文件必已落盘；无收益
+  路径复查仍得 `None`，语义不变）。`concurrent_misses_compress_once` ×50 本地全过。
+
 ## v0.1.128（2026-11-09）
 
 **feat（bridge，SQL 构造器：`fromSelect().orIgnore()` 三方言闭环）**：此前
