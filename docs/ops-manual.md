@@ -154,6 +154,44 @@ kill 12345                       # 停机：SIGTERM 走优雅停机（排空在�
 `--daemon` 下 stdio 重定向到空设备，启动失败的真因看 `logs/server-*.log`
 （unix 走 setsid 脱离控制终端；Windows 走 DETACHED_PROCESS + CREATE_NEW_PROCESS_GROUP）。
 
+### 2.0 systemd 托管（推荐，替代 `--daemon`）
+
+`--daemon` 是"无 systemd 时的轻量守护"。有 systemd 就别用它——就绪语义、超时、
+失败重启都交给 unit，且 daemon 模式的 30s 就绪等待上限（`DAEMON_READY_TIMEOUT`）
+整个消失。模板：
+
+```ini
+[Unit]
+Description=oj serve
+After=network.target
+
+[Service]
+Type=simple
+# 迁移 + seed 移出服务进程关键路径：失败即 ExecStartPre 非零，服务不会带伤启动。
+# --with-seed 仅当需要 seed 重放时加（与 serve 启动的 seed 重放语义一致，幂等可重跑）。
+ExecStartPre=/opt/oj/bin/oj migrate -c /opt/oj/config.yaml --api-path /opt/oj/dist --with-seed
+ExecStart=/opt/oj/bin/oj serve -c /opt/oj/config.yaml --api-path /opt/oj/dist
+# 按实测填：跑几次冷启动，看 listening 行的 `startup …` 总耗时（见 §6），留一倍余量。
+TimeoutStartSec=60
+Restart=on-failure
+RestartSec=2
+# oj 无 sd_notify——就绪判据用健康探针（ExecStartPost 轮询 {base}/health 或外部监控），
+# 不要把 Type 写成 notify（会挂起超时）。
+ExecStartPost=/bin/sh -c 'for i in $(seq 1 30); do curl -sf http://127.0.0.1:9778/v1/api/health && exit 0; sleep 1; done; exit 1'
+
+[Install]
+WantedBy=multi-user.target
+```
+
+要点：
+
+- **fail-fast 语义完整保留**：`oj migrate` 失败 → unit 启动失败；serve 内嵌的
+  verify 门禁（账本落后拒启）作为第二道闸仍在。
+- 冷启动慢的根因定位：看 serve 日志里 `oj: startup:` 分相位行（§6），
+  慢在 migrate/seed 还是路由装配，数据说话。
+- 滚动重启（消重启窗口）：新实例 `ExecStartPost` 探针通过后再切流（负载均衡侧），
+  而不是先杀旧进程。
+
 日志级别另由 `RUST_LOG` 环境变量控制（如 `RUST_LOG=oj=debug`），配置里不能配。
 落盘基于 fd 重定向，**仅 unix**：Windows 上不写日志文件，终端输出强制保留并告警。
 **例外**：启动失败的最终退出原因总是直写终端（console 关闭也不例外），便于立即调整。
@@ -269,6 +307,22 @@ server dev 不写 `migrate_on_start` 时缺省 `auto`（启动即应用迁移）
 ```bash
 RUST_LOG=oj=info ./oj serve -c config.yaml --api-path dist
 ```
+
+### 6.0 启动分相位耗时（`oj: startup:` 行）
+
+冷启动逐相位打印累计耗时（`stderr`，不受 `RUST_LOG` 影响）——排"重启越来越慢"
+先看这组数：
+
+| 日志 | 覆盖相位 |
+|---|---|
+| `oj: startup: migrate gate (auto\|verify) …` | 迁移门禁（apply 或 verify + reconcile） |
+| `oj: startup: seed replay …` | seed 全量重放（fixtures=true 时另有 `fixtures …` 行） |
+| `oj: startup: ext_boot prewarm …` | boot 预热（仅配了 ext_boot 时） |
+| `oj: startup: route tables …` | 路由表构建（release 读 routes.js；dev 走 bridge 内省） |
+| `oj serve listening on … (startup …)` | 总耗时（自进程装配起算） |
+
+口径均为自迁移门禁起的累计值，两相邻行相减即该相位净耗时。模块/版本数增长时
+用这组数据定位瓶颈相位，再决定优化方向（seed 语句批处理、verify 批量读等）。
 
 ### 6.1 插件装配期日志（逐字，v0.1.88）
 

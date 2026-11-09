@@ -51,6 +51,7 @@ async fn db_profile_selection_redirects_default_and_fails_fast_on_missing() {
         &profiles,
         None,
         None,
+        false,
     )
     .await
     .expect("assemble with valid --db report");
@@ -75,6 +76,7 @@ async fn db_profile_selection_redirects_default_and_fails_fast_on_missing() {
         &profiles,
         None,
         None,
+        false,
     )
     .await
     .err()
@@ -105,6 +107,7 @@ async fn db_profile_default_when_no_override() {
         &ResourceProfiles::default(),
         None,
         None,
+        false,
     )
     .await
     .expect("assemble with no --db");

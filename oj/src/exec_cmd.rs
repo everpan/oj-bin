@@ -120,6 +120,8 @@ pub fn run(a: ExecArgs) -> Result<i32, String> {
                     &profiles,
                     None,
                     module_index.clone(),
+                    // exec 是一次性进程，T13 插件横幅是噪音（quiet）。
+                    true,
                 )
                 .await?;
                 // 迁移门禁（spec §3.1）：exec 缺省全跳过（与 server dev 缺省 auto 相反，
@@ -433,6 +435,7 @@ mod tests {
             &ResourceProfiles::default(),
             None,
             None,
+            true,
         )
         .await
         .unwrap()

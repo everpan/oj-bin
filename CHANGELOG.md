@@ -16,6 +16,26 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.127（2026-11-09）
+
+**feat（serve，启动分相位耗时日志）**：冷启动逐相位打印累计耗时（`stderr`，
+不受 `RUST_LOG` 影响）：`oj: startup: migrate gate (auto|verify) …`、`seed replay …`、
+`fixtures …`、`ext_boot prewarm …`、`route tables …`，listening 行追加
+`startup …` 总耗时（自进程装配起算）。观测不改行为——排"重启越来越慢"先看这组数。
+
+**fix（oj exec 噪音）**：`oj exec` 不再打印 `[oj-serve] host ABI_VERSION` 与逐插件
+`[oj-serve] plugin …` 启动横幅、以及 `warn: audit is enabled but audit.allow is
+unrestricted…` 启动告警（`assemble_backend` / `assemble_plugins` 新增 `quiet` 参数，
+exec 传 `true`；`oj serve` / `oj test` / `oj migrate` 输出不变）。
+
+**feat（serve，`{base}/_system/health` 诊断增强）**：health 响应新增
+`cfg_sha256` / `loaded_at` / `config_age_secs`（热更代际指纹与本代时长）、
+`uptime_secs` / `pid` / `cpus`（进程与运行时）、`modules`（本代挂载模块清单）。
+字段均为低敏（无凭据、无 config 值），端点保持匿名可访问的监控语义不变；
+首次启动 `cfg_sha256` 为空，首次热更提交后填入。配套改动：`/_system/config` 的
+`loaded_at` 由 JSON 字符串（epoch 秒的文本形态）改为数值（epoch 秒），与 health
+对齐——消费方若按字符串解析该字段需适配。
+
 ## v0.1.126（2026-11-08）
 
 **fix（bridge / exec，`"oj"` token 打包形态重定向，OJ-10）**：linux glibc 发行包的 `bin/oj`

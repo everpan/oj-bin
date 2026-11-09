@@ -39,7 +39,7 @@ pub type ReloadExecutor = only_js::bridge::reload_bridge::ReloadExecutorLike;
 struct ReloadMeta {
     generation: u64,
     cfg_sha256: String,
-    loaded_at: String,
+    loaded_at: u64,
     config_path: PathBuf,
     /// 本代生效的挂载模块清单（`name@ver`，按名排序）——v0.1.122 起随锁
     /// 装配推进，GET 摘要可见。
@@ -58,6 +58,8 @@ pub struct ReloadState {
     /// 串行化执行（try_lock 失败 → 409 busy）。
     reload_lock: Mutex<()>,
     meta: Arc<Mutex<ReloadMeta>>,
+    /// 进程启动时刻（epoch secs）：`_system/health` 的 uptime 来源。
+    started_at: u64,
     /// 热更执行闭包（`oj` 侧注入；构造后由 `set_executor` 填入，避免与
     /// `ReloadState` 的构造循环依赖）。
     executor: Mutex<Option<ReloadExecutor>>,
@@ -88,7 +90,7 @@ impl Committer {
             meta.generation += 1;
             let g = meta.generation;
             meta.cfg_sha256 = sha256;
-            meta.loaded_at = now.to_string();
+            meta.loaded_at = now;
             meta.modules = modules;
             g
         };
@@ -130,11 +132,12 @@ impl ReloadState {
             meta: Arc::new(Mutex::new(ReloadMeta {
                 generation: 0,
                 cfg_sha256: String::new(),
-                loaded_at: now.to_string(),
+                loaded_at: now,
                 config_path,
                 modules,
             })),
             executor: Mutex::new(executor),
+            started_at: now,
         })
     }
 
@@ -244,12 +247,27 @@ async fn system_fallback(
 }
 
 /// health 摘要（不经内层证书门禁，运维到期可用）。
+///
+/// 诊断字段均为低敏（无凭据 / 无 config 值）：进程与运行时信息（uptime/pid/cpus）、
+/// 热更代际（generation/loaded_at/config_age_secs/cfg_sha256——sha 仅指纹不反推）、
+/// 本代模块清单。端点刻意保持匿名可访问（监控轮询），新增字段须守同一条线。
 async fn health_ok(rs: &Arc<ReloadState>) -> Response<Body> {
     let meta = rs.meta.lock().await;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     Json(serde_json::json!({
         "status": "OK",
         "generation": meta.generation,
         "config_path": meta.config_path.display().to_string(),
+        "cfg_sha256": meta.cfg_sha256,
+        "loaded_at": meta.loaded_at,
+        "config_age_secs": now.saturating_sub(meta.loaded_at),
+        "uptime_secs": now.saturating_sub(rs.started_at),
+        "pid": std::process::id(),
+        "cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
+        "modules": meta.modules,
     }))
     .into_response()
 }
@@ -606,5 +624,56 @@ mod tests {
         assert_eq!(g, 1);
         let v = get_body(&rs).await;
         assert_eq!(v["modules"], serde_json::json!(["a@1.0.1"]));
+    }
+
+    /// `_system/health` 诊断字段：generation/config/uptime/pid/cpus/loaded_at/
+    /// config_age_secs/cfg_sha256（commit 后）齐——运维排障单端点可取证。
+    #[tokio::test(flavor = "current_thread")]
+    async fn health_includes_diagnostic_fields() {
+        async fn get(app: Router, uri: &str) -> (StatusCode, Value) {
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .extension(ConnectInfo("127.0.0.1:1234".parse::<SocketAddr>().unwrap()))
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap())
+        }
+        let rs = ReloadState::new(
+            Arc::new(Router::new()),
+            vec!["/v1/api".to_string()],
+            None,
+            true,
+            PathBuf::from("config.yaml"),
+            None,
+            vec!["a@1.0.0".to_string()],
+        );
+        let app = Router::new()
+            .fallback(any(system_fallback))
+            .with_state(rs.clone());
+        let (status, v) = get(app.clone(), "/v1/api/_system/health").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["status"], "OK");
+        assert_eq!(v["generation"], 0);
+        assert_eq!(v["config_path"], "config.yaml");
+        assert_eq!(v["modules"], serde_json::json!(["a@1.0.0"]));
+        assert_eq!(v["pid"], std::process::id());
+        assert!(v["cpus"].as_u64().unwrap() >= 1);
+        assert!(v["uptime_secs"].as_u64().is_some());
+        assert!(v["loaded_at"].as_u64().unwrap() > 0);
+        assert!(v["config_age_secs"].as_u64().is_some());
+        assert_eq!(v["cfg_sha256"], ""); // 首次启动尚未 commit → 空指纹
+        // commit 后 cfg_sha256 / generation 随代际推进。
+        rs.committer()
+            .commit(Arc::new(Router::new()), "deadbeef".to_string(), vec![])
+            .await;
+        let (_status, v) = get(app, "/v1/api/_system/health").await;
+        assert_eq!(v["generation"], 1);
+        assert_eq!(v["cfg_sha256"], "deadbeef");
     }
 }

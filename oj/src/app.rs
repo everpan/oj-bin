@@ -1236,6 +1236,8 @@ pub async fn assemble_backend(
     // 装配期构造一次，注入 StableState 与 Extras——运行期别名、schema 归属、迁移、
     // 路由共用同一份判定。
     module_index: Option<Arc<ModuleIndex>>,
+    // quiet=true 抑制插件装配横幅（oj exec 等一次性进程；穿参至 assemble_plugins）。
+    quiet: bool,
 ) -> Result<Backend, String> {
     // PR-4：单 isolate 堆限额（u64 copy 提前取出，避免闭包借用 &Config）。
     let js_heap_limit = Some(cfg.server.js_heap_limit_bytes as usize);
@@ -1278,6 +1280,7 @@ pub async fn assemble_backend(
             config_dir,
             &mut registries,
             profiles.es.as_deref(),
+            quiet,
         )
         .await
         .map_err(|e| format!("plugins: {e}"))?;
@@ -1571,7 +1574,7 @@ pub async fn assemble_backend(
         if audit.retention_secs == 0 {
             return Err("audit.enabled=true requires audit.retention_secs >= 1".to_string());
         }
-        if audit.allow.is_unrestricted() {
+        if audit.allow.is_unrestricted() && !quiet {
             eprintln!(
                 "warn: audit is enabled but audit.allow is unrestricted — any caller may query \
                  audit events via audit.query (events are in-process and credential-free); \
@@ -1930,6 +1933,7 @@ impl App {
                     profiles,
                     reload_slot,
                     module_index.clone(),
+                    false,
                 )
                 .await?,
             ),
@@ -1980,6 +1984,9 @@ impl App {
         // 匿名路径条目校验（v0.1.23）：`one_layer` 只对尾 "/*" 条目有意义（fail-fast）。
         config::validate_anon_paths(&cfg)?;
         config::validate_server_limits(&cfg)?;
+        // 分相位耗时锚点（冷启动优化前置测量）：自迁移门禁起累计，逐相位打印——
+        // 重启慢的真凶靠这份数据定位，不靠猜。
+        let t_asm = std::time::Instant::now();
         // 迁移门禁（§4.6，先于 seed）：dev 默认 auto（apply），release 默认 verify
         // （M003/M004 校验，账本落后拒启）；`migrate_on_start: off` 为逃生门。
         // 热更路径强制 verify-only（dev 默认 auto-apply 会打生产库，§5 ②）。
@@ -2033,6 +2040,7 @@ impl App {
                 ));
             }
         }
+        eprintln!("oj: startup: migrate gate ({gate}) {:?}", t_asm.elapsed());
         // 种子重放（P0）：各 api 树的模块 seed.sql（§8-1）。热更复用时不重放
         // （种子是一次性初始化，重载不应再灌库，§5 ②）。
         if !reused {
@@ -2040,6 +2048,7 @@ impl App {
                 crate::seed::replay_all(stable.dbs.get(db_key), tdir, module_index.as_deref())
                     .await?;
             }
+            eprintln!("oj: startup: seed replay {:?}", t_asm.elapsed());
         }
         // fixtures/ 演示数据（§4.5）：仅 oj test（fixtures=true）灌入；server 不灌。
         if fixtures {
@@ -2047,6 +2056,7 @@ impl App {
                 let modules = crate::manifest::discover(tdir, *tts, module_index.as_deref())?;
                 crate::migrate_cmd::load_fixtures(stable.dbs.get(db_key), &modules).await?;
             }
+            eprintln!("oj: startup: fixtures {:?}", t_asm.elapsed());
         }
         // ext_boot 预热：建 runtime 并跑完 boot，失败即 `Err`（真·启动失败）。
         // 必须前移到建表之前 —— 否则 boot 错误只能借 dev 内省的间接失败暴露，而
@@ -2054,6 +2064,7 @@ impl App {
         // 结果「路由全空、服务照常监听」）。
         if stable.boot.is_some() {
             prewarm_boot(make_bridge.clone())?;
+            eprintln!("oj: startup: ext_boot prewarm {:?}", t_asm.elapsed());
         }
         // 路由表：逐 api 挂载构建（v0.1.58 多挂载）。dev 启动内省 .route 声明；
         // release 聚合该树 manifests.yaml（pattern = /{挂载prefix}/{e.pattern}）。
@@ -2152,6 +2163,7 @@ impl App {
             failures.extend(mount_failures);
             tables.push((prefix.to_string(), table));
         }
+        eprintln!("oj: startup: route tables {:?}", t_asm.elapsed());
         for f in &failures {
             if let Some(w) = f.strip_prefix("warning: ") {
                 eprintln!("warn: route: {w}");

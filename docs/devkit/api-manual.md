@@ -3001,7 +3001,7 @@ mounts:
 
 **并发**：同一时刻只允许一个热更（HTTP POST 与 JS `server.reloadConfig()` 共享同一把串行锁）；第二个并发触发在拿不到锁时返回 **409 `reload in progress`**（JS 侧抛 `server.reloadConfig: reload in progress (busy)`）。
 
-**代际与可观测**：`GET {base}/_system/config` 返回 `{config_path, sha256, loaded_at, generation, modules}`（`modules` v0.1.122 起）；`GET {base}/_system/health` 返回 `{status:"OK", generation, config_path}`（旧路径 `{base}/health` 仍可用，但会告警建议改用 `_system/health`）。
+**代际与可观测**：`GET {base}/_system/config` 返回 `{config_path, sha256, loaded_at, generation, modules}`（`modules` v0.1.122 起）；`GET {base}/_system/health` 返回 `{status:"OK", generation, config_path, cfg_sha256, loaded_at, config_age_secs, uptime_secs, pid, cpus, modules}`（诊断字段：进程/运行时信息 + 热更代际指纹，均为低敏无凭据；首次启动 `cfg_sha256` 为空，首次热更后填入；旧路径 `{base}/health` 仍可用，但会告警建议改用 `_system/health`）。
 
 **限制（v1 边界）**：
 - 热更**复用首代已建立的连接池与插件后端**——不重建后端、不二次 `init` 插件、迁移强制 `verify`-only（dev 默认 `auto` 会打生产库，故热更路径强制 `verify`）、不重放 seed。需要新后端/新迁移的改动请走 `restart_pending` 提示并**重启进程**。

@@ -96,6 +96,7 @@ pub async fn run(a: ServeArgs) -> Result<(), String> {
 }
 
 async fn run_inner(a: ServeArgs) -> Result<(), String> {
+    let t_run = std::time::Instant::now();
     let (mut cfg, top, config_dir) = load_cfg(a.config.as_deref(), true)?;
     // CLI 挂载折叠：--api-path / --module-root / --app-path 全部 upsert 进 cfg.mounts
     // （CLI 优先）。
@@ -247,7 +248,7 @@ async fn run_inner(a: ServeArgs) -> Result<(), String> {
     // daemon 子进程：监听已绑定 = 启动成功落定，回传父进程（非 daemon 子进程 no-op）。
     daemon_ready::ok();
     println!(
-        "oj serve listening on http://{bound}{} (dir={}, {})",
+        "oj serve listening on http://{bound}{} (dir={}, {}, startup {:?})",
         base,
         dir.display(),
         if static_only {
@@ -256,7 +257,8 @@ async fn run_inner(a: ServeArgs) -> Result<(), String> {
             "dev/ts"
         } else {
             "release/js"
-        }
+        },
+        t_run.elapsed()
     );
     h.await.map_err(|e| format!("server task: {e}"))?;
     // 任务线程收场（flag 已置位；join 为阻塞调用，移交 blocking 池）：
@@ -1938,6 +1940,8 @@ pub async fn assemble_plugins(
     config_dir: &Path,
     registries: &mut Registries,
     es_profile: Option<&str>,
+    // quiet=true 不打 T13 启动能力位横幅（oj exec 等一次性进程，横幅是噪音）。
+    quiet: bool,
 ) -> Result<(Vec<PluginInfo>, Vec<LoadedPlugin>), String> {
     // A5：mail 双配置源（`smtp:` 与 `plugins.mail` 皆非空）是配置错误 → 装配期 fail-fast
     // （`plugin_cfg` 会让非空 `plugins.mail` 静默胜出，运维改 `smtp:` 会「改了不生效」）。
@@ -1994,12 +1998,14 @@ pub async fn assemble_plugins(
         eprintln!("[oj-serve] unconsumed config sections: {unused:?} (typo? or plugin not loaded)");
     }
     // T13 启动能力位一览：宿主 ABI + 每插件 abi/fingerprint/caps（caps 仅 db 轴插件有）。
-    eprintln!(
-        "[oj-serve] host ABI_VERSION = {}",
-        oj_plugin_ffi::ABI_VERSION
-    );
-    for p in &loaded {
-        eprintln!("{}", plugin_banner_line(p));
+    if !quiet {
+        eprintln!(
+            "[oj-serve] host ABI_VERSION = {}",
+            oj_plugin_ffi::ABI_VERSION
+        );
+        for p in &loaded {
+            eprintln!("{}", plugin_banner_line(p));
+        }
     }
     Ok((loaded.iter().map(PluginInfo::from).collect(), loaded))
 }

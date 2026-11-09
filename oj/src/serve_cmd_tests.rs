@@ -1606,7 +1606,7 @@ async fn manifest_missing_file_fails_fast() {
     };
     cfg.plugins.insert("ghost".into(), serde_json::json!({}));
     let mut r = Registries::default();
-    let e = assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
+    let e = assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None, false)
         .await
         .err()
         .unwrap_or_default();
@@ -1623,9 +1623,10 @@ async fn scan_empty_dir_yields_only_builtin() {
         ..Default::default()
     };
     let mut r = Registries::default();
-    let (plugins, _loaded) = assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
-        .await
-        .unwrap();
+    let (plugins, _loaded) =
+        assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None, false)
+            .await
+            .unwrap();
     assert!(plugins.is_empty());
     assert!(r.es.is_none());
 }
@@ -1642,7 +1643,7 @@ async fn scan_bad_plugin_fails_fast() {
         ..Default::default()
     };
     let mut r = Registries::default();
-    let e = assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
+    let e = assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None, false)
         .await
         .err()
         .unwrap_or_default();
@@ -1657,7 +1658,7 @@ async fn es_declared_without_plugin_fails_startup() {
     let mut cfg = es_cfg("http://127.0.0.1:1");
     cfg.plugins_dir = Some(t.0.clone());
     let mut r = Registries::default();
-    let e = assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
+    let e = assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None, false)
         .await
         .err()
         .unwrap_or_default();
@@ -1674,9 +1675,10 @@ async fn es_plugin_wires_backend() {
     let mut cfg = es_cfg("http://127.0.0.1:1");
     cfg.plugins_dir = Some(t.0.clone());
     let mut r = Registries::default();
-    let (plugins, _loaded) = assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
-        .await
-        .unwrap();
+    let (plugins, _loaded) =
+        assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None, false)
+            .await
+            .unwrap();
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].name, "es");
     assert!(r.es.is_some(), "es backend must be wired from the plugin");
@@ -1695,9 +1697,10 @@ async fn plugins_map_keys_drive_strict_load() {
     cfg.plugins_dir = Some(t.0.clone());
     cfg.plugins.insert("es".into(), serde_json::json!({}));
     let mut r = Registries::default();
-    let (plugins, _loaded) = assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
-        .await
-        .unwrap();
+    let (plugins, _loaded) =
+        assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None, false)
+            .await
+            .unwrap();
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].name, "es");
     assert!(r.es.is_some(), "es backend must be wired from the plugin");
@@ -1709,7 +1712,7 @@ async fn plugins_map_keys_drive_strict_load() {
     };
     cfg.plugins.insert("ghost".into(), serde_json::json!({}));
     let mut r = Registries::default();
-    let e = assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
+    let e = assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None, false)
         .await
         .err()
         .unwrap_or_default();
@@ -1720,9 +1723,10 @@ async fn plugins_map_keys_drive_strict_load() {
         ..Default::default()
     };
     let mut r = Registries::default();
-    let (plugins, _loaded) = assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
-        .await
-        .unwrap();
+    let (plugins, _loaded) =
+        assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None, false)
+            .await
+            .unwrap();
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].name, "es");
 }
@@ -1742,9 +1746,10 @@ async fn strict_manifest_loads_in_name_order() {
     cfg.plugins
         .insert("auth".into(), serde_json::json!({"jwt_secret": "x"}));
     let mut r = Registries::default();
-    let (plugins, _loaded) = assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
-        .await
-        .unwrap();
+    let (plugins, _loaded) =
+        assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None, false)
+            .await
+            .unwrap();
     let names: Vec<&str> = plugins.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names, vec!["auth", "es"]);
 }
@@ -1787,9 +1792,10 @@ async fn db_plugin_wires_backend() {
         ..Default::default()
     };
     let mut r = Registries::default();
-    let (plugins, _loaded) = assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
-        .await
-        .unwrap();
+    let (plugins, _loaded) =
+        assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None, false)
+            .await
+            .unwrap();
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].name, "db-mysql");
     let names = r.dbs.backend_names();
@@ -1818,7 +1824,7 @@ async fn db_declared_without_plugin_unknown_scheme() {
         ..Default::default()
     };
     let mut r = Registries::default();
-    assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
+    assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None, false)
         .await
         .unwrap();
     let mut m = std::collections::HashMap::new();
@@ -1872,9 +1878,10 @@ async fn blob_plugin_wires_vtable_and_connect_gate() {
         ..Default::default()
     };
     let mut r = Registries::default();
-    let (plugins, _loaded) = assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
-        .await
-        .unwrap();
+    let (plugins, _loaded) =
+        assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None, false)
+            .await
+            .unwrap();
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].name, "blob-s3");
     assert!(r.blob.is_some(), "blob vtable slot not registered");
@@ -1953,9 +1960,10 @@ async fn bus_plugin_wires_kind() {
         ..Default::default()
     };
     let mut r = Registries::default();
-    let (plugins, _loaded) = assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
-        .await
-        .unwrap();
+    let (plugins, _loaded) =
+        assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None, false)
+            .await
+            .unwrap();
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].name, "bus-kafka");
     let kinds = r.bus.kinds();
@@ -1977,7 +1985,7 @@ async fn kafka_declared_without_plugin_unknown_kind() {
         ..Default::default()
     };
     let mut r = Registries::default();
-    assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
+    assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None, false)
         .await
         .unwrap();
     let broker_cfg = only_js::config::BrokerCfg {
@@ -2036,9 +2044,10 @@ async fn kv_plugin_wires_vtable_and_connect_gate() {
         ..Default::default()
     };
     let mut r = Registries::default();
-    let (plugins, _loaded) = assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
-        .await
-        .unwrap();
+    let (plugins, _loaded) =
+        assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None, false)
+            .await
+            .unwrap();
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].name, "kv-redis");
     assert!(r.kv.is_some(), "kv vtable slot not registered");
@@ -2061,7 +2070,7 @@ async fn redis_declared_without_kv_plugin_fails_fast() {
     cfg.redis
         .insert("default".into(), "redis://127.0.0.1:1/".into());
     let mut r = Registries::default();
-    assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
+    assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None, false)
         .await
         .unwrap();
     assert!(r.kv.is_none());
@@ -2108,7 +2117,7 @@ async fn auth_plugin_required_when_configured() {
     };
     cfg.auth = Some(serde_yaml::from_str("jwt_secret: \"x\"\n").unwrap());
     let mut r = Registries::default();
-    let e = assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
+    let e = assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None, false)
         .await
         .err()
         .unwrap_or_default();
@@ -2133,7 +2142,7 @@ async fn auth_plugin_wires_guard_and_verifies_jwt() {
             .unwrap(),
     );
     let mut r = Registries::default();
-    assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
+    assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None, false)
         .await
         .unwrap();
     let vt = r
@@ -2208,9 +2217,10 @@ async fn kafka_plugin_broker_shared_across_channels() {
         ..Default::default()
     };
     let mut r = Registries::default();
-    let (plugins, _loaded) = assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
-        .await
-        .unwrap();
+    let (plugins, _loaded) =
+        assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None, false)
+            .await
+            .unwrap();
     assert_eq!(plugins.len(), 1);
     let broker_cfg = only_js::config::BrokerCfg {
         kind: "kafka".into(),
@@ -2274,9 +2284,10 @@ async fn rabbitmq_plugin_broker_shared_across_channels() {
         ..Default::default()
     };
     let mut r = Registries::default();
-    let (plugins, _loaded) = assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
-        .await
-        .unwrap();
+    let (plugins, _loaded) =
+        assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None, false)
+            .await
+            .unwrap();
     assert_eq!(plugins.len(), 1);
     let broker_cfg = only_js::config::BrokerCfg {
         kind: "rabbitmq".into(),

@@ -514,6 +514,7 @@ async fn platform_root_mount_gives_privileged_module_ownership() {
         &ResourceProfiles::default(),
         None,
         None,
+        false,
     )
     .await
     .unwrap();
@@ -789,6 +790,7 @@ async fn backend_constructs_without_certificate() {
         &ResourceProfiles::default(),
         None,
         None,
+        false,
     )
     .await
     .unwrap();
