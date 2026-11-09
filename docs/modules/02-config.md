@@ -41,7 +41,7 @@
 |---|---|---|
 | `db` | `HashMap<name, DSN>` | 多库混用（`sqlite://` / `mysql://` / `postgres://`），经 `DbBackendRegistry` 按 scheme 认领。**键 = 库名**：`oj migrate` / `oj test fixture` / `oj schema diff` 的 `--db` 取值域即此（缺省 `default`，未声明 fail-fast，见 `docs/migration.md` §3.8） |
 | `redis` | `HashMap<name, URL>` | 键 = profile 名；缺省装配 `redis.default`，可用 `oj test`/`oj exec` 的 `--redis <profile>` 选其他 profile 为默认源（未声明 fail-fast）。其余未选中的 profile warn 忽略；有声明但无 kv 插件 → fail fast；未声明 → 内置 `InMemoryKV` |
-| `tenant` | `TenantCfg` | `enable` + `header_key`（默认 `X-TENANT-ID`）+ `anonymous_paths`（通配见下）+ `sql_guard` + `shared_allow` + `allow_as_tenant`（`db.asTenant` 开关，默认 false） |
+| `tenant` | `TenantCfg` | `enable` + `header_key`（默认 `X-TENANT-ID`）+ `anonymous_paths`（通配见下）+ `sql_guard` + `shared_allow` + `allow_as_tenant`（`db.asTenant` 开关，默认 false）。语句级 `db.table().forTenant(id)`（v0.1.129）**不受此开关管**——无配置门，命中记审计 `DB_TENANT_OVERRIDE` |
 | `db_query` | `QueryLimits` | 构造器 LIMIT：`default_limit`（默认 100，顶层 select 未给 limit 时的隐式值）+ `max_limit`（默认 1000，显式 limit 的 clamp 上界，硬顶 100000）。**不能写进 `db:`**——`db` 是 name→DSN map，键即库名 |
 | `auth` | `AuthCfg` | `jwt_secret`（空 → fail fast）、`signing_method`(HS256/384/512)、access/refresh 时长、`anonymous_paths`（条目＝字符串或 `{path, one_layer}`，见 §4） |
 | `oidc` | `OidcSection` | `issuer` / `private_key_path`（相对 config 目录）/ `rp: {tenant → {issuer, client_id, client_secret, scope}}` / `clients: {id → {secret, redirect_uris, tenant}}` |

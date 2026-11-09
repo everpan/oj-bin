@@ -162,10 +162,13 @@ cd sample && npm run typecheck            # 推荐（委托到 unit，用其安�
   `lastSqlCalls()` 取 `db` 发出的 SQL（query/exec/**构造器**）与绑定参数记录（可断言 handler 走了哪个分支）。
   桩面与 bootstrap 同形：含 `db.asSystem` / `db.asTenant`（**返回同一实例**，便于
   `db.asTenant(id).table(...)` 这类链式写法）——但 L2 **不**模拟租户注入与 asTenant 的三道门禁
-  （属 Rust 侧，归 L1 用 `oj test --anonymous` 验）。
+  （属 Rust 侧，归 L1 用 `oj test --anonymous` 验）；构造器上的 `forTenant(id)` 见
+  `mocks/query-builder.ts`（记录 `SqlCall.tenant`，注入不模拟）。
 - `mocks/query-builder.ts`：`db.table(...)` 的构造器桩，**镜像** `src/bridge/bootstrap.js` 的
   `builderFromReq` API 面（select/where/orderBy/limit/offset/insert/update/delete/returning/
-  all/run/toSQL，含 `update|delete` 无 where 即抛的守卫）。SQL 按**规范形**渲染（小写关键字、
+  forTenant/all/run/toSQL，含 `update|delete` 无 where 即抛的守卫）。`forTenant(id)` 与
+  asSystem/asTenant 同策略：**不模拟**租户注入（归 L1/e2e），但把 id 记录进
+  `SqlCall.tenant`——spec 可断言 handler 确实把服务端派生的 id 交给了 forTenant。SQL 按**规范形**渲染（小写关键字、
   `col, col`、`?` 占位）——真实渲染是 sea-query 按方言产出，mock 不复刻方言细节；保留的信号是
   「handler 选了哪张表/哪些列/什么过滤条件/绑定参数」，故 spec 断言的是规范形而非某个方言真身。
   未覆盖的形态（树形 or/and、子查询、join、聚合列）**直接抛错**，避免静默渲染出错误字符串。

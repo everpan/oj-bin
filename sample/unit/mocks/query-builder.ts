@@ -16,6 +16,10 @@ export interface SqlCall {
   fn: "query" | "exec";
   sql: string;
   params: any[];
+  /** 语句级租户覆盖（forTenant(id)）声明的租户 id；未调用为 undefined。
+   *  L2 不模拟注入本身——本字段只给 spec 断言「handler 把哪个 id 交给了 forTenant」
+   *  （注入语义归 L1/e2e 验）。 */
+  tenant?: string;
 }
 
 const OPS: Record<string, string> = {
@@ -99,6 +103,7 @@ export function tableBuilder(
     values: [] as any[],
     sets: {} as Record<string, any>,
     returning: [] as string[],
+    tenant_id: null as string | null,
   };
 
   const build = (): SqlCall => {
@@ -134,12 +139,18 @@ export function tableBuilder(
     } else {
       sql = `delete from ${req.table}` + renderWhere(req.conditions, params);
     }
-    return { fn: "query", sql, params };
+    return { fn: "query", sql, params, tenant: req.tenant_id ?? undefined };
   };
 
   const api: any = {
     select(cols?: any[]) {
       req.columns = (cols ?? []).map((c: any) => (typeof c === "string" ? String(c) : c));
+      return api;
+    },
+    // 语句级租户覆盖：与 db.asSystem/asTenant 的桩同策略——不模拟注入（归 L1/e2e），
+    // 但把 id 记录进 SqlCall.tenant，spec 可断言 handler 确实用了服务端派生的 id。
+    forTenant(id: unknown) {
+      req.tenant_id = String(id);
       return api;
     },
     where(cond: any) {

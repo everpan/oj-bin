@@ -376,6 +376,8 @@ db_query:                    # 构造器 LIMIT 策略（v0.1.20；顶层查询�
 - `tenant.allow_as_tenant`（默认 false）：允许匿名请求（豁免命中且无租户头）的 handler 用
   `db.asTenant(uuid)` 声明本次查询的租户身份——公开页（anchor → workspace uuid）用。仍强制
   租户条件，只是身份由 handler 给；id 必须服务端派生。
+  （已认证请求要对**单条语句**跨租户的，用构造器 `db.table(t).forTenant(id)`——语句级、
+  无此开关、无配置门，见 `tenant-guide.md`。）
 - `oidc:`：缺段时调用报 `oidc not configured`。私钥只在 Rust 侧解析使用；
   `client_secret` 经 `oidc.rp`/`oidc.clients` 对 JS 可读（与 `auth.jwt_secret` 同一信任级）。
   内置 OP/RP 演示见 §11 与 `sample/README.md`「OIDC 演示」。

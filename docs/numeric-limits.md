@@ -188,7 +188,8 @@ unique constraint` → 业务接口 500。且从"静默写错"到"爆发 500"有
      PG/SQLite 对后者报错 → 数值租户 id 请落在 i64 内）；
    - insert/update 的租户等值判定接受 **4 种形态**（字符串 / 数字 / i64 标记 / u64 标记）。
      即 `tenant_id: "7"`、`tenant_id: 7`、`toBigInt("7")` 都可；
-   - 租户头（或 `db.asTenant(id)`）在数值列上**必须是十进制字面量**，否则报
+   - 租户头（或 `db.asTenant(id)`、语句级 `forTenant(id)`）在数值列上**必须是十进制
+     字面量**，否则报
      `tenant guard: tenant id "acme" is not a valid integer for numeric column t.tenant_id`。
    **新增声明期 fail-fast**：`tenant_id` 列类型 ∉ {`text`,`integer`,`bigint`} →
    启动即报错（`double`/`boolean`/`blob` 没有「等值租户 id」语义）。

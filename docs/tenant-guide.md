@@ -165,6 +165,37 @@ export const get = async () => {
 
 一句话选型：**要跨租户看全部用 `asSystem`，要给匿名请求认一个租户用 `asTenant`。**
 
+## 语句级通道：`db.table().forTenant(id)`（v0.1.129）
+
+前两个都是**请求级**：调一次，整个请求的身份都变了。还有一种常见诉求——普通请求里
+只想对**另一个租户**做一条窄范围写（企微回调 `corp_id` 变了，删掉**那个租户**的旧
+refresh token），整条请求的防护又不想去动。这就是语句级覆盖：
+
+```ts
+// 回调 handler：corpId 是验签后从回调体派生的（可信），不是请求参数透传
+await db.table("auth_refresh_token")
+  .forTenant(corpId)                              // 只这一条语句以 corpId 注入
+  .delete().where({ field: "provider", op: "eq", value: "wecom" }).run();
+// 本请求里随后的普通语句仍注入当前请求租户——不受影响
+await db.table("audit_log").insert({ action: "wecom.rebind" }).run();
+```
+
+要点：
+
+- **防护照常**——只是注入的租户 id 换成 `id`：where 收窄、insert 强制写、update sets
+  校验全走覆盖值。它不是第二个 `asSystem`。
+- **`id` 必须服务端派生**（回调验签、查库），**绝不能吃请求参数**——`forTenant` 吃
+  什么都生效，误用就是跨租户泄露事故。命中记审计事件 `DB_TENANT_OVERRIDE`。
+- **无配置门**（与 `asSystem` 同信任模型：仍强制注入，比请求级全关更严）。
+- **只许顶层语句**：子查询 / union 臂 / cte / fromSelect 源里调 `forTenant` 会抛错
+  （单条语句内不允许两个租户身份）。
+- `asSystem` 的请求里 `forTenant` 无效（全关语义不变，warn 提示）。
+- `toJSON` 快照会带着它走——**跨租户持久化快照是危险动作**。
+- 它的 `toSQL()` 产物**不能**经 `db.query` 回放（裸 SQL 守卫按请求租户校验参数），
+  要执行就直接 `.run()` / `.all()`。
+
+选型再补一句：**已认证请求里只对一条语句跨租户，用 `forTenant`。**
+
 ## 豁免路径怎么写（anonymous_paths）
 
 `tenant.anonymous_paths`（以及 `auth.anonymous_paths`）写的是**去掉 API 前缀**后的路径，
@@ -207,6 +238,8 @@ export const get = async () => {
 | `warn: ... 共享表声明 "x" 未列入 tenant.shared_allow` | 声明了共享但白名单没点名 | config 补 `tenant.shared_allow: [x]`；不补则该表按受约束处理 |
 | `warn: tenant.sql_guard ... 但 tenant.enable=false` | 开了防护但没开租户识别 | `tenant.enable: true`，或者关掉 sql_guard |
 | `db.asTenant: ...`（调用即抛） | 三道门禁没过：开关没开 / 请求不是匿名 / id 为空 | 依次核对 `tenant.allow_as_tenant: true`、路径在 `anonymous_paths` 且未带租户头、id 非空；同一请求只调一次 |
+| `tenant guard: forTenant is only valid on the top-level statement`（v0.1.129） | 在子查询 / union 臂 / cte / fromSelect 源里调了 `forTenant` | 覆盖只许在**最外层**那条语句；把 `forTenant(id)` 提到链的最前面 |
+| `tenant guard: forTenant id must not be empty`（v0.1.129） | 派生逻辑没查到租户，传了空串 / 空白 | 先判断派生结果再调用（与 `db.asTenant` 同纪律） |
 
 ## 选型建议
 
