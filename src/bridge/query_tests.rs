@@ -2686,6 +2686,39 @@ fn or_ignore_from_select_with_returning_renders() {
     assert!(!my.contains("RETURNING"), "{my}");
 }
 
+/// INSERT 直接源里的 lit 列（v0.1.128）：pg 渲染裸参数（INSERT 目标列提供类型
+/// 推断上下文，bigint/text 混合可推断——真机 PREPARE 验证过）；mysql 保持
+/// `CAST(? AS CHAR)`（隐式转数值不受影响）；sqlite 本就裸参数。
+#[test]
+fn lit_in_insert_source_pg_bare_param() {
+    let reg = SchemaRegistry::new()
+        .table("t", &["id"], &["id", "user_id", "note"])
+        .table("s", &["id"], &["id", "user_id"]);
+    let req = r#"{"table":"t","verb":"insert","from_select":{"table":"s","columns":["id",{"lit":7,"as":"user_id"},{"lit":"x","as":"note"}]},"insert_cols":["id","user_id","note"]}"#;
+    let pg = norm_ws(sql_in(&reg, req, Dialect::Postgres).unwrap());
+    assert!(pg.contains(r#"$1 AS "user_id""#), "{pg}");
+    assert!(pg.contains(r#"$2 AS "note""#), "{pg}");
+    assert!(!pg.contains("CAST"), "{pg}");
+    let my = sql_in(&reg, req, Dialect::MySql).unwrap();
+    assert!(my.contains("CAST(? AS CHAR)"), "{my}");
+    let sq = sql_in(&reg, req, Dialect::Sqlite).unwrap();
+    assert!(!sq.contains("CAST"), "{sq}");
+}
+
+/// 嵌套子查询里的 lit（v0.1.128 回归保护）：pg 保持 `CAST($n AS TEXT)`——
+/// INSERT 目标列的类型推断只覆盖直接源的顶层列清单，嵌套层裸参数无推断上下文。
+/// 该测试在实现前即通过。
+#[test]
+fn lit_in_nested_subquery_keeps_cast_pg() {
+    let reg = SchemaRegistry::new()
+        .table("t", &["id"], &["id", "user_id", "note"])
+        .table("s", &["id"], &["id", "user_id"])
+        .table("u", &["id"], &["id"]);
+    let req = r#"{"table":"t","verb":"insert","from_select":{"table":"s","columns":["id"],"conditions":[{"field":"id","op":"in","subquery":{"table":"u","columns":[{"lit":7,"as":"v"}],"conditions":[]}}]},"insert_cols":["id"]}"#;
+    let pg = norm_ws(sql_in(&reg, req, Dialect::Postgres).unwrap());
+    assert!(pg.contains("CAST($1 AS TEXT)"), "{pg}");
+}
+
 /// `fromSelect`（v0.1.81）：列数必须与源 select 一致，且与 values 互斥。
 #[test]
 fn from_select_checks_arity_and_exclusivity() {

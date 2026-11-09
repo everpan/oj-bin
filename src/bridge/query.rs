@@ -783,11 +783,19 @@ fn lit_is_scalar(v: &Value) -> bool {
 }
 
 /// 类型名按裸标识符传入（不是 `Alias`）：`Alias` 会被渲染成 `"CHAR"` 而变成列名。
-fn lit_expr(v: &Value, dialect: Dialect) -> SimpleExpr {
+///
+/// `insert_src`（v0.1.128）：select 是 INSERT 的**直接源**时为 true——pg 的
+/// INSERT 目标列提供参数类型推断上下文，裸 `$n` 可推断（bigint/text 混合也成立，
+/// 真机 PREPARE 验证）；独立 SELECT 里 pg 裸参数报
+/// `could not determine data type of parameter $1`，必须保持 CAST。lit 只出现在
+/// select 列清单（`ColSpec::Lit` 仅此一处），直接源的顶层列必有目标列上下文；
+/// 嵌套子查询由调用点传 false 保持 CAST（推断只覆盖直接源顶层列清单）。
+fn lit_expr(v: &Value, dialect: Dialect, insert_src: bool) -> SimpleExpr {
     let e = Expr::val(to_qv(v));
     match dialect {
         Dialect::Sqlite => e,
         Dialect::MySql => e.cast_as("CHAR"),
+        Dialect::Postgres if insert_src => e,
         Dialect::Postgres => e.cast_as("TEXT"),
     }
 }
@@ -1128,7 +1136,7 @@ fn leaf_subquery(
     validate_nested(sub, sel_depth + 1, "subquery")?;
     ctx.check_col(&c.field, site)?;
     let col = col_simple_expr(&c.field);
-    let sel = build_select_stmt(sub, bx, sel_depth + 1)?;
+    let sel = build_select_stmt(sub, bx, sel_depth + 1, false)?;
     // ExprTrait 的 eq/ne/gt/gte/lt/lte 接受 R: Into<Expr>（SelectStatement 可转）；
     // in 走 in_subquery——比较 op 渲染为 `col = (SELECT ...)` 标量子查询。
     Ok(Some(match c.op {
@@ -1216,7 +1224,12 @@ fn cond_expr(
         },
         &mut |sub| {
             validate_nested(sub, sel_depth + 1, "exists")?;
-            Ok(Expr::exists(build_select_stmt(sub, bx, sel_depth + 1)?))
+            Ok(Expr::exists(build_select_stmt(
+                sub,
+                bx,
+                sel_depth + 1,
+                false,
+            )?))
         },
         depth,
         leaves,
@@ -1251,7 +1264,12 @@ fn cond_expr_having(
         },
         &mut |sub| {
             validate_nested(sub, sel_depth + 1, "exists")?;
-            Ok(Expr::exists(build_select_stmt(sub, bx, sel_depth + 1)?))
+            Ok(Expr::exists(build_select_stmt(
+                sub,
+                bx,
+                sel_depth + 1,
+                false,
+            )?))
         },
         depth,
         leaves,
@@ -1700,7 +1718,7 @@ fn build_statement(
             } else {
                 Some(build_with_clause(req, bx, 0)?)
             };
-            let sel = build_select_stmt(req, bx, 0)?;
+            let sel = build_select_stmt(req, bx, 0, false)?;
             match clause {
                 None => params_of(build_sql(dialect, &sel)),
                 Some(c) => params_of(build_sql(dialect, &sel.with(c))),
@@ -1724,7 +1742,7 @@ fn build_statement(
                     }
                 }
                 ins.columns(req.insert_cols.iter().map(Alias::new));
-                let sel = build_select_stmt(src, bx, 0)?;
+                let sel = build_select_stmt(src, bx, 0, true)?;
                 // 列数与源产出列数由 sea-query 在 `select_from` 里对齐：
                 // 少了漏列、多了串行，两种错都是运行时才炸的 INSERT 语法错。
                 // sea-query 的 Error 当前只有列数/值数不匹配一种形态。
@@ -1877,11 +1895,15 @@ fn build_statement(
 
 /// 构造 select 语句（含 join/where/group/having/order/limit）；depth 为嵌套层数。
 /// 顶层（depth=0）由 build_statement 调用后统一 build；嵌套层被子查询/exists 复用，
+/// `insert_src`（v0.1.128）：本 select 是否是 INSERT 的**直接源**。仅顶层
+/// INSERT 的 fromSelect 调用点传 true；所有嵌套边界（compare/exists 子查询、
+/// union 成员、CTE 查询）传 false——pg 的目标列类型推断只覆盖直接源顶层列清单。
 /// 不单独 build（参数由 sea-query 跨整棵语句树统一收集）。
 fn build_select_stmt(
     req: &QueryReq,
     bx: Build<'_>,
     depth: u8,
+    insert_src: bool,
 ) -> Result<SelectStatement, JsErrorBox> {
     // CTE 虚拟表集合（本层 with 声明；嵌套层 validate_nested 已保证为空）。
     // WITH 名遮蔽同名真实表（SQL 语义）；CTE 名跳过 registry 解析。
@@ -1981,7 +2003,10 @@ fn build_select_stmt(
                             l.r#as
                         )));
                     }
-                    q.expr_as(lit_expr(&l.lit, bx.dialect), Alias::new(&l.r#as));
+                    q.expr_as(
+                        lit_expr(&l.lit, bx.dialect, insert_src),
+                        Alias::new(&l.r#as),
+                    );
                 }
                 ColSpec::Name(c) => {
                     ctx.check_col(c, &site)?;
@@ -2199,7 +2224,7 @@ fn build_select_stmt(
                     "union member does not accept order_by/limit/offset",
                 ));
             }
-            let member = build_select_stmt(m, bx, depth + 1)?;
+            let member = build_select_stmt(m, bx, depth + 1, false)?;
             let ty = match arm.kind {
                 UnionKind::All => sea_query::UnionType::All,
                 UnionKind::Distinct => sea_query::UnionType::Distinct,
@@ -2231,7 +2256,7 @@ fn build_with_clause(
         let mut cte = sea_query::CommonTableExpression::new();
         cte.table_name(Alias::new(&c.name));
         cte.columns(c.columns.iter().map(Alias::new));
-        cte.query(build_select_stmt(&c.query, bx, depth + 1)?);
+        cte.query(build_select_stmt(&c.query, bx, depth + 1, false)?);
         clause.cte(cte);
     }
     Ok(clause)
