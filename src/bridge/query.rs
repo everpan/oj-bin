@@ -536,8 +536,7 @@ struct QueryReq {
     #[serde(default)]
     with: Vec<CteReq>,
     /// 幂等插入（v0.1.81）：主键冲突时跳过而非报错。
-    /// sqlite/pg 渲染 `ON CONFLICT DO NOTHING`；mysql 无原生 DO NOTHING，
-    /// 退化成 `ON DUPLICATE KEY UPDATE <pk> = <pk>` 恒等式。
+    /// 渲染形态按方言 × （VALUES | fromSelect) 分派，见 `ignore_strategy`（v0.1.128）。
     #[serde(default)]
     or_ignore: bool,
     /// 显式整表清空（v0.1.82）：verb=delete + 无 where，渲染 `DELETE FROM t`（三方言通用；
@@ -552,6 +551,60 @@ struct QueryReq {
     /// `from_select` 路径下的目标列清单（必须与源 select 输出列数一致）。
     #[serde(default)]
     insert_cols: Vec<String>,
+}
+
+/// orIgnore 的方言 × 形态分派（v0.1.128 统一入口）：新方言 / 新形态只改这张表。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IgnoreStrategy {
+    /// sea-query on_conflict：sqlite/pg 的 VALUES、pg 的 fromSelect。
+    OnConflictDoNothing,
+    /// 生成串前缀补丁：sqlite fromSelect——upsert 子句只能跟 VALUES，但冲突
+    /// **解决**子句 `OR IGNORE` 可跟 SELECT。语义较宽：连 NOT NULL/CHECK 违例也跳过。
+    SqliteOrIgnorePrefix,
+    /// 生成串前缀补丁：mysql fromSelect——`INSERT IGNORE`；无 1052 歧义、不要求
+    /// 主键（`VALUES()` 形态自 8.0.20 弃用，不采）。语义较宽：部分错误降级为告警。
+    MySqlInsertIgnorePrefix,
+    /// sea-query on_conflict 恒等赋值：mysql VALUES（既有行为，零回归）。
+    MySqlDuplicateKeyIdentity,
+}
+
+/// 分派表：方言是必需的——`lit` 的 CAST 形态与 `orIgnore` 的方言分派都要它。
+fn ignore_strategy(d: Dialect, from_select: bool) -> IgnoreStrategy {
+    match (d, from_select) {
+        (Dialect::Sqlite, true) => IgnoreStrategy::SqliteOrIgnorePrefix,
+        (Dialect::MySql, true) => IgnoreStrategy::MySqlInsertIgnorePrefix,
+        (Dialect::MySql, false) => IgnoreStrategy::MySqlDuplicateKeyIdentity,
+        _ => IgnoreStrategy::OnConflictDoNothing,
+    }
+}
+
+/// 对 build_sql 生成串做首前缀替换（`INSERT INTO ` → `<kw> INTO `）。
+///
+/// **这是唯一 sanctioned 的生成串改写点，新增用途需评审。** sea-query 不支持
+/// sqlite 的 `INSERT OR IGNORE` / mysql 的 `INSERT IGNORE` 前缀形态，而这两个
+/// 形态是各自方言上「幂等 INSERT…SELECT」的唯一合法出口（sqlite upsert 子句
+/// 只能跟 VALUES；mysql 恒等赋值在 SELECT 源含同名列时 1052 歧义）。
+///
+/// 安全面：替换的是**固定关键字串**，无任何用户输入进 SQL 文本（标识符仍走
+/// SchemaRegistry、值仍走 sea-query Values 绑定参数）。锚前缀校验**构造期
+/// 生效**（本仓只产 release，`debug_assert!` 会被编译掉）——不匹配返回 Err，
+/// 绝不静默退回没有冲突子句的普通 INSERT（那会让 orIgnore 的幂等承诺悄悄失效）。
+fn apply_conflict_resolution(sql: String, s: IgnoreStrategy) -> Result<String, JsErrorBox> {
+    const ANCHOR: &str = "INSERT INTO ";
+    let kw = match s {
+        IgnoreStrategy::SqliteOrIgnorePrefix => "INSERT OR IGNORE",
+        IgnoreStrategy::MySqlInsertIgnorePrefix => "INSERT IGNORE",
+        _ => return Ok(sql),
+    };
+    if !sql.starts_with(ANCHOR) {
+        return Err(JsErrorBox::generic(format!(
+            "insert conflict-resolution prefix patch: generated SQL does not start with \
+             '{ANCHOR}' (got prefix ..={:?}) — sea-query rendering drifted, refusing to \
+             silently degrade orIgnore into a plain INSERT",
+            sql.chars().take(ANCHOR.len() + 8).collect::<String>()
+        )));
+    }
+    Ok(sql.replacen(ANCHOR, &format!("{kw} INTO "), 1))
 }
 
 /// union 种类（Intersect/Except 不做：mysql 旧版本不支持且无用例）。
@@ -1702,43 +1755,33 @@ fn build_statement(
                         .map_err(|e| JsErrorBox::generic(format!("insert values: {e}")))?;
                 }
             }
-            // orIgnore（v0.1.81）：冲突行静默跳过，不抛唯一键冲突。
+            // orIgnore（v0.1.81；v0.1.128 统一走 ignore_strategy 分派）：
+            // 冲突行静默跳过，不抛唯一键冲突。
             // - sqlite / pg：`ON CONFLICT DO NOTHING`（无参）；
-            // - mysql：无 DO NOTHING；8.0.20+ 才认，旧版只有
+            // - mysql：无原生 DO NOTHING；8.0.20+ 才认，旧版只有
             //   `ON DUPLICATE KEY UPDATE <pk> = <pk>` 这个恒等赋值可用，
             //   故必须知道主键列名——没有主键就无从构造，直接拒绝而不是猜列名。
-            if req.or_ignore {
-                // sqlite 的 upsert 子句只能跟在 VALUES 后面：
-                // `INSERT ... SELECT ... ON CONFLICT DO NOTHING` 是语法错
-                // （sqlite 直接报 `near "DO": syntax error`），加 target 也不行。
-                // 让 sqlite 吐这句谁也看不懂的错，不如在构造期就说清楚。
-                if req.from_select.is_some() && dialect == Dialect::Sqlite {
-                    return Err(JsErrorBox::generic(
-                        "orIgnore with fromSelect is not supported on sqlite \
-                         (its upsert clause only follows VALUES)",
-                    ));
+            // - sqlite/mysql 的 fromSelect 形态退到冲突解决子句前缀（OR IGNORE /
+            //   INSERT IGNORE），见 apply_conflict_resolution。
+            let strategy = req
+                .or_ignore
+                .then(|| ignore_strategy(dialect, req.from_select.is_some()));
+            if let Some(IgnoreStrategy::MySqlDuplicateKeyIdentity) = strategy {
+                if table.primary_key.is_empty() {
+                    return Err(JsErrorBox::generic(format!(
+                        "orIgnore on mysql requires a primary key on table '{}'",
+                        req.table.name
+                    )));
                 }
-                match dialect {
-                    Dialect::MySql => {
-                        if table.primary_key.is_empty() {
-                            return Err(JsErrorBox::generic(format!(
-                                "orIgnore on mysql requires a primary key on table '{}'",
-                                req.table.name
-                            )));
-                        }
-                        // mysql 渲染时丢弃 target 列表，只有 action 用得上（恒等赋值）。
-                        let mut oc = OnConflict::new();
-                        ins.on_conflict(
-                            oc.do_nothing_on(
-                                table.primary_key.iter().map(|c| Alias::new(c.as_str())),
-                            )
-                            .to_owned(),
-                        );
-                    }
-                    _ => {
-                        ins.on_conflict(OnConflict::new().do_nothing().to_owned());
-                    }
-                }
+                // mysql 渲染时丢弃 target 列表，只有 action 用得上（恒等赋值）。
+                let mut oc = OnConflict::new();
+                ins.on_conflict(
+                    oc.do_nothing_on(table.primary_key.iter().map(|c| Alias::new(c.as_str())))
+                        .to_owned(),
+                );
+            }
+            if matches!(strategy, Some(IgnoreStrategy::OnConflictDoNothing)) {
+                ins.on_conflict(OnConflict::new().do_nothing().to_owned());
             }
             // returning 列：白名单校验（限定名自然被 has_column 拒）→ 渲染 RETURNING。
             // mysql 无 RETURNING：只接受单列，由 op 侧在同一目标上两步取 LAST_INSERT_ID()。
@@ -1765,7 +1808,15 @@ fn build_statement(
                     ));
                 }
             }
-            params_of(build_sql(dialect, &ins))
+            let (sql, values) = build_sql(dialect, &ins);
+            let sql = match strategy {
+                Some(
+                    s @ (IgnoreStrategy::SqliteOrIgnorePrefix
+                    | IgnoreStrategy::MySqlInsertIgnorePrefix),
+                ) => apply_conflict_resolution(sql, s)?,
+                _ => sql,
+            };
+            params_of((sql, values))
         }
         Verb::Update => {
             // DML 带 joins/with 已被动词矩阵拒绝 → 条件上下文恒为真实基表、无联表。

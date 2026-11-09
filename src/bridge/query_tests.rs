@@ -2633,9 +2633,10 @@ fn or_ignore_renders_per_dialect() {
     );
 }
 
-/// orIgnore + fromSelect 的方言差异（v0.1.81）：pg/mysql 都能挂上去，
-/// sqlite 的 upsert 子句只能跟 VALUES——实测 `INSERT ... SELECT ... ON CONFLICT`
-/// 报 `near "DO": syntax error`，加 target 也没用（sqlite 3.54 直接不支持）。
+/// orIgnore + fromSelect 的方言差异（v0.1.128）：三方言全部支持。
+/// sqlite 的 upsert 子句只能跟 VALUES，但冲突**解决**子句 `OR IGNORE` 可跟
+/// SELECT；mysql 用 `INSERT IGNORE`（无 1052 歧义、不要求主键）；pg 保持
+/// `ON CONFLICT DO NOTHING`。
 #[test]
 fn or_ignore_with_from_select_renders_per_dialect() {
     let reg = SchemaRegistry::new()
@@ -2645,14 +2646,44 @@ fn or_ignore_with_from_select_renders_per_dialect() {
     let pg = norm_ws(sql_in(&reg, req, Dialect::Postgres).unwrap());
     assert!(pg.contains("SELECT"), "{pg}");
     assert!(pg.contains("ON CONFLICT DO NOTHING"), "{pg}");
-    let my = sql_in(&reg, req, Dialect::MySql).unwrap();
+    let my = norm_ws(sql_in(&reg, req, Dialect::MySql).unwrap());
     assert!(my.contains("SELECT"), "{my}");
-    assert!(my.contains("ON DUPLICATE KEY UPDATE `id` = `id`"), "{my}");
-    let e = sql_in(&reg, req, Dialect::Sqlite).unwrap_err().to_string();
-    assert!(
-        e.contains("orIgnore with fromSelect is not supported on sqlite"),
-        "{e}"
-    );
+    assert!(my.contains("INSERT IGNORE INTO"), "{my}");
+    assert!(!my.contains("ON DUPLICATE"), "{my}");
+    let sq = norm_ws(sql_in(&reg, req, Dialect::Sqlite).unwrap());
+    assert!(sq.contains("SELECT"), "{sq}");
+    assert!(sq.contains("INSERT OR IGNORE INTO"), "{sq}");
+}
+
+/// mysql 无主键表 + fromSelect + orIgnore（v0.1.128）：INSERT IGNORE 不需要
+/// 恒等赋值列，主键检查只属于 VALUES 路径的 DuplicateKeyIdentity 策略。
+#[test]
+fn or_ignore_from_select_mysql_no_pk_ok() {
+    let reg = SchemaRegistry::new()
+        .table("t", &[], &["id", "name"])
+        .table("s", &["id"], &["id", "name"]);
+    let req = r#"{"table":"t","verb":"insert","from_select":{"table":"s","columns":["id","name"]},"insert_cols":["id","name"],"or_ignore":true}"#;
+    let my = sql_in(&reg, req, Dialect::MySql).unwrap();
+    assert!(my.contains("INSERT IGNORE INTO"), "{my}");
+}
+
+/// orIgnore + fromSelect + returning 组合（v0.1.128）：三方言共存渲染
+/// （mysql 走 LAST_INSERT_ID 两步取，无 RETURNING 子句，语义不变）。
+#[test]
+fn or_ignore_from_select_with_returning_renders() {
+    let reg = SchemaRegistry::new()
+        .table("t", &["id"], &["id", "name"])
+        .table("s", &["id"], &["id", "name"]);
+    let req = r#"{"table":"t","verb":"insert","from_select":{"table":"s","columns":["id","name"]},"insert_cols":["id","name"],"or_ignore":true,"returning":["id"]}"#;
+    let sq = norm_ws(sql_in(&reg, req, Dialect::Sqlite).unwrap());
+    assert!(sq.contains("INSERT OR IGNORE INTO"), "{sq}");
+    assert!(sq.contains("RETURNING"), "{sq}");
+    let pg = norm_ws(sql_in(&reg, req, Dialect::Postgres).unwrap());
+    assert!(pg.contains("ON CONFLICT DO NOTHING"), "{pg}");
+    assert!(pg.contains("RETURNING"), "{pg}");
+    let my = sql_in(&reg, req, Dialect::MySql).unwrap();
+    assert!(my.contains("INSERT IGNORE INTO"), "{my}");
+    assert!(!my.contains("RETURNING"), "{my}");
 }
 
 /// `fromSelect`（v0.1.81）：列数必须与源 select 一致，且与 values 互斥。
@@ -2805,8 +2836,8 @@ async fn from_select_copies_rows_and_pairs_with_or_ignore() {
         .unwrap();
     let v: Value = serde_json::from_slice(&cap.body).unwrap();
     assert_eq!(v["code"], 500, "{v}");
-    // sqlite 上 orIgnore 与 fromSelect 不能共存 → 构造期就拒（不是把 sqlite 的
-    // `near "DO": syntax error` 抛给用户）。
+    // 带 id + orIgnore（v0.1.128）：sqlite 渲染 `INSERT OR IGNORE`，4 行全撞
+    // 主键被静默跳过 → code==0、写入 0 行（幂等语义，与 pg/mysql 一致）。
     let cap = b
         .run(
             r#"db.table("t").fromSelect(db.table("t").select(["id","name"]), ["id","name"]).orIgnore().run()
@@ -2816,14 +2847,7 @@ async fn from_select_copies_rows_and_pairs_with_or_ignore() {
         .await
         .unwrap();
     let v: Value = serde_json::from_slice(&cap.body).unwrap();
-    assert_eq!(v["code"], 500, "{v}");
-    assert!(
-        v["msg"]
-            .as_str()
-            .unwrap()
-            .contains("orIgnore with fromSelect is not supported on sqlite"),
-        "{v}"
-    );
+    assert_eq!((&v["code"], &v["data"]["n"]), (&json!(0), &json!(0)), "{v}");
     // 失败的语句没写进任何行：仍是 8 行（4 原 + 4 副本）。
     let cap = b
         .run(

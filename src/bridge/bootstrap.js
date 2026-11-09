@@ -1486,9 +1486,14 @@ function builderFromReq(snap) {
       req.insert_cols = (cols || []).map(String);
       return api;
     },
-    // Skip rows that collide with a unique key / primary key (v0.1.81).
-    // sqlite/pg render ON CONFLICT DO NOTHING; mysql has no DO NOTHING and falls back
-    // to the identity update `ON DUPLICATE KEY UPDATE <pk> = <pk>` (needs a primary key).
+    // Skip rows that collide with a unique key / primary key (v0.1.81; fromSelect
+    // forms v0.1.128). VALUES form: sqlite/pg render ON CONFLICT DO NOTHING; mysql
+    // has no DO NOTHING and falls back to the identity update
+    // `ON DUPLICATE KEY UPDATE <pk> = <pk>` (needs a primary key). fromSelect form:
+    // sqlite renders INSERT OR IGNORE, mysql renders INSERT IGNORE (no primary key
+    // needed), pg keeps ON CONFLICT DO NOTHING. NOTE: OR IGNORE / INSERT IGNORE also
+    // swallow NOT NULL/CHECK violations -- only unique-key conflicts are skipped
+    // on pg; and idempotency requires an actual unique key on the target columns.
     orIgnore() { req.or_ignore = true; return api; },
     update(sets) { req.verb = "update"; req.sets = encodeParams({ ...sets }); return api; },
     delete() { req.verb = "delete"; return api; },
