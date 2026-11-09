@@ -241,13 +241,18 @@ mode`；另有两条 fail-closed——DML/DDL 命中却**提取不到已登记�
 `TRUNCATE/ALTER/DROP/CREATE` 触碰已登记表（`tenant guard: {KW} on registered table(s) […]
 not allowed under sql_guard`）——都无法注入条件，deny 拒、warn 只告警。
 
-**两个逃生口**：`db.asSystem()`（请求级绕过、`ReqState` 重置即失效，日志留
+**两个请求级逃生口 + 一个语句级通道**：`db.asSystem()`（请求级绕过、`ReqState` 重置即失效，日志留
 `warn: db.asSystem() invoked (tenant guard bypass for this request)`，只给审计/运维类
 handler）；`db.asTenant(id)`（匿名请求声明租户，**不绕过**防护——租户条件照常注入，只是
-id 由 handler 给。三道门禁：`allow_as_tenant: true`、请求匿名且尚无租户头、`id` 非空）。
+id 由 handler 给。三道门禁：`allow_as_tenant: true`、请求匿名且尚无租户头、`id` 非空）；
+`db.table(t).forTenant(id)`（**语句级**，未发布版——只让这一条构造器语句以 `id` 注入，
+同请求其他语句仍注入当前租户；id 必须服务端派生；命中记审计事件
+`DB_TENANT_OVERRIDE`；只许顶层语句，子查询/union/cte/fromSelect 源带它必报错）。
 报错文案：`db.asTenant is disabled: set tenant.allow_as_tenant=true to let anonymous handlers
 declare a tenant` / `db.asTenant is only allowed on anonymous requests (anonymous_paths hit,
-no tenant header)` / `db.asTenant: id must not be empty`。
+no tenant header)` / `db.asTenant: id must not be empty` /
+`tenant guard: forTenant is only valid on the top-level statement` /
+`tenant guard: forTenant id must not be empty`。
 
 ---
 
@@ -1450,7 +1455,8 @@ db_access:
 - `allow: {}`（或整段不写）= 不限制；`allow: { roles: [] }` = 声明且为空 → **无人可过**。
 - fail-closed：声明了某维而请求取不到该维身份 → 该维不命中（**不因「取不到」而放行**）。
 - `tenants` 维**只认 server 注入的租户**：`db.asTenant()` 自填的租户不作数
-  （否则匿名 handler 可自造租户命中白名单 → 借道跨租户）。
+  （否则匿名 handler 可自造租户命中白名单 → 借道跨租户）；语句级 `forTenant()` 覆盖的
+  租户同样不作数——`tenants` 维授权的是**请求身份**，不约束逃生口语句实读的行。
 - `db.asSystem()` **不豁免**访问控制（它只绕过租户注入）；管理员通道请走 `allow.roles`。
 - `sources` 维是为了解决**任务桥恒无身份**（定时任务没有 user/module/tenant）：
   给它们声明 `sources: [task]`。WS 帧跑在 HTTP 桥上，source 记 `http`

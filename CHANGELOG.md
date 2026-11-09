@@ -16,7 +16,30 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
-## 下一版（未发布）
+## v0.1.129（2026-11-09）
+
+- **feat（bridge，SQL 构造器：语句级跨租户身份 `db.table().forTenant(id)`，需求
+  #8.5）**：此前跨租户只有两极——`db.asSystem()`（请求级**全关**）与 `db.asTenant(id)`
+  （请求级、仅匿名、三道门禁）。新增语句级第三极：链上 `forTenant(id)` 让**单条**构造器
+  语句以服务端派生的租户 id 执行，**只换注入值、不关闭防护**（where 注入 / insert 强制写 /
+  update sets 校验 / join ON / fromSelect 常量列全部照常），同请求其他语句仍注入当前请求租户
+  （字段随 QueryReq 逐语句传递，不碰 ReqState，toSQL 与 run 天然一致；tx 会话路由同样生效）。
+  - 无配置门（与 asSystem 同信任模型：仍强制结构化注入，比全关更严）；命中记审计事件
+    `DB_TENANT_OVERRIDE`（U-9 归一口径，detail 带 `from=<请求租户> to=<覆盖值> cross=<bool>
+    verb=<动词>`，顶层每语句一次），运维按 `cross=true` 过滤真跨租户。
+  - 嵌套防呆：forTenant 只许在**顶层**语句——union 臂 / where 子查询 / exists / cte /
+    fromSelect 源 / case-when 任一内层 req 自带 tenant_id 即报错
+    `tenant guard: forTenant is only valid on the top-level statement`（独立递归检查，与
+    sql_guard 档位无关）；空 / 空白 id 拒绝（`tenant guard: forTenant id must not be
+    empty`，Rust 侧为权威，fromJSON 直喂同检）。
+  - `asSystem` 请求内 forTenant 为 no-op（全关语义不变、不报错，warn 提示防「期望恢复
+    限定」的过曝误用）；toJSON/fromJSON 快照原样携带覆盖（语句语义延续）。
+  - 限制：forTenant 语句的 `toSQL()` 产物不可经 `db.query` 回放（裸 SQL 守卫
+    `check_tenant_raw` 要求参数含**当前请求租户**，fail-closed 会拒）——直接 `.run()`；
+    `db_access` 的 `allow.tenants` 维授权的是**请求身份**，不约束 forTenant 语句实读的行
+    （与 asSystem 先例同构）。
+  - 红线：id 必须服务端派生（企微 `corp_id` 回调、管理员重设等），**绝不可取请求参数**；
+    模板后端两处「保留裸 SQL」注释论证（A1/A2）可据此收敛为构造器。
 
 - **fix（serve，静态压缩 single-flight 收尾竞态）**：并发同键请求在 macOS CI 偶发
   `concurrent_misses_compress_once` 红。follower 循环内「查缓存」与「读 INFLIGHT 登记」

@@ -44,6 +44,7 @@
 | [41](#场景-41通知回执合并--幂等写入构造器补齐能力v0181) | 通知回执合并 + 幂等写入：join ON 值条件 / 字面量列 `scope` / `orIgnore` / `fromSelect`（v0.1.81 补齐，替代手写 `db.query`） | §6 db / 查询构造器 |
 | [42](#场景-42运行期动态登记数据源-client-轴v0191) | 运行期把 DSN 登记为命名库：`db.client.register("rep", dsn)` → `DB("rep")` 直接可用（复用 L1 访问控制 + L2 内省）；未声明 `db_access.<name>` 的动态库默认 deny | §6 db / `db.client` |
 | [73](#场景-73装完部署后让-seed-随迁移即时灌oj-migrate---with-seedv01125) | 带 `seed.sql` 的模块装完数据面空：`oj migrate --with-seed` 把迁移+seed 一起做完（严格 migrate→seed、幂等、fail-closed 门禁、`--format json` 顶层 `seed`、exit code 成败真源） | §3 数据层 / §10 `oj migrate --with-seed` |
+| [74](#场景-74普通请求里对别的租户做窄范围写语句级-fortenantid未发布版) | 服务端派生别的租户 id（企微 `corp_id`），普通请求里只删**那一个租户**的 refresh token，又不想关掉整个请求的租户防护 | §8 鉴权与多租户 / §6 db |
 
 ---
 
@@ -4792,3 +4793,56 @@ platform:
 
 > 相关：§3「三层 SQL 文件」的 seed 行、`SKILL.md` 陷阱速查「装完带 seed 的模块数据面空」、
 > `api-manual.md` §13「门禁是词法白名单、非完整沙箱 / 不自动接进 ojm install」。
+
+## 场景 74：普通请求里对别的租户做窄范围写（语句级 `forTenant(id)`，未发布版）
+
+> 何时抄我：服务端从**可信渠道**派生出另一个租户的 id（企微回调里的 `corp_id`、
+> 租户管理员重设后清旧会话），需要在**普通请求**里对那个租户做窄范围写（比如删它的
+> refresh token）——但不想 `db.asSystem()` 把整个请求的租户防护全关掉。
+> 手册 §8 鉴权与多租户（逃生口三极）/ §6 db、`api-manual.md`「语句级 forTenant」段、
+> `SKILL.md` 陷阱速查最红一行。
+
+三个身份工具的取舍（先选对极，别上来就 asSystem）：
+
+| 诉求 | 用哪个 |
+|---|---|
+| 跨租户对账/报表，**整个请求**都不要租户防护 | `db.asSystem()`（请求级全关，业务禁用） |
+| **匿名**请求（公开页/回调无租户头）声明自己是哪个租户 | `db.asTenant(id)`（请求级，需 `tenant.allow_as_tenant`，防护照常注入） |
+| **已认证请求**里只让**一条语句**以别的租户执行 | `db.table(t).forTenant(id)`（本场景） |
+
+```ts
+// src/auth/wecom-callback/api.ts（示意：企微授权回调， CorpId 来自平台验签后的回调体）
+export async function post() {
+  const body = await http.body();
+  // 红线：corpId 必须服务端派生（验签后的回调体 / 查库得出），绝不吃 http.query 的租户参数。
+  const corpId: string = await deriveTenantFromVerifiedCallback(body); // 项目自己的派生逻辑
+  // 该租户换了授权：清掉它旧的 refresh token。只影响 t=corpId 的行，
+  // 本请求里其他语句仍注入当前请求租户。
+  await db
+    .table("auth_refresh_token")
+    .forTenant(corpId)
+    .delete()
+    .where({ field: "provider", op: "eq", value: "wecom" })
+    .run();
+  // 之后的普通语句不受影响——照常注入当前请求租户：
+  await db.table("audit_log").insert({ action: "wecom.rebind", at: Date.now() }).run();
+  return json.ok({ rebind: true });
+}
+```
+
+验证（sql_guard: deny 下）：
+
+```bash
+# 审计事件可检索：detail 带 from=<请求租户> to=<覆盖值> cross=<bool> verb=<动词>
+curl -s "{base}/_system/audit?kind=DB_TENANT_OVERRIDE"    # 或由平台 audit.query({kind}) 查
+# stderr 同步归一行（OJ_AUDIT: kind=DB_TENANT_OVERRIDE ... cross=true ...），journald 直接 grep
+```
+
+| 坑 | 解 |
+|---|---|
+| `forTenant(请求参数)` | **事故模板**：id 吃什么都生效（防护照常、只是换注入值），必须服务端派生。命中记审计 `cross=true` 即真跨租户——这是 forensic 的第一查询 |
+| 报错 `forTenant is only valid on the top-level statement` | 覆盖只许在**顶层**语句：子查询 / union 臂 / cte / fromSelect 源里调了 forTenant——把覆盖提到最外层那条语句 |
+| 报错 `forTenant id must not be empty` | 派生逻辑没查到租户就传了空串——先判断再调用（与 `db.asTenant` 同纪律） |
+| `toSQL()` 产物经 `db.query` 回放被拒 | 裸 SQL 守卫按**请求租户**校验参数，fail-closed。要执行直接 `.run()` / `.all()`，别走裸路径 |
+| 想「asSystem 后再 forTenant 恢复限定」 | 不成立：`asSystem` 是请求级全关，其内 forTenant 为 no-op（warn 提示）。要限定就别 asSystem，用 forTenant |
+| toJSON 快照存库后 fromJSON 行为变了 | 快照**原样携带** forTenant（语句语义的延续）——跨租户持久化快照是危险动作，存之前想清楚 |

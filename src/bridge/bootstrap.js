@@ -1509,6 +1509,14 @@ function builderFromReq(snap) {
       req.table = { name: String(base.name), as: String(alias) };
       return api;
     },
+    // Statement-level tenant override (#8.5): run THIS statement as tenant `id`.
+    // `id` must be derived server-side (never from request input). Tenant
+    // conditions are still injected - only the injected id changes; sibling
+    // statements in the same request keep the request tenant. Request-level
+    // escape hatches stay db.asSystem() (full bypass) and db.asTenant(id)
+    // (anonymous-request identity). The override rides the req snapshot:
+    // toJSON/fromJSON carries it as part of the statement.
+    forTenant(id) { req.tenant_id = String(id); return api; },
     // join(table, on, kind, alias?): `on` entries are either {left,right} (col=col) or
     // {left,op,value} (col <op> value, v0.1.81). `value` goes through encodeParams so
     // toBigInt() markers survive. The optional 4th arg aliases the JOINED table.

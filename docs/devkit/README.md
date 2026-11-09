@@ -304,7 +304,7 @@ v0.1.89 已落地部分：**db 访问控制（`db_access:` 段）**——① 顶
 ⑤ 决策可观测：`DB_ACCESS_DENY` 前缀结构化日志（按 `(alias, reason)` 聚合计数）+ `SqlEvent`
 新增 `risk`/`operator`。⑥ **行为变更**：`db.asSystem()` **不豁免**访问控制（它只绕过租户
 防护），`db.asTenant()` 自填的租户在 `tenants` 维**不作数**——升级到 `deny` 档前先查存量
-handler。⑦ 它是**宿主侧护栏层**不是数据库权限：`read_only` 是文本级判定（真写防线仍是 DB
+handler。语句级 `db.table().forTenant(id)`（未发布版）同理：覆盖值不是 `tenants` 维身份。⑦ 它是**宿主侧护栏层**不是数据库权限：`read_only` 是文本级判定（真写防线仍是 DB
 账号 GRANT）、`max_rows` 对 `db.query` 是取回后截断（非限流）、**不约束**平台自生成 SQL 与
 `oj migrate` 等 CLI 通道。见 api-manual §10「db_access」与 §6「db / DB(name)」、§13 限制表、
 SKILL 陷阱速查、scenarios 场景 46。

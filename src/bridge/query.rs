@@ -551,6 +551,13 @@ struct QueryReq {
     /// `from_select` 路径下的目标列清单（必须与源 select 输出列数一致）。
     #[serde(default)]
     insert_cols: Vec<String>,
+    /// 语句级租户覆盖（需求 #8.5，链方法 `forTenant(id)`）：本语句以该租户 id
+    /// 注入 tenant_id 条件——**只换注入值，不关闭防护**（结构化条件照常生效，
+    /// 写侧校验照常）。字段随 QueryReq 逐语句传递，不碰 ReqState，故同请求
+    /// 其他语句仍注入当前租户、toSQL 与 run 天然一致。id 必须服务端派生（红线）。
+    /// 只许出现在**顶层**语句；嵌套 req 带此键由 `reject_nested_tenant` 拒绝。
+    #[serde(default)]
+    tenant_id: Option<String>,
 }
 
 /// orIgnore 的方言 × 形态分派（v0.1.128 统一入口）：新方言 / 新形态只改这张表。
@@ -1318,6 +1325,68 @@ fn guard_req(state: &Rc<RefCell<OpState>>, req: &QueryReq) -> Result<(), JsError
         guard_req(state, s)?;
     }
     Ok(())
+}
+
+/// 语句级租户覆盖（forTenant）只许在**顶层**语句：嵌套 req（union 臂 / where 子查询 /
+/// exists / cte / fromSelect 源 / case-when 条件）自带 tenant_id 会造成单条语句内
+/// 两个租户身份，直接拒绝（fail-closed，与「insert fromSelect 不得自带 tenant_id」
+/// 同构）。独立递归而不塞进 guard_req/apply_tenant——那两份是历史上漂移过的镜像
+/// 递归，且本检查与 sql_guard 档位无关（apply_tenant_guard 在 Off 档提前 return，
+/// 塞进去 Off 档会静默放行）。两个构造器 op 在反序列化后、guard_req 前各调一次。
+fn reject_nested_tenant(req: &QueryReq) -> Result<(), JsErrorBox> {
+    for c in &req.conditions {
+        reject_nested_tenant_tree(c)?;
+    }
+    if let Some(h) = &req.having {
+        reject_nested_tenant_tree(h)?;
+    }
+    for col in &req.columns {
+        if let ColSpec::Case(c) = col {
+            for w in &c.case.when {
+                reject_nested_tenant_tree(&w.cond)?;
+            }
+        }
+    }
+    for u in &req.unions {
+        reject_nested_one(&u.query)?;
+    }
+    for c in &req.with {
+        reject_nested_one(&c.query)?;
+    }
+    if let Some(s) = &req.from_select {
+        reject_nested_one(s)?;
+    }
+    Ok(())
+}
+
+/// 单个嵌套 req 的判定：自带 tenant_id → 拒；否则继续向下递归。
+fn reject_nested_one(sub: &QueryReq) -> Result<(), JsErrorBox> {
+    if sub.tenant_id.is_some() {
+        return Err(JsErrorBox::generic(
+            "tenant guard: forTenant is only valid on the top-level statement",
+        ));
+    }
+    reject_nested_tenant(sub)
+}
+
+/// 条件树遍历，嵌套 req 递归 reject_nested_tenant（形状照抄 guard_nested）。
+fn reject_nested_tenant_tree(t: &CondTree) -> Result<(), JsErrorBox> {
+    match t {
+        CondTree::Leaf(c) => {
+            if let Some(sub) = &c.subquery {
+                reject_nested_one(sub)?;
+            }
+            Ok(())
+        }
+        CondTree::And(xs) | CondTree::Or(xs) => {
+            for x in xs {
+                reject_nested_tenant_tree(x)?;
+            }
+            Ok(())
+        }
+        CondTree::Not(x) => reject_nested_tenant_tree(x),
+        CondTree::Exists(sub) => reject_nested_one(sub),
+    }
 }
 
 /// 条件树遍历，嵌套 req 递归 guard_req。
@@ -2341,6 +2410,7 @@ pub async fn op_db_query_build(
     #[serde] req: QueryReq,
 ) -> Result<serde_json::Value, JsErrorBox> {
     let reg = registry(&state)?;
+    reject_nested_tenant(&req)?;
     guard_req(&state, &req)?;
     validate_truncate(&req)?;
     // db 访问控制（v0.1.89）：构造器路径走**精确意图**判定——verb 已知，不经词法，
@@ -2681,6 +2751,7 @@ pub fn op_db_query_sql(
     #[serde] req: QueryReq,
 ) -> Result<serde_json::Value, JsErrorBox> {
     let reg = registry(&state)?;
+    reject_nested_tenant(&req)?;
     guard_req(&state, &req)?;
     validate_truncate(&req)?;
     let mut req = req;
@@ -2699,26 +2770,64 @@ pub fn op_db_query_sql(
 
 /// 两构造器 op 共用的租户预变换：读本代装配 sql_guard + ReqState（tenant_id/system），
 /// Off 或 system 逃生口直接放行。
+///
+/// 语句级覆盖（需求 #8.5）：`req.tenant_id` 为 Some 时本语句改以该租户注入——
+/// **只换注入值，不关闭防护**（注入 / insert 强制写 / update sets 校验照常）；
+/// 同请求其他语句不受影响。id 必须服务端派生（红线），命中记审计
+/// `DB_TENANT_OVERRIDE`（顶层每语句一次；run() 与 toSQL() 各调一次本函数，
+/// 各记一条）。system 请求内覆盖为 no-op（system = 全关，域内无租户概念），
+/// 不报错但打 warn——防「asSystem 后误加 forTenant 期望恢复限定」的过曝方向。
 fn apply_tenant_guard(
     state: &Rc<RefCell<OpState>>,
     req: &mut QueryReq,
     reg: &SchemaRegistry,
 ) -> Result<(), JsErrorBox> {
-    let g = state.borrow();
-    let guard = g
-        .borrow::<super::ReqState>()
-        .assembly
-        .clone()
-        .expect("assembly pinned at checkout")
-        .sql_guard;
+    let (guard, rs_tid, system) = {
+        let g = state.borrow();
+        let guard = g
+            .borrow::<super::ReqState>()
+            .assembly
+            .clone()
+            .expect("assembly pinned at checkout")
+            .sql_guard;
+        let rs = g.borrow::<super::ReqState>();
+        (guard, rs.req.tenant_id.clone(), rs.system)
+    };
     if guard == super::SqlGuard::Off {
         return Ok(());
     }
-    let (tid, system) = {
-        let rs = g.borrow::<super::ReqState>();
-        (rs.req.tenant_id.clone(), rs.system)
+    if system {
+        if req.tenant_id.is_some() {
+            eprintln!(
+                "warn: db.table().forTenant({:?}) ignored: request is db.asSystem() \
+                 (tenant guard fully off for this request)",
+                req.tenant_id
+            );
+        }
+        return Ok(());
+    }
+    let tid = match &req.tenant_id {
+        Some(t) => {
+            if t.trim().is_empty() {
+                return Err(JsErrorBox::generic(
+                    "tenant guard: forTenant id must not be empty",
+                ));
+            }
+            // cross=false（覆盖值 == 请求租户）多为便利用法，事件照记、运维按 cross 过滤。
+            let cross = rs_tid.as_deref() != Some(t.as_str());
+            let (owner, st) = super::client_db::audit_ctx(state);
+            super::audit::emit(
+                &st.audit,
+                "DB_TENANT_OVERRIDE",
+                &owner,
+                &super::guard::bound_db(state, &req.db),
+                &format!("from={rs_tid:?} to={t:?} cross={cross} verb={:?}", req.verb),
+            );
+            Some(t.clone())
+        }
+        None => rs_tid,
     };
-    apply_tenant(req, reg, tid.as_deref(), guard, system)
+    apply_tenant(req, reg, tid.as_deref(), guard, false)
 }
 
 /// 按方言出 SQL（QueryStatementWriter::build 泛型，四类 statement 通吃）。

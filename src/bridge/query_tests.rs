@@ -2173,6 +2173,344 @@ async fn tenant_guard_applies_inside_tx() {
     );
 }
 
+// ----- 语句级跨租户身份（需求 #8.5）：db.table().forTenant(id) -----
+
+/// 语句级覆盖：forTenant("t2") 精确命中 t2 行；同请求另一条普通语句仍收窄 t1
+/// （验收标准 1 双断言）；tx 路由同样生效（注入在 resolve_target 之前）。
+#[tokio::test(flavor = "current_thread")]
+async fn tenant_stmt_override_hits_target_and_siblings_stay_scoped() {
+    let b = guarded_bridge().await;
+    let cap = b
+        .run_with(
+            r#"(async () => {
+                 const theirs = await db.table("t").forTenant("t2").select(["name"]).all();
+                 const del = await db.table("t").forTenant("t2")
+                   .delete().where({field:"name",op:"eq",value:"b1"}).run();
+                 const mine = await db.table("t").select(["name"]).orderBy([{field:"id",dir:"asc"}]).all();
+                 const inTx = await db.tx(async (tx) =>
+                   tx.table("u").forTenant("t2").select(["label"]).all());
+                 // asSystem 是请求级：放最后，避免污染前面的语句。
+                 const gone = await db.asSystem().table("t").select(["name"]).all();
+                 json.ok({
+                   theirs: theirs.map(r => r.name), del,
+                   mine: mine.map(r => r.name),
+                   gone: gone.map(r => r.name).sort(),
+                   inTx: inTx.map(r => r.label),
+                 });
+               })().catch(e => json.fail(500, String(e)));"#,
+            req_t1(),
+        )
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["code"], 0, "{v}");
+    assert_eq!(v["data"]["theirs"], json!(["b1"]), "{v}");
+    assert_eq!(v["data"]["del"], 1, "{v}");
+    // 同请求普通语句仍只见到 t1 的行——证明不是请求级全关。
+    assert_eq!(v["data"]["mine"], json!(["a1", "a2"]), "{v}");
+    // tx 路由同样带覆盖。
+    assert_eq!(v["data"]["inTx"], json!(["ub"]), "{v}");
+    assert_eq!(v["data"]["gone"], json!(["a1", "a2"]), "{v}");
+}
+
+/// 覆盖命中打审计事件：每语句顶层一次（toSQL + run 各一次 = 各一条，不是每个
+/// AST 节点一条）；detail 带 from/to/cross，运维按 cross=true 过滤真跨租户。
+#[tokio::test(flavor = "current_thread")]
+async fn tenant_stmt_override_emits_audit_with_from_to_cross() {
+    let b = guarded_bridge().await;
+    let cap = b
+        .run_with(
+            r#"(async () => {
+                 // exists 子查询使语句树有两个受约束表节点——若审计挂在递归层会多于 2 条。
+                 const q = () => db.table("t").forTenant("t2").select(["name"])
+                   .where({exists: db.table("u").select(["id"])});
+                 await q().toSQL();
+                 await q().all();
+                 await db.table("t").forTenant("t1").select(["name"]).all();
+                 const evs = await audit.query({ kind: "DB_TENANT_OVERRIDE" });
+                 json.ok({ n: evs.length, details: evs.map(e => e.detail) });
+               })().catch(e => json.fail(500, String(e)));"#,
+            req_t1(),
+        )
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["code"], 0, "{v}");
+    // 顶层每语句一次：t2 语句两次调用 2 条 + t1 语句 1 条 = 3。
+    assert_eq!(v["data"]["n"], 3, "{v}");
+    // audit.query 最新在前，不按序断言；按形态计数。
+    let details = v["data"]["details"].as_array().unwrap();
+    let t2 = details
+        .iter()
+        .filter(|d| {
+            let d = d.as_str().unwrap();
+            d.contains("to=\"t2\"") && d.contains("cross=true")
+        })
+        .count();
+    let same = details
+        .iter()
+        .filter(|d| d.as_str().unwrap().contains("cross=false"))
+        .count();
+    assert_eq!(t2, 2, "{v}");
+    assert_eq!(same, 1, "{v}");
+}
+
+/// 嵌套防呆：forTenant 只许在顶层语句——union 臂 / where 子查询 / exists /
+/// cte / fromSelect 源 任一内层带 tenant_id → 报错，不静默忽略。
+#[tokio::test(flavor = "current_thread")]
+async fn tenant_stmt_override_rejected_on_nested_reqs() {
+    let b = guarded_bridge().await;
+    for (name, js) in [
+        (
+            "union arm",
+            r#"db.table("t").select(["name"]).union(db.table("t").forTenant("t2").select(["name"])).all()"#,
+        ),
+        (
+            "where subquery",
+            r#"db.table("t").select(["name"]).where({field:"id",op:"in",subquery:db.table("t").forTenant("t2").select(["id"])}).all()"#,
+        ),
+        (
+            "exists",
+            r#"db.table("t").select(["name"]).where({exists:db.table("t").forTenant("t2").select(["id"])}).all()"#,
+        ),
+        (
+            "cte",
+            r#"db.table("t").with("c",["name"],db.table("t").forTenant("t2").select(["name"])).select(["name"]).all()"#,
+        ),
+        (
+            "fromSelect source",
+            r#"db.table("t").fromSelect(db.table("t").forTenant("t2").select(["name"]),["name"]).run()"#,
+        ),
+    ] {
+        let cap = b
+            .run_with(
+                &format!(r#"{js}.then(()=>json.ok({{}})).catch(e=>json.fail(400,String(e)));"#),
+                req_t1(),
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_ne!(v["code"], 0, "{name} 应拒绝: {v}");
+        assert!(
+            v["msg"].as_str().unwrap().contains("top-level"),
+            "{name}: {v}"
+        );
+    }
+    // fromJSON 直喂 serde 的同构句式（绕过 JS 链层也走同一防呆）。
+    let cap = b
+        .run_with(
+            r#"db.fromJSON({table:"t",columns:["name"],conditions:[{exists:{table:"t",columns:["id"],conditions:[],tenant_id:"t2"}}],tenant_id:"t2"}).all()
+                 .then(()=>json.ok({})).catch(e=>json.fail(400,String(e)));"#,
+            req_t1(),
+        )
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_ne!(v["code"], 0, "fromJSON 嵌套应拒绝: {v}");
+    assert!(v["msg"].as_str().unwrap().contains("top-level"), "{v}");
+}
+
+/// 空 / 空白覆盖 id 拒绝（链上与 fromJSON 两个入口同文案；Rust 侧为权威）。
+#[tokio::test(flavor = "current_thread")]
+async fn tenant_stmt_override_rejects_blank_id() {
+    let b = guarded_bridge().await;
+    for (name, js) in [
+        (
+            "empty",
+            r#"db.table("t").forTenant("").select(["name"]).all()"#,
+        ),
+        (
+            "blank",
+            r#"db.table("t").forTenant("   ").select(["name"]).all()"#,
+        ),
+        (
+            "fromJSON",
+            r#"db.fromJSON({table:"t",columns:["name"],conditions:[],tenant_id:" "}).all()"#,
+        ),
+    ] {
+        let cap = b
+            .run_with(
+                &format!(r#"{js}.then(()=>json.ok({{}})).catch(e=>json.fail(400,String(e)));"#),
+                req_t1(),
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_ne!(v["code"], 0, "{name} 应拒绝: {v}");
+        assert!(
+            v["msg"].as_str().unwrap().contains("must not be empty"),
+            "{name}: {v}"
+        );
+    }
+}
+
+/// asSystem 请求内 forTenant 为 no-op：全关语义不变、不报错（快照续链不因
+/// 混用而炸），但打 warn 提示覆盖被吞（防「期望恢复限定」的过曝方向）。
+#[tokio::test(flavor = "current_thread")]
+async fn tenant_stmt_override_noop_under_as_system() {
+    let b = guarded_bridge().await;
+    let cap = b
+        .run_with(
+            r#"db.asSystem().table("t").forTenant("t2").select(["name"]).orderBy([{field:"id",dir:"asc"}]).all()
+                 .then(r => json.ok({names: r.map(x => x.name)}))
+                 .catch(e => json.fail(500, String(e)));"#,
+            req_t1(),
+        )
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["code"], 0, "{v}");
+    // system = 全关：三租户行全见，forTenant 不报错也不收窄。
+    assert_eq!(v["data"]["names"], json!(["a1", "a2", "b1"]), "{v}");
+}
+
+/// 快照续链：toJSON 携带 forTenant → fromJSON 恢复后仍以该租户执行
+/// （覆盖是语句语义的一部分；api-manual 警示「跨租户持久化快照是危险动作」）。
+#[tokio::test(flavor = "current_thread")]
+async fn tenant_stmt_override_survives_snapshot_roundtrip() {
+    let b = guarded_bridge().await;
+    let cap = b
+        .run_with(
+            r#"(async () => {
+                 const snap = db.table("t").forTenant("t2").select(["name"]).toJSON();
+                 const rows = await db.fromJSON(snap).all();
+                 json.ok({names: rows.map(r => r.name)});
+               })().catch(e => json.fail(500, String(e)));"#,
+            req_t1(),
+        )
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["code"], 0, "{v}");
+    assert_eq!(v["data"]["names"], json!(["b1"]), "{v}");
+}
+
+/// 数值型租户列：覆盖值走 tenant_value 数值形态（注入数字不是字符串），
+/// insert 强制写覆盖租户、另一条普通语句不受影响。
+#[tokio::test(flavor = "current_thread")]
+async fn tenant_stmt_override_numeric_column() {
+    let b = numeric_tenant_bridge().await;
+    let cap = b
+        .run_with(
+            r#"(async () => {
+                 const rows = await db.table("n").forTenant("8").select(["name"]).all();
+                 const s = db.table("n").forTenant("8").select(["name"]).toSQL();
+                 const ins = await db.table("n").forTenant("8").insert({name:"n88"}).run();
+                 const see = await db.table("n").forTenant("8").select(["name"]).orderBy([{field:"id",dir:"asc"}]).all();
+                 const back = await db.table("n").select(["name"]).orderBy([{field:"id",dir:"asc"}]).all();
+                 json.ok({rows: rows.map(r => r.name), params: s.params, ins,
+                          see: see.map(r => r.name), back: back.map(r => r.name)});
+               })().catch(e => json.fail(500, String(e)));"#,
+            req_tenant("7"),
+        )
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["code"], 0, "{v}");
+    assert_eq!(v["data"]["rows"], json!(["n8"]), "{v}");
+    assert!(
+        v["data"]["params"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p == &json!(8)),
+        "注入值应为数值 8: {v}"
+    );
+    assert_eq!(v["data"]["ins"], 1, "{v}");
+    assert_eq!(v["data"]["see"], json!(["n8", "n88"]), "{v}");
+    // 同请求普通语句仍以请求租户 7 执行（n88 写进了 8，7 的视角仍是 n7）。
+    assert_eq!(v["data"]["back"], json!(["n7"]), "{v}");
+}
+
+/// truncate + forTenant：只清覆盖租户的行（破坏性 × 跨租户的组合语义钉死）。
+#[tokio::test(flavor = "current_thread")]
+async fn tenant_stmt_override_truncate_clears_only_override_tenant() {
+    let b = guarded_bridge().await;
+    let cap = b
+        .run_with(
+            r#"(async () => {
+                 const n = await db.table("t").forTenant("t2").truncate().run();
+                 const rest = await db.asSystem().table("t").select(["name"]).orderBy([{field:"id",dir:"asc"}]).all();
+                 json.ok({n, rest: rest.map(r => r.name)});
+               })().catch(e => json.fail(500, String(e)));"#,
+            req_t1(),
+        )
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["code"], 0, "{v}");
+    assert_eq!(v["data"]["n"], 1, "{v}");
+    assert_eq!(v["data"]["rest"], json!(["a1", "a2"]), "{v}");
+}
+
+/// 语句级覆盖三方言一致（env-gated 真库腿，照 db_exec REQ-11 模式）：注入发生在
+/// AST 预变换、方言渲染之前，PG/MySQL 应与 sqlite 常跑腿同结果。CI 无服务容器恒
+/// skip；本机容器 OJ_TEST_PG / OJ_TEST_MYSQL 亲跑（memory: local-test-db-containers）。
+#[tokio::test(flavor = "current_thread")]
+async fn tenant_stmt_override_real_pg_mysql() {
+    let mut ran = 0;
+    for env in ["OJ_TEST_PG", "OJ_TEST_MYSQL"] {
+        let Ok(url) = std::env::var(env) else {
+            eprintln!("skip: {env} unset");
+            continue;
+        };
+        if url.is_empty() {
+            eprintln!("skip: {env} empty");
+            continue;
+        }
+        ran += 1;
+        let db = SqlxAccessor::arc(&url).await.unwrap();
+        // drop+create+seed 保证重复运行幂等（b1 在上轮已被删）。
+        for sql in [
+            "drop table if exists oj_stmt_override_rt",
+            "create table oj_stmt_override_rt (id integer primary key, name text, tenant_id text)",
+            "insert into oj_stmt_override_rt (id, name, tenant_id) values (1, 'a1', 't1')",
+            "insert into oj_stmt_override_rt (id, name, tenant_id) values (2, 'a2', 't1')",
+            "insert into oj_stmt_override_rt (id, name, tenant_id) values (3, 'b1', 't2')",
+        ] {
+            db.exec_with_params(sql, &[]).await.unwrap();
+        }
+        let reg = SchemaRegistry::new().table(
+            "oj_stmt_override_rt",
+            &["id"],
+            &["id", "name", "tenant_id"],
+        );
+        let b = Bridge::with_dbs_and_loader(
+            std::collections::HashMap::from([("default".to_string(), db as _)]),
+            Arc::new(InMemoryKV::new()),
+            reg,
+            false,
+            None,
+            Extras {
+                sql_guard: SqlGuard::Deny,
+                ..Default::default()
+            },
+        );
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                     const theirs = await db.table("oj_stmt_override_rt").forTenant("t2").select(["name"]).all();
+                     const del = await db.table("oj_stmt_override_rt").forTenant("t2")
+                       .delete().where({field:"name",op:"eq",value:"b1"}).run();
+                     const mine = await db.table("oj_stmt_override_rt").select(["name"])
+                       .orderBy([{field:"id",dir:"asc"}]).all();
+                     json.ok({theirs: theirs.map(r => r.name), del, mine: mine.map(r => r.name)});
+                   })().catch(e => json.fail(500, String(e)));"#,
+                req_t1(),
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{env}: {v}");
+        assert_eq!(v["data"]["theirs"], json!(["b1"]), "{env}: {v}");
+        assert_eq!(v["data"]["del"], 1, "{env}: {v}");
+        assert_eq!(v["data"]["mine"], json!(["a1", "a2"]), "{env}: {v}");
+    }
+    if ran == 0 {
+        eprintln!("skip: OJ_TEST_PG / OJ_TEST_MYSQL both unset");
+    }
+}
+
 /// 含 LIKE 元字符的夹具：% 与 _ 是数据，不是通配符。
 async fn seeded_bridge_like() -> Bridge {
     let db = SqlxAccessor::arc("sqlite::memory:").await.unwrap();

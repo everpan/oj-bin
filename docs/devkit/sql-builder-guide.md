@@ -35,6 +35,7 @@ PG 的 `$N` 占位符自管）就会锁死到单一引擎，迁移时须逐条�
 | 聚合 / groupBy / having / distinct | `select([{fn,...}])/groupBy/having/distinct` | ✅ | |
 | count(distinct col) | `select([{fn:"count",distinct:true,field,as}])` | ✅ | v0.1.82；聚合一行、免拉行计数（受 LIMIT 钳制的 `distinct().all()+length` 是陷阱） |
 | 整表清空 | `.truncate().run()` | ✅ | v0.1.82；渲染 `DELETE FROM t`；**租户守卫照常注入**（租户表=清当前租户，整库清用 asSystem） |
+| 语句级租户覆盖 | `.forTenant(id)` | ✅ | 未发布版；只本条语句以 `id` 注入（防护照常），同请求其他语句仍当前租户；id 必须服务端派生；只许顶层语句，子查询/union/cte/fromSelect 源带它必报错；见 api-manual「语句级 forTenant」段 |
 | 子查询 / exists / union / with CTE | `subquery / exists / union / with` | ✅ | 嵌套 ≤ 4 |
 | 取回主键 | `.returning([...])` | ⚠️ | mysql 仅单列（两步取） |
 | 幂等写入 | `.orIgnore()` | ⚠️ | 见 §3.2；VALUES / fromSelect 两形态 × 三方言全支持（v0.1.128），**语义宽度有方言差异** |

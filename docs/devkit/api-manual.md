@@ -2691,6 +2691,29 @@ tenant_id」时 warn 告警 / deny 拦截。guard 非 Off 时 schema.yaml 声明
 租户条件；**请求级且只能设一次**（已带租户头 / 已设过 → 抛错，防运行期切换身份）。
 典型用途：公开分享页、OIDC 回调等无头请求仍需按 URL 里的租户读取数据。
 
+**`db.table(t).forTenant(id)`（语句级，未发布版起）**：与上两个请求级逃生口不同，这是
+**语句级**身份——只让**这一条**构造器语句以租户 `id` 执行，同请求其他语句仍注入当前
+请求租户。租户条件**照常注入**（只是注入值换成 `id`）：where 收窄、insert 强制写、update
+sets 校验、join ON、fromSelect 常量列全走覆盖值。`id` 必须**服务端派生**（企微回调
+`corp_id`、租户管理员重设等），绝不可取请求参数——误用即跨租户数据泄露。典型用途：
+普通请求里对**非当前租户**做窄范围写（删该租户的 refresh token），又不想关整个请求的
+防护。语义与边界：
+- **无配置门**（与 `asSystem` 同信任模型：仍强制结构化注入，比请求级全关更严）；命中记
+  审计事件 `DB_TENANT_OVERRIDE`（`audit.query({kind:"DB_TENANT_OVERRIDE"})` 可检索，
+  detail 带 `from=<请求租户> to=<覆盖值> cross=<bool> verb=<动词>`）。
+- **只许顶层语句**：union 臂 / where 子查询 / exists / cte / fromSelect 源 / case-when
+  任一内层 req 自带 `tenant_id` → 报错
+  `tenant guard: forTenant is only valid on the top-level statement`（单条语句内不允许
+  出现两个租户身份）。
+- 空 / 空白 id → 报错 `tenant guard: forTenant id must not be empty`。
+- `db.asSystem()` 的请求里 forTenant 为 **no-op**（全关语义不变，不报错，warn 提示）。
+- `toJSON()` 快照**原样携带**覆盖（fromJSON 恢复后仍以该租户执行）——快照即语句语义的
+  延续，**跨租户持久化快照是危险动作**。
+- **限制**：forTenant 语句的 `toSQL()` 产物不可经 `db.query` 回放——裸 SQL 守卫要求
+  参数含当前请求租户，会 fail-closed 拒绝。要执行就直接 `.run()` / `.all()`。
+- `db_access` 的 `allow.tenants` 维只认**请求身份**，不约束 forTenant 语句实际读到的行
+  （与 asSystem 先例同构）——「这个库只有 A 的数据能被读」的正确手段是不开逃生口。
+
 两个逃生口都是**请求级**（`ReqState` 重置即失效）。注意 `tx.asSystem()` / `tx.asTenant(id)`
 返回的是**外层池句柄**（丢掉 `isTx` 标记）——别指望借它「离开事务」：执行路由按库名判定，
 语句仍在事务会话里跑，反倒是靠 `isTx` 认事务域的共享库（DDL 拒绝）会因此失明。要绕租户就
