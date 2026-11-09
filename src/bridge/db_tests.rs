@@ -11,14 +11,13 @@ fn elapsed_ms_scales_to_millis() {
     assert!(ms >= 3.0, "ms {ms}");
     assert!(ms < 1_000.0, "ms {ms}");
 }
-use crate::bridge::Extras;
+use crate::bridge::{Extras, SqlGuard};
 use crate::bridge::client_db::ClientDbRegistry;
 use crate::bridge::db_backend::DbBackendRegistry;
 use crate::bridge::db_policy::{
     AllowList, DbAccess, DbAccessOverride, DbAccessSection, DbClientSection,
 };
-use crate::bridge::{Bridge, InMemoryAccessor, InMemoryKV, SchemaRegistry};
-use serde_json::json;
+use crate::bridge::{Bridge, InMemoryAccessor, InMemoryKV, SchemaRegistry};use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -282,6 +281,200 @@ async fn stream_matches_query_on_real_db() {
     }
     if let Some(url) = my {
         stream_eq_check(&url, "mysql").await;
+    }
+}
+
+/// fromSelect().orIgnore() 三方言幂等执行腿（v0.1.128）：同一段 JS 在
+/// sqlite（内存，常跑）/ PG / MySQL（env-gated，未设 skip 并诚实登记）上
+/// 「跑 3 次仍 2 行 + 首跑 affected==2」——幂等、唯一键、lit 类型注入、
+/// 吞行哨兵（NOT NULL/截断被 OR IGNORE / INSERT IGNORE 静默吞行时首跑即红；
+/// 光凭行数抓不到，被吞行后续重跑会补上）。第二段租户守卫腿：既有真库骨架
+/// `Extras::default()` 的 sql_guard=Off 使租户注入零覆盖，这里用
+/// sql_guard=Deny + tenant_id 上下文补硬腿（共享广播源表 + 租户隔离回执表）。
+#[tokio::test(flavor = "current_thread")]
+async fn from_select_or_ignore_idempotent_all_dialects() {
+    // 三方言同一段 JS——可移植性本身就是断言。
+    const JS: &str = r#"(async () => {
+      const cols = ["tenant_id","broadcast_id","user_id","note"];
+      const src = () => db.table("ojm_nb").select(["tenant_id","id",{lit:7,as:"user_id"},{lit:"x",as:"note"}])
+          .where({field:"tenant_id",op:"eq",value:"d1"});
+      const r1 = await db.table("ojm_nbr").fromSelect(src(), cols).orIgnore().run();
+      await db.table("ojm_nbr").fromSelect(src(), cols).orIgnore().run();
+      await db.table("ojm_nbr").fromSelect(src(), cols).orIgnore().run();
+      const rows = await db.table("ojm_nbr").select(["*"]).where({field:"tenant_id",op:"eq",value:"d1"}).all();
+      return json.ok({ affected1: r1 ?? -1, n: rows.length });
+    })().catch(e => json.fail(500, String(e)))"#;
+    const JS_TENANT: &str = r#"(async () => {
+      const cols = ["broadcast_id","user_id","note"];
+      const src = () => db.table("ojm_nb_t").select(["id",{lit:7,as:"user_id"},{lit:"x",as:"note"}])
+          .where({field:"tenant_id",op:"eq",value:"d1"});
+      const r1 = await db.table("ojm_nbr_t").fromSelect(src(), cols).orIgnore().run();
+      await db.table("ojm_nbr_t").fromSelect(src(), cols).orIgnore().run();
+      await db.table("ojm_nbr_t").fromSelect(src(), cols).orIgnore().run();
+      const rows = await db.table("ojm_nbr_t").select(["*"]).all();
+      return json.ok({ affected1: r1 ?? -1, n: rows.length });
+    })().catch(e => json.fail(500, String(e)))"#;
+
+    /// 单腿：建表（d1 两行 id 必须不同——broadcast_id 按位置取源 id，相同则
+    /// 第二次 insert 被 ignore，n==2 假红）、种子、跑 JS、断言。
+    async fn leg(url: &str, ddl: &[&str]) {
+        let db = crate::bridge::SqlxAccessor::arc(url).await.unwrap();
+        for s in ddl {
+            db.exec_with_params(s, &[]).await.unwrap();
+        }
+        db.exec_with_params(
+            "insert into ojm_nb (tenant_id) values ('d1'),('d1'),('d2')",
+            &[],
+        )
+        .await
+        .unwrap();
+        let reg = SchemaRegistry::new()
+            .table("ojm_nb", &["id"], &["id", "tenant_id"])
+            .table(
+                "ojm_nbr",
+                &["id"],
+                &["id", "tenant_id", "broadcast_id", "user_id", "note"],
+            );
+        let b = Bridge::with_dbs_and_loader(
+            std::collections::HashMap::from([("default".to_string(), db as _)]),
+            Arc::new(InMemoryKV::new()),
+            reg,
+            false,
+            None,
+            Extras::default(),
+        );
+        let cap = b.run_with(JS, Default::default()).await.unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["n"], json!(2), "{v}");
+        assert_eq!(v["data"]["affected1"], json!(2), "{v}");
+    }
+
+    // ---- 腿 1-3：普通表（列清单自带 tenant_id 字面列）----
+    let sqlite_ddl = [
+        "drop table if exists ojm_nbr",
+        "drop table if exists ojm_nb",
+        "create table ojm_nb (id integer primary key, tenant_id text)",
+        "create table ojm_nbr (id integer primary key, tenant_id text, broadcast_id integer, user_id integer, note text, unique(tenant_id, broadcast_id, user_id))",
+    ];
+    leg("sqlite::memory:", &sqlite_ddl).await;
+    eprintln!("sqlite leg ok");
+    if let Ok(url) = std::env::var("OJ_TEST_PG") {
+        if !url.is_empty() {
+            let pg_ddl = [
+                "drop table if exists ojm_nbr",
+                "drop table if exists ojm_nb",
+                "create table ojm_nb (id bigint generated always as identity primary key, tenant_id text)",
+                "create table ojm_nbr (id bigint generated always as identity primary key, tenant_id text, broadcast_id bigint, user_id bigint, note text, unique(tenant_id, broadcast_id, user_id))",
+            ];
+            leg(&url, &pg_ddl).await;
+            eprintln!("pg leg ok");
+        }
+    } else {
+        eprintln!("skip: OJ_TEST_PG unset");
+    }
+    if let Ok(url) = std::env::var("OJ_TEST_MYSQL") {
+        if !url.is_empty() {
+            let my_ddl = [
+                "drop table if exists ojm_nbr",
+                "drop table if exists ojm_nb",
+                "create table ojm_nb (id bigint auto_increment primary key, tenant_id varchar(64))",
+                "create table ojm_nbr (id bigint auto_increment primary key, tenant_id varchar(64), broadcast_id bigint, user_id bigint, note varchar(64), unique key uk_nbr(tenant_id,broadcast_id,user_id))",
+            ];
+            leg(&url, &my_ddl).await;
+            eprintln!("mysql leg ok");
+        }
+    } else {
+        eprintln!("skip: OJ_TEST_MYSQL unset");
+    }
+
+    // ---- 腿 3：租户守卫（共享源表 + 租户隔离回执表；JS 列清单不含 tenant_id，
+    // 守卫自动补列；sql_guard=Deny 使注入路径真正激活）----
+    async fn tenant_leg(url: &str, ddl_nb: &str, ddl_nbr: &str) {
+        let db = crate::bridge::SqlxAccessor::arc(url).await.unwrap();
+        for s in [
+            "drop table if exists ojm_nbr_t",
+            "drop table if exists ojm_nb_t",
+            ddl_nb,
+            ddl_nbr,
+        ] {
+            db.exec_with_params(s, &[]).await.unwrap();
+        }
+        db.exec_with_params(
+            "insert into ojm_nb_t (tenant_id) values ('d1'),('d1'),('d2')",
+            &[],
+        )
+        .await
+        .unwrap();
+        let reg = SchemaRegistry::new()
+            // 广播源表共享（shared=true）：源 select 不被注入租户过滤。
+            .table_owned_shared(
+                "app",
+                "ojm_nb_t",
+                &["id"],
+                &["id", "tenant_id"],
+                true,
+            )
+            // 回执表声明 tenant_id 列即自动受约束（is_tenant_scoped）。
+            .table(
+                "ojm_nbr_t",
+                &["id"],
+                &["id", "tenant_id", "broadcast_id", "user_id", "note"],
+            );
+        let b = Bridge::with_dbs_and_loader(
+            std::collections::HashMap::from([("default".to_string(), db as _)]),
+            Arc::new(InMemoryKV::new()),
+            reg,
+            false,
+            None,
+            Extras {
+                sql_guard: SqlGuard::Deny,
+                ..Default::default()
+            },
+        );
+        let cap = b
+            .run_with(
+                JS_TENANT,
+                crate::bridge::http::RequestInfo {
+                    tenant_id: Some("d1".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["n"], json!(2), "{v}");
+        assert_eq!(v["data"]["affected1"], json!(2), "{v}");
+    }
+    tenant_leg(
+        "sqlite::memory:",
+        "create table ojm_nb_t (id integer primary key, tenant_id text)",
+        "create table ojm_nbr_t (id integer primary key, tenant_id text, broadcast_id integer, user_id integer, note text, unique(tenant_id, broadcast_id, user_id))",
+    )
+    .await;
+    eprintln!("sqlite tenant leg ok");
+    if let Ok(url) = std::env::var("OJ_TEST_PG") {
+        if !url.is_empty() {
+            tenant_leg(
+                &url,
+                "create table ojm_nb_t (id bigint generated always as identity primary key, tenant_id text)",
+                "create table ojm_nbr_t (id bigint generated always as identity primary key, tenant_id text, broadcast_id bigint, user_id bigint, note text, unique(tenant_id, broadcast_id, user_id))",
+            )
+            .await;
+            eprintln!("pg tenant leg ok");
+        }
+    }
+    if let Ok(url) = std::env::var("OJ_TEST_MYSQL") {
+        if !url.is_empty() {
+            tenant_leg(
+                &url,
+                "create table ojm_nb_t (id bigint auto_increment primary key, tenant_id varchar(64))",
+                "create table ojm_nbr_t (id bigint auto_increment primary key, tenant_id varchar(64), broadcast_id bigint, user_id bigint, note varchar(64), unique key uk_nbr_t(tenant_id,broadcast_id,user_id))",
+            )
+            .await;
+            eprintln!("mysql tenant leg ok");
+        }
     }
 }
 
