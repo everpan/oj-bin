@@ -2175,14 +2175,14 @@ await db.table("notify_daily").fromSelect(
 // 也可叠加 .orIgnore()：fromSelect(...).orIgnore().run()——**sqlite 除外**（见下）
 ```
 
-- **`orIgnore()`**：撞主键/任意唯一键的行被跳过。sqlite / postgres 渲染 `ON CONFLICT DO NOTHING`；
+- **`orIgnore()`**：撞主键/任意唯一键的行被跳过。VALUES 形态：sqlite / postgres 渲染 `ON CONFLICT DO NOTHING`；
   mysql 走 `ON DUPLICATE KEY UPDATE <pk> = <pk>`（恒等式、命中冲突即跳过），**要求表有主键**——
   无主键表报 `orIgnore on mysql requires a primary key on table '...'`。**mysql 上别把
   `orIgnore()` 和 `returning(['id'])` 组合**：恒等赋值不会刷新 `LAST_INSERT_ID()`，跳过重复行时
   两步取 id 会拿到该连接上的旧值——要「幂等 + 拿到 id」就先用唯一键 `select` 出 id（或改用普通
   `insert` 并接 `OJ_DB_CONSTRAINT`）。**三方言 affected-rows
   不一致**（mysql 命中重复键返回匹配行 1，pg/sqlite 返回 0），勿用 `if (n === 1)` 判幂等——
-  口径与「为什么不用 `INSERT IGNORE`」见 `sql-builder-guide.md` §3.2。
+  口径与渲染形态表（两形态 × 三方言）见 `sql-builder-guide.md` §3.2。
   **sqlite / mysql 上 `orIgnore()` + `fromSelect()` 组合已支持**（v0.1.128；此前 v0.1.82
   构造期拒绝）：sqlite 渲染 `INSERT OR IGNORE INTO … SELECT …`（upsert 子句只能跟 VALUES，
   但冲突解决子句可跟 SELECT），mysql 渲染 `INSERT IGNORE INTO … SELECT …`（`VALUES()`
