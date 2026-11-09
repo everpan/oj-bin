@@ -3941,7 +3941,7 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | bus 二进制 wire 约定（v0.1.16） | JSON → record/信封文本帧；字节 → record payload = 原始字节、投递为 Binary 帧。消费侧启发式：UTF-8 且为含 `topic`+`data` 的 JSON 对象才按文本信封，否则按二进制透传——**恰为该形状 JSON 的二进制载荷会以文本帧投递**（无害，自辨） |
 | WS 二进制状态（Yjs awareness 等）不进 `sess.state` | `sess.state` 必须可 JSON 序列化；二进制状态走 base64 字符串存 `sess.state`/kv，或分片放 kv |
 | `WhereCond.and/or` 嵌套未展开 | 多个 `where()` 即 AND；复杂条件用 `db.query` 参数化 SQL |
-| `orIgnore()` + `fromSelect()` 组合在 **sqlite** 不支持（v0.1.82 明文，构造期拒绝） | sqlite 的 upsert 子句只能跟 VALUES；报 `orIgnore with fromSelect is not supported on sqlite (its upsert clause only follows VALUES)`。pg / mysql 支持 SELECT 源。绕行走裸 `db.exec("insert or ignore into … select …", [...])`（`OR IGNORE` 会把 NOT NULL/CHECK 违例一并静默跳过，数据面比 ON CONFLICT 宽）或先查后插 |
+| `orIgnore()` + `fromSelect()`（v0.1.128 起三方言全支持） | sqlite 渲染 `INSERT OR IGNORE INTO … SELECT …`、mysql 渲染 `INSERT IGNORE INTO … SELECT …`（不要求主键）、pg 渲染 `… ON CONFLICT DO NOTHING`。**只幂等唯一键冲突**——目标表须真有唯一约束，否则冲突子句是空操作、连跑两次重复落；**语义宽度跨方言相反**——pg 上 NOT NULL/CHECK 违例照常报错，sqlite/mysql 的宽形态（OR IGNORE / INSERT IGNORE）对同样脏数据静默丢行（降级为跳过/告警）。mysql VALUES 形态仍渲染 `ON DUPLICATE KEY UPDATE pk=pk`（要求主键）。渲染形态表见 `sql-builder-guide.md` §3.2 |
 | schema 回滚无自动机制 | 迁移只前向；破坏性变更前备份，反向变更写新 seq 迁移 |
 | fixtures/ 不进 release 产物 | 演示数据走 fixtures（oj test / oj test fixture）；参考数据走模块 seed（`seed.sql`，或分方言的 `seed.<方言>.sql`） |
 | `db param: u64 value … is not supported on this path`（v0.1.24） | 在 PG/SQLite 上用了 `toUBigInt()`——它们的 bigint 是 i64；改存 text，或把该列放到 MySQL `BIGINT UNSIGNED` |

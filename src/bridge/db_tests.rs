@@ -11,13 +11,14 @@ fn elapsed_ms_scales_to_millis() {
     assert!(ms >= 3.0, "ms {ms}");
     assert!(ms < 1_000.0, "ms {ms}");
 }
-use crate::bridge::{Extras, SqlGuard};
 use crate::bridge::client_db::ClientDbRegistry;
 use crate::bridge::db_backend::DbBackendRegistry;
 use crate::bridge::db_policy::{
     AllowList, DbAccess, DbAccessOverride, DbAccessSection, DbClientSection,
 };
-use crate::bridge::{Bridge, InMemoryAccessor, InMemoryKV, SchemaRegistry};use serde_json::json;
+use crate::bridge::{Bridge, InMemoryAccessor, InMemoryKV, SchemaRegistry};
+use crate::bridge::{Extras, SqlGuard};
+use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -408,13 +409,7 @@ async fn from_select_or_ignore_idempotent_all_dialects() {
         .unwrap();
         let reg = SchemaRegistry::new()
             // 广播源表共享（shared=true）：源 select 不被注入租户过滤。
-            .table_owned_shared(
-                "app",
-                "ojm_nb_t",
-                &["id"],
-                &["id", "tenant_id"],
-                true,
-            )
+            .table_owned_shared("app", "ojm_nb_t", &["id"], &["id", "tenant_id"], true)
             // 回执表声明 tenant_id 列即自动受约束（is_tenant_scoped）。
             .table(
                 "ojm_nbr_t",
@@ -464,6 +459,8 @@ async fn from_select_or_ignore_idempotent_all_dialects() {
             .await;
             eprintln!("pg tenant leg ok");
         }
+    } else {
+        eprintln!("skip: OJ_TEST_PG unset");
     }
     if let Ok(url) = std::env::var("OJ_TEST_MYSQL") {
         if !url.is_empty() {
@@ -475,6 +472,8 @@ async fn from_select_or_ignore_idempotent_all_dialects() {
             .await;
             eprintln!("mysql tenant leg ok");
         }
+    } else {
+        eprintln!("skip: OJ_TEST_MYSQL unset");
     }
 }
 

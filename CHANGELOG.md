@@ -16,6 +16,37 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.128（2026-11-09）
+
+**feat（bridge，SQL 构造器：`fromSelect().orIgnore()` 三方言闭环）**：此前
+sqlite 构造期拒绝（v0.1.82）、mysql 组合渲染 `ON DUPLICATE KEY UPDATE pk=pk`（源 SELECT
+含同名列时 1052 歧义）、pg 的 `lit` 列一律 `CAST($n AS TEXT)`（写入 BIGINT 列类型错）三处
+缺口全部闭环，同一段构造器代码三方言构造并执行成功：
+
+- 新统一分派点 `ignore_strategy(dialect, from_select)`：VALUES 形态 sqlite/pg 渲染
+  `ON CONFLICT DO NOTHING`、mysql 恒等赋值（**既有行为零回归**）；fromSelect 形态
+  sqlite 渲染 `INSERT OR IGNORE`（冲突解决子句可跟 SELECT——upsert 子句只能跟 VALUES）、
+  mysql 渲染 `INSERT IGNORE`（`VALUES()` 形态已弃用、恒等赋值 1052 歧义，均不采；
+  **不再要求主键**）、pg 渲染 `ON CONFLICT DO NOTHING`。
+- 前缀补丁锚 `INSERT INTO ` 构造期校验、不匹配返回 Err（release 生效，绝不静默退回
+  普通 INSERT）；这是唯一 sanctioned 的生成串改写点。
+- pg 的 `lit` 列在 INSERT 直接源渲染裸参数，类型由 INSERT 目标列推断（嵌套子查询/
+  union/CTE 内保持 CAST——推断只覆盖直接源顶层列清单）。
+- **只幂等唯一键冲突**：无唯一约束时三方言冲突子句都是空操作，连跑两次产生重复行
+  （真机验证）——目标表须真有唯一约束。
+- **语义宽度有意保留差异**（统一性落在分派点）：sqlite/mysql 的 fromSelect 宽形态
+  （`OR IGNORE` / `INSERT IGNORE`）把 NOT NULL/CHECK/截断违例静默跳过/降级为告警，
+  pg 的 `ON CONFLICT DO NOTHING` 只跳过唯一键冲突——**故障模式跨方言相反**。
+  mysql 内部 VALUES（窄）/ fromSelect（宽）两形态宽度不同，同为有意保留。
+- 文档误标更正：devkit 四件 + `docs/api/06-db.md` 中「sqlite 不支持 orIgnore+fromSelect」
+  「绕行走裸 `db.exec`（三方言通用）」等旧条目全部改写（后者实为 sqlite 专属，MySQL 1064 /
+  PG 语法错）。
+- **下游联动**：oj-module 模板迁移（`notify.ts` 两处 `db.exec` 裸 SQL）须在本版 tag
+  之后，并抬 MIN_OJ_VERSION ≥ 本版（v0.1.126 消费侧联动惯例）。
+- 真机验证（本机容器，CI 无 OJ_TEST_* 恒 skip）：sqlite / PG 16.15 / MySQL 8.4.11
+  三方言「跑 3 次仍 2 行 + 首跑 affected==2」幂等腿 + 租户守卫腿全 PASS
+  （`from_select_or_ignore_idempotent_all_dialects`）。
+
 ## v0.1.127（2026-11-09）
 
 **feat（serve，启动分相位耗时日志）**：冷启动逐相位打印累计耗时（`stderr`，

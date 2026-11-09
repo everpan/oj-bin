@@ -838,15 +838,22 @@ await db.table("notify_daily").fromSelect(
 await db.table("sys_login_throttle").truncate().run();
 ```
 
-- **`orIgnore()`**：sqlite/pg 渲染 `ON CONFLICT DO NOTHING`，mysql 渲染
-  `ON DUPLICATE KEY UPDATE <pk> = <pk>`（恒等式）——所以 mysql **要求表有主键**
-  （`orIgnore on mysql requires a primary key on table '…'`）。**别把 `orIgnore()` 与
-  `returning(["id"])` 一起用**（mysql 上恒等赋值不刷新 `LAST_INSERT_ID()`，跳过重复行时会拿到
-  连接上的旧值）——要幂等+id 就先按唯一键 `select`。**affected-rows 三方言不一致**（mysql 命中
-  重复键给 1，pg/sqlite 给 0）：别用 `if (n === 1)` 判幂等，靠唯一约束 + 事务保证「不会重复写」。
-- **sqlite 上 `orIgnore()` + `fromSelect()` 不可组合**（upsert 子句只能跟在 VALUES 后）：
-  `orIgnore with fromSelect is not supported on sqlite (its upsert clause only follows VALUES)`；
-  pg/mysql 组合可用。
+- **`orIgnore()`**：**只幂等唯一键冲突**——目标表须有唯一约束，否则冲突子句是空操作、连跑两次
+  重复落。VALUES 形态：sqlite/pg 渲染 `ON CONFLICT DO NOTHING`，mysql 渲染
+  `ON DUPLICATE KEY UPDATE <pk> = <pk>`（恒等式，**要求表有主键**，
+  `orIgnore on mysql requires a primary key on table '…'`）。fromSelect 形态（v0.1.128 起三方言
+  全支持）：sqlite 渲染 `INSERT OR IGNORE`、mysql 渲染 `INSERT IGNORE`（不要求主键）、pg 渲染
+  `ON CONFLICT DO NOTHING`；**语义宽度跨方言相反**——pg 上 NOT NULL/CHECK 违例照常报错，
+  sqlite/mysql 的 fromSelect 形态对同样脏数据静默丢行（NOT NULL/截断降级为跳过/告警）。
+  别把 `orIgnore()` 与 `returning(["id"])` 一起用（mysql 上跳过的行不刷新 `LAST_INSERT_ID()`，
+  拿到连接旧值）——要幂等+id 就先按唯一键 `select`。**affected-rows 三方言不一致**（mysql
+  命中重复键给 1，pg/sqlite 给 0）：别用 `if (n === 1)` 判幂等，靠唯一约束 + 事务保证
+  「不会重复写」。渲染形态表见 `sql-builder-guide.md` §3.2。
+- **sqlite/mysql 上 `orIgnore()` + `fromSelect()`**（v0.1.128 起组合已支持，三方言全可）：
+  sqlite 渲染 `INSERT OR IGNORE INTO … SELECT …`、mysql 渲染 `INSERT IGNORE INTO … SELECT …`、
+  pg 渲染 `… ON CONFLICT DO NOTHING`。注意**只幂等唯一键冲突**（无唯一键时空操作）与
+  **宽语义**（sqlite/mysql 把 NOT NULL/CHECK 违例也静默跳过/降级）——渲染形态与宽度表见
+  `sql-builder-guide.md` §3.2。
 - **`fromSelect(q, cols)`**：列数不符 `insert declares N columns but the source select yields M`；
   `cols` 含 `tenant_id` 直接拒（租户由服务端注入）；源 select 递归过租户与归属守卫
   （`ownership_guard: deny` 下跨模块搬运同样被挡）。
@@ -1355,8 +1362,7 @@ export async function upsertAccount(id: number, name: string): Promise<void> {
 | `insert needs either values or fromSelect` | `.insert()` 空参（或 `fromJSON` 里两条都缺） | 传对象/非空数组，或改用 `.fromSelect(q, cols)` |
 | `insert takes either values or fromSelect, not both` | 同一请求里两条路都给了 | 二选一（upsert 语义请用 `orIgnore`） |
 | `insert rows must share identical key sets` | 行数组键不一致 | 对齐每行键 |
-| `orIgnore on mysql requires a primary key on table 't'` | mysql 的 `orIgnore` 靠 `ON DUPLICATE KEY UPDATE pk=pk`，无主键无从恒等 | 给表加主键，或改用唯一约束 + 先查后写 |
-| `orIgnore with fromSelect is not supported on sqlite (its upsert clause only follows VALUES)` | sqlite 的 upsert 只能跟 VALUES | 裸 `insert or ignore … select`（注意它连 NOT NULL/CHECK 也静默跳过），或 pg/mysql |
+| `orIgnore on mysql requires a primary key on table 't'` | mysql VALUES 形态的 `orIgnore` 靠 `ON DUPLICATE KEY UPDATE pk=pk`，无主键无从恒等（fromSelect 形态渲染 `INSERT IGNORE`，不要求主键） | 给表加主键，或改用唯一约束 + 先查后写 |
 | `insert declares N columns but the source select yields M` | `fromSelect` 目标列与源列数不符 | 按位置对齐列清单 |
 | `truncate does not accept where` | `.truncate()` 自带条件 | 走 `.delete().where(...)` |
 | `count distinct needs a field` / `distinct is only supported on count` | `{fn:"count",distinct:true}` 缺 field / 给非 count 聚合加了 distinct | 写 `{fn:"count", distinct:true, field:"col"}` |
@@ -2177,12 +2183,13 @@ await db.table("notify_daily").fromSelect(
   `insert` 并接 `OJ_DB_CONSTRAINT`）。**三方言 affected-rows
   不一致**（mysql 命中重复键返回匹配行 1，pg/sqlite 返回 0），勿用 `if (n === 1)` 判幂等——
   口径与「为什么不用 `INSERT IGNORE`」见 `sql-builder-guide.md` §3.2。
-  **sqlite 上 `orIgnore()` 与 `fromSelect()` 不可组合**（v0.1.82 明文）：报
-  `orIgnore with fromSelect is not supported on sqlite (its upsert clause only follows VALUES)`
-  ——sqlite 的 upsert 子句只能跟在 VALUES 之后（引擎在构造期显式拒绝，pg / mysql 的
-  ON CONFLICT / ON DUPLICATE KEY 支持 SELECT 源，不受限）。绕行：裸
-  `db.exec("insert or ignore into … select …", [...])`（注意 sqlite 的 `OR IGNORE` 会把
-  NOT NULL / CHECK 违例**一并静默跳过**，数据面比 ON CONFLICT 宽，自行权衡），或先查后插。
+  **sqlite / mysql 上 `orIgnore()` + `fromSelect()` 组合已支持**（v0.1.128；此前 v0.1.82
+  构造期拒绝）：sqlite 渲染 `INSERT OR IGNORE INTO … SELECT …`（upsert 子句只能跟 VALUES，
+  但冲突解决子句可跟 SELECT），mysql 渲染 `INSERT IGNORE INTO … SELECT …`（`VALUES()`
+  形态已弃用、恒等赋值在 SELECT 源含同名列时 1052 歧义），pg 渲染
+  `… ON CONFLICT DO NOTHING`。**只幂等唯一键冲突**（目标表须真有唯一约束）且
+  **故障模式跨方言相反**：pg 上 NOT NULL/CHECK 违例照常报错，sqlite/mysql 的宽形态对同样
+  脏数据静默丢行——口径与渲染形态表见 `sql-builder-guide.md` §3.2。
 - **`fromSelect(q, cols)`**：`q` 是另一个 `db.table(...)` 构造器（或纯 JSON 请求）；`cols` 是目标
   表写入列、与 `q` 的 select 列**按位置一一对齐**。列数不符报
   `insert declares N columns but the source select yields M`；`cols` 为空报

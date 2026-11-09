@@ -3035,6 +3035,13 @@ await db.table("notify_daily")
   .run();
 ```
 
+> v0.1.128 起该组合**三方言全支持**（sqlite `INSERT OR IGNORE` / mysql `INSERT IGNORE` /
+> pg `ON CONFLICT DO NOTHING`）。两个前提：目标表 `(user_id, cnt)` 上**真有唯一约束**
+> （否则 orIgnore 是空操作，重跑翻倍）；源行若可能带 NOT NULL/CHECK 违例，注意 sqlite/mysql
+> 宽形态会**静默丢行**而 pg 会报错——故障模式跨方言相反（sql-builder-guide §3.2 宽度表）。
+> 批量回执写入（「全部已读」把当前租户所有广播一次性写入按人回执表）同此形态：
+> `db.table("receipt").fromSelect(src.select(["id", {lit: uid, as:"user_id"}, …]), cols).orIgnore().run()`。
+
 ### ⑤ 常见坑
 
 | 坑 | 说明 |
@@ -3116,7 +3123,7 @@ curl "http://localhost:9778/v1/api/_lifecycle/uninstall/?module=myapp"   # 返�
 | `truncate()` 又接了 `.where(...)` | 直接报 `truncate does not accept where`——带条件的清空用 `delete`，别用 truncate 表达 |
 | `listTables()` 返回的表名直接拼进 SQL | 名字来自引擎目录而非 registry 白名单——拼接本身不违背红线（非用户输入），但**行数据操作仍须值绑定**；要删整表（DDL）本就该走迁移，不在 handler 里 drop |
 | `count(distinct)` 忘了 `field` / 用在 sum 上 | 报 `count distinct needs a field` / `distinct is only supported on count`——显式拒绝，不静默忽略 |
-| sqlite 上 `fromSelect(...).orIgnore()` | 不支持（构造期报 `orIgnore with fromSelect is not supported on sqlite`）——见场景 41 与 sql-builder-guide §3.3 |
+| sqlite 上 `fromSelect(...).orIgnore()` | **已支持**（v0.1.128）——见场景 41 与 sql-builder-guide §3.3；注意「只幂等唯一键冲突」（无唯一键连跑两次重复落）与宽语义（sqlite/mysql 对 NOT NULL/CHECK 违例静默丢行，pg 照常报错） |
 | `drop table "${t}"` 在 mysql 上 1064 | mysql 默认不认双引号包标识符——DDL 逃生舱里按方言换反引号（此类语句本就是方言语义，分支可接受；表名来自 `db.listTables`，非用户输入） |
 
 ## 场景 43：模块放任意深度目录 + URL 前缀自定义（`--module-root` / manifest `prefix`，v0.1.85）
