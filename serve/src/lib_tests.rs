@@ -2741,7 +2741,8 @@ async fn admit_scopes_gate_three_tiers_and_shapes() {
         .unwrap_or_else(|_| panic!("scopes absent must not gate"));
 }
 
-/// scopes 门豁免 /auth/obo（换签端点自身，svc token 必达）。
+/// scopes 门豁免三字面传输路径：/auth/obo（换签端点自身）+ /mcp、/rpc（端点级
+/// POST 是传输动词——业务档位由 per-tool admit 判）。
 #[tokio::test]
 async fn admit_scopes_exempt_obo_path() {
     let mut st = guard_state(svc_user("jt-ok", serde_json::json!(["read"])));
@@ -2750,10 +2751,19 @@ async fn admit_scopes_exempt_obo_path() {
     crate::dispatch::admit(&st, &headers, "POST", Some("/auth/obo"))
         .await
         .unwrap_or_else(|_| panic!("/auth/obo exempt from scopes gate"));
-    // 豁免只此一字面路径。
+    crate::dispatch::admit(&st, &headers, "POST", Some("/mcp"))
+        .await
+        .unwrap_or_else(|_| panic!("/mcp endpoint POST is transport, not business verb"));
+    crate::dispatch::admit(&st, &headers, "POST", Some("/rpc"))
+        .await
+        .unwrap_or_else(|_| panic!("/rpc endpoint POST is transport, not business verb"));
+    // 豁免只此三字面路径。
     let (s, m) =
         admit_err(crate::dispatch::admit(&st, &headers, "POST", Some("/auth/obo/extra")).await)
             .await;
+    assert_eq!((s, m.as_str()), (403, "missing scope: write"));
+    let (s, m) =
+        admit_err(crate::dispatch::admit(&st, &headers, "POST", Some("/mcp/extra")).await).await;
     assert_eq!((s, m.as_str()), (403, "missing scope: write"));
 }
 

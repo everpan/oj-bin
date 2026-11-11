@@ -278,14 +278,16 @@ pub(crate) async fn admit(
     if let Some(u) = user.as_ref() {
         let claims = u.get("claims");
         // ① scopes：缺席 = 跳过（零破坏）；present-but-empty = 全拒；
-        // 未知串 = 档位不匹配拒。豁免：/auth/obo 一字面路径（换签端点自身，
-        // svc token 必达；svc token 天然没有员工权限全档）。
+        // 未知串 = 档位不匹配拒。豁免三字面路径：/auth/obo（换签端点自身，
+        // svc token 必达）+ /mcp、/rpc（端点级 POST 是**传输动词**而非业务动词
+        // ——scopes 档位由 per-tool admit 以 tool 真实动词判，tools/list 走展示
+        // 裁剪；jti 门在端点级照常生效，吊销仍全网 ≤30s）。
         if let Some(scopes) = claims.and_then(|c| c.get("scopes")) {
             let list: Vec<&str> = scopes
                 .as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
                 .unwrap_or_default();
-            let exempt = path_no_base == Some("/auth/obo");
+            let exempt = matches!(path_no_base, Some("/auth/obo" | "/mcp" | "/rpc"));
             if !exempt
                 && let Some(tier) = crate::svc_gate::tier_of(verb)
                 && !list.contains(&tier)

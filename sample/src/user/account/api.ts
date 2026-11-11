@@ -1,5 +1,9 @@
 import { positiveId, requireRole } from "#_shared/validate";
 
+// 路由元数据（spec 2026-11-11 P1）：description 进 openapi 与 /mcp tools/list 的
+// description 键——写给模型看的路由说明书（管理端可补，代码声明优先）。
+get.schema = { description: "查询账户列表（id 过滤可选）" };
+
 function get(): void {
   const id = Number(http.param("id", 0));
   const q = db.table("account").select(["id", "name", "role"]);
