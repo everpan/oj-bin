@@ -6,13 +6,16 @@
 use oj_plugin_ffi::{AuthGuardVtable, HostContext, PluginDescriptor, RArc, RResult, RString};
 use std::sync::OnceLock;
 
-/// access token 载荷（与 core bridge crypto.rs Claims 同形）。
+/// access token 载荷（与 core bridge crypto.rs Claims 同形，同发布：自定义
+/// claim 平铺进顶层，verify 后经 user.claims 读回——svc/scopes/act 等）。
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Claims {
     sub: String,
     roles: Vec<String>,
     iat: u64,
     exp: u64,
+    #[serde(default, flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(serde::Deserialize)]
@@ -370,6 +373,51 @@ mod tests {
             g.verify("/me", "GET", &format!("Bearer {past}"), "")
                 .is_err()
         );
+    }
+
+    /// claims 透传（与 crypto.rs jwt.sign 孪生，spec 2026-11-11）：自定义 claim
+    /// 平铺进 JWT 顶层，verify 后经 user.claims 读回；旧 token（无自定义键）
+    /// claims 键集不变（字节兼容，Review Focus 1）。
+    #[test]
+    fn verify_passthrough_custom_claims_and_legacy_shape() {
+        let g = guard();
+        let now: i64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let mk = |extra: serde_json::Value| {
+            let mut claims = serde_json::json!({
+                "sub": "9", "roles": ["staff"],
+                "iat": now, "exp": now + 60,
+            });
+            for (k, v) in extra.as_object().unwrap() {
+                claims[k.as_str()] = v.clone();
+            }
+            jsonwebtoken::encode(
+                &jsonwebtoken::Header::new(g.alg),
+                &claims,
+                &jsonwebtoken::EncodingKey::from_secret(b"s3cret"),
+            )
+            .unwrap()
+        };
+        // 自定义 claim（svc/scopes）→ 平铺进顶层，verify 后 user.claims 可读回。
+        let t = mk(serde_json::json!({"svc": "b1", "scopes": ["read"]}));
+        let u = g.verify("/me", "GET", &format!("Bearer {t}"), "").unwrap();
+        assert_eq!(u["claims"]["svc"], "b1");
+        assert_eq!(u["claims"]["scopes"][0], "read");
+        // 旧 token（无自定义键）→ claims 键集恰为 {sub,roles,iat,exp}。
+        let legacy = mk(serde_json::json!({}));
+        let u2 = g
+            .verify("/me", "GET", &format!("Bearer {legacy}"), "")
+            .unwrap();
+        let mut keys: Vec<&str> = u2["claims"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["exp", "iat", "roles", "sub"]);
     }
 
     /// cookie 关闭（缺省）→ cookie 一律不认，行为与纯 Bearer 一致。
