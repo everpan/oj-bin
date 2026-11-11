@@ -57,13 +57,21 @@ impl JwtCfg {
     }
 }
 
+/// jwt.sign 可控 TTL 的服务端钳制上限（90d；spec 2026-11-11 svc token 时效）。
+pub const JWT_TTL_CAP_SECS: u64 = 7_776_000;
+
 /// access token 载荷（与旧 server/auth.rs Claims 同形，守卫插件侧解码契约）。
+/// `extra`：自定义 claims **平铺**到 JWT 顶层（守卫侧同形 flatten）——PR-9 的
+/// `user.claims.tenant` 读路径（dispatch.rs）依赖平铺形状。保留键 {sub,roles,iat,exp}
+/// 在签发入口拒绝（flatten 会产生重复键，且 JS 不得伪造时效）。
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Claims {
     sub: String,
     roles: Vec<String>,
     iat: u64,
     exp: u64,
+    #[serde(default, flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 fn now_unix() -> u64 {
@@ -81,7 +89,8 @@ fn jwt(state: &OpState) -> Result<Arc<JwtCfg>, JsErrorBox> {
         .ok_or_else(|| JsErrorBox::generic("jwt not configured (config auth: section missing)"))
 }
 
-/// jwt.sign({sub, roles})：iat/exp 由 Rust 补（JS 不可控有效期）。
+/// jwt.sign({sub, roles, claims?, ttl_secs?})：iat/exp 由 Rust 补（JS 可经 ttl_secs
+/// 指定有效期，钳制 JWT_TTL_CAP_SECS）；claims 平铺进 JWT 顶层，保留键 fail-fast。
 #[op2]
 #[string]
 pub fn op_jwt_sign(
@@ -100,12 +109,40 @@ pub fn op_jwt_sign(
                 .collect()
         })
         .unwrap_or_default();
+    const RESERVED: [&str; 4] = ["sub", "roles", "iat", "exp"];
+    let extra = match payload.get("claims") {
+        None | Some(serde_json::Value::Null) => Default::default(),
+        Some(v @ serde_json::Value::Object(_)) => {
+            let m: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_value(v.clone())
+                    .map_err(|e| JsErrorBox::generic(format!("jwt.sign: claims: {e}")))?;
+            if let Some(k) = RESERVED.iter().find(|k| m.contains_key(**k)) {
+                return Err(JsErrorBox::generic(format!(
+                    "jwt.sign: claims contain reserved claim key `{k}`"
+                )));
+            }
+            m
+        }
+        Some(_) => {
+            return Err(JsErrorBox::generic(
+                "jwt.sign: payload.claims must be an object",
+            ))
+        }
+    };
+    let ttl = match payload.get("ttl_secs") {
+        None | Some(serde_json::Value::Null) => cfg.access_secs,
+        Some(v) => v
+            .as_u64()
+            .ok_or_else(|| JsErrorBox::generic("jwt.sign: payload.ttl_secs must be a u64"))?
+            .min(JWT_TTL_CAP_SECS),
+    };
     let now = now_unix();
     let claims = Claims {
         sub: sub.to_string(),
         roles,
         iat: now,
-        exp: now + cfg.access_secs,
+        exp: now + ttl,
+        extra,
     };
     jsonwebtoken::encode(
         &jsonwebtoken::Header::new(cfg.algorithm()),
@@ -432,6 +469,101 @@ mod tests {
         assert_eq!(v["data"]["roles"][0], "admin", "{v}");
         assert!(v["data"]["tampered"].is_string(), "{v}");
         assert_eq!(v["data"]["dur"], serde_json::json!([60, 720 * 3600]), "{v}");
+    }
+
+    // Given payload 带 claims {tenant, svc} 与 ttl_secs 600
+    // When jwt.sign + jwt.verify roundtrip
+    // Then verify 出的 claims 含 tenant/svc 平铺顶层键，exp-iat==600。
+    #[tokio::test(flavor = "current_thread")]
+    async fn jwt_sign_custom_claims_and_ttl_roundtrip() {
+        let b = bridge(Some(jwt_cfg()));
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                    const t = await jwt.sign({ sub: "7", roles: ["bot"], claims: { tenant: "t1", svc: "bot1" }, ttl_secs: 600 });
+                    const c = await jwt.verify(t);
+                    json.ok({ tenant: c.tenant, svc: c.svc, span: c.exp - c.iat });
+                })().catch((e) => json.fail(500, String(e)));"#,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["tenant"], "t1", "{v}");
+        assert_eq!(v["data"]["svc"], "bot1", "{v}");
+        assert_eq!(v["data"]["span"], 600, "{v}");
+    }
+
+    // Given claims 含保留键 "exp"
+    // When jwt.sign
+    // Then Err 且文案含 "reserved claim key"（不静默覆盖 Rust 补的 iat/exp）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn jwt_sign_rejects_reserved_claim_keys() {
+        let b = bridge(Some(jwt_cfg()));
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                    let err = null;
+                    try { await jwt.sign({ sub: "7", roles: [], claims: { exp: 123 } }); } catch (e) { err = String(e); }
+                    json.ok({ err });
+                })().catch((e) => json.fail(500, String(e)));"#,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!(
+            v["data"]["err"].as_str().unwrap_or("").contains("reserved claim key"),
+            "{v}"
+        );
+    }
+
+    // Given ttl_secs 超过 90d 钳制上限
+    // When jwt.sign
+    // Then exp-iat == 钳制上限（服务端钳制，不报错）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn jwt_sign_clamps_ttl_to_cap() {
+        let b = bridge(Some(jwt_cfg()));
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                    const t = await jwt.sign({ sub: "7", roles: [], ttl_secs: 999999999 });
+                    const c = await jwt.verify(t);
+                    json.ok({ span: c.exp - c.iat });
+                })().catch((e) => json.fail(500, String(e)));"#,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["span"], 7_776_000, "{v}");
+    }
+
+    // Given 旧形态 payload 仅 {sub, roles}
+    // When sign+verify
+    // Then 无自定义键、exp-iat==access_secs（存量零破坏回归）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn jwt_sign_legacy_payload_unchanged() {
+        let b = bridge(Some(jwt_cfg()));
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                    const t = await jwt.sign({ sub: "7", roles: ["admin"] });
+                    const c = await jwt.verify(t);
+                    const keys = Object.keys(c).sort();
+                    json.ok({ keys, span: c.exp - c.iat });
+                })().catch((e) => json.fail(500, String(e)));"#,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(
+            v["data"]["keys"],
+            serde_json::json!(["exp", "iat", "roles", "sub"]),
+            "{v}"
+        );
+        assert_eq!(v["data"]["span"], 60, "{v}");
     }
 
     #[tokio::test(flavor = "current_thread")]
