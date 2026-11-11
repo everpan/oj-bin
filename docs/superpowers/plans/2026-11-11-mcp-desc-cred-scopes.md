@@ -22,7 +22,7 @@
 | 6 | auth/obo 端点 + 换签审计 | 完成 | 4892903；六路实测全对（含 /me 解 act/tenant/600s）；oj-auth bump 0.1.1（4d665b3，用户约定：改插件必 bump） |
 | 7 | admin 运营端点（svc-token/绑定/审计） | 完成 | 3e7b00b；实测全过（revoke→obo 40311 闭环）；多路由=组对象+组 .route |
 | 8 | admit async 化 + scopes/jti/act_mask 门 | 完成 | 53eac73；svc_gate.rs（TTL 30s/fail-closed）+ 三检查冻结序 + /auth/obo 豁免；serve 239/only-js 1119/oj 311+e2e 60 全绿；补 admin/manifest.yaml 三表（S005） |
-| 9 | mcp_http 展示层裁剪 + isError 前缀 | 待办 | |
+| 9 | mcp_http 展示层裁剪 + isError 前缀 | 完成 | 959c1e2；filter_tools_for_display 与 admit 同口径（只裁展示面）；[code=<n>] 前缀两面统一；serve 243 全绿 |
 | 10 | e2e 全矩阵 | 待办 | |
 | 11 | 配置示范 + devkit 四件套 + CHANGELOG | 待办 | |
 
