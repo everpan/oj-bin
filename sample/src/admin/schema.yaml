@@ -46,3 +46,33 @@ tables:
       is_read: { type: integer, null: false }      # 0/1，输出映射 boolean
       message: { type: text }
       title: { type: text, null: false }
+  # MCP 服务凭据三表（spec 2026-11-11 P2）：svc-token / 机器人绑定 / 换签审计。
+  # Rust SvcGate（dispatch.rs）静态 SQL 直查 oj_svc_token.jti——列名即契约。
+  oj_svc_token:
+    pk: jti
+    columns:
+      jti: { type: text, null: false }
+      name: { type: text, null: false }
+      scopes: { type: text, null: false }          # JSON 数组串 ["read","write","destructive"]
+      created_by: { type: text, null: false }
+      created_at: { type: bigint, null: false }
+  oj_bot_binding:
+    pk: [provider, external_sub]
+    columns:
+      provider: { type: text, null: false }        # 企微 / 飞书 / …（机器人平台标识）
+      external_sub: { type: text, null: false }    # 平台侧员工标识（userid/openid）
+      user_id: { type: text, null: false }         # 本系统 users.id
+      last_used_at: { type: bigint, null: false }
+      created_by: { type: text, null: false }
+      created_at: { type: bigint, null: false }
+  oj_obo_audit:
+    pk: id
+    columns:
+      id: { type: integer, autoincrement: true }
+      svc: { type: text, null: false }             # 换签的 svc token jti
+      provider: { type: text, null: false }
+      external_sub: { type: text, null: false }
+      user_id: { type: text, null: false }
+      ok: { type: integer, null: false }           # 0/1，输出映射 boolean
+      reason: { type: text, null: false }          # 失败原因（成功为空串）
+      ts: { type: bigint, null: false }
