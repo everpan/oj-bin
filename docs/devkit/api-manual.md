@@ -2191,8 +2191,9 @@ const svc = jwt.sign({
 > **claims 约定**（v0.1.130）：`svc`（机器凭据标记）/`jti`（凭据 id，admin 端点
 > 可吊销）/`scopes`（三档权限，见第 14 章）/`act`（代操作标记，obo 换签写入）/
 > `tenant`（租户门只认验签后 claim——`tenant.require_signed_claim: true` 部署下
-> 裸租户头不自证）。守卫把平铺字段孪生回 `http.user.claims`，旧 token（无自定义
-> claims）`claims` 为空对象，行为零变化。
+> 裸租户头不自证）。守卫把平铺字段孪生回 `http.user.claims`——旧 token（无自定义
+> claims）的 `http.user.claims` **仅含标准四键** `{sub,roles,iat,exp}`（不是空对象；
+> 有自定义 claims 时是全量孪生，勿硬编码键集假设），旧 token 行为零变化。
 
 ### bcrypt —— 密码哈希（始终可用）
 
@@ -4196,7 +4197,7 @@ REST 三面同规则，服务端单点判定——客户端侧不判权限）：
 | `destructive` | DELETE / DEL | 破坏面 |
 
 语义细则：**缺席** = 全量随 roles（旧 token 零破坏）；present-but-empty（`[]`）=
-全拒；未知档名 = 档位不符拒（文案逐字 `missing scope: <tier>`，HTTP 403 信封 /
+全拒；显式 `null` 同 present-but-invalid 全拒（fail-closed）；未知档名 = 档位不符拒（文案逐字 `missing scope: <tier>`，HTTP 403 信封 /
 `[code=403] missing scope: <tier>` isError）。两条绕过 POST-as-query 判定的正路：
 ① 查询类业务路由改 GET + query 参数（首选）；② 该机器人签发时纳入 `write` 档。
 `/ws`（WebSocket 升级）**不经** scopes/jti/act_mask 门（升级面只过守卫 verify）。
@@ -4220,7 +4221,7 @@ external_sub}`）→ 员工受托 token（10 分钟，`claims.act.sub` 指回 sv
 |---|---|
 | 40310 | 绑定缺失（该 external_sub 没有绑定行） |
 | 40311 | svc 凭据已吊销（jti 不在册） |
-| 40312 | 凭据非 svc（普通员工 token 打到 obo） |
+| 40312 | 凭据非 svc（普通员工 token 打到 obo；或 claims.svc 在但 roles 不含 bot——双查纵深） |
 | 40313 | 员工已停用（users.disabled） |
 
 标准消费模式：捕获 code → 40311/40312 告警运营（凭据/绑定面问题）→ 40310 提示

@@ -37,7 +37,7 @@ MCP/机器人三痛点（spec 2026-11-11）：**模型看不懂接口**（descri
 - **feat（serve：svc token 三档 scopes + jti 吊销门，三面同规则）**：`claims.scopes`
   为 `["read"|"write"|"destructive"]` 数组——get→read、post/put/patch→write、
   delete/del→destructive；**缺席 = 全量随 roles（旧 token 零破坏）**，present-but-empty
-  = 全拒，未知档 = 档位不符拒。单点收口在 admit（守卫 verify 之后、租户提取之前，
+  = 全拒（显式 `null` 同判全拒），未知档 = 档位不符拒。单点收口在 admit（守卫 verify 之后、租户提取之前，
   冻结序 scopes→jti→act_mask），三个调用面**同规则**：`/mcp` tools/list 展示裁剪
   （只裁可见性）、tools/call 与 `/rpc`/直连 REST 逐请求拦（文案逐字
   `missing scope: <tier>`）。
@@ -56,7 +56,8 @@ MCP/机器人三痛点（spec 2026-11-11）：**模型看不懂接口**（descri
 - **feat（sample：`/auth/obo` 换签端点 + admin 运营端点，v0.1.130 sample 迁移三表）**：
   - `POST /v1/api/auth/obo`（svc token + `{provider, external_sub}` → 员工受托
     token，10min，`claims.act.sub` 指回 svc 名）：四失败路径错误码契约
-    **40310 未绑定 / 40311 jti 已吊销 / 40312 非 svc 凭据 / 40313 员工已停用**
+    **40310 未绑定 / 40311 jti 已吊销 / 40312 非 svc 凭据（claims.svc 存在**且
+    **roles 含 bot 方过，双查纵深）/ 40313 员工已停用**
     （信封 `code` 是契约，>599 落 HTTP 500）；每次调用（成败均）落 `oj_obo_audit`。
   - admin：`service-token`（签发返回**唯一一次明文**/列表/吊销）、`bot-binding`
     （CRUD+CSV 导入导出）、`obo-audit`（分页+CSV 导出）。迁移新增

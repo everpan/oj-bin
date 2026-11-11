@@ -27,8 +27,11 @@ export default {
         reason,
       );
 
-    // 40312 非 svc 凭据：claims.svc 缺失/非串（普通员工 token 打到这里）。
-    if (typeof svcName !== "string" || !svcName) {
+    // 40312 非 svc 凭据：claims.svc 缺失/非串，或 roles 不含 bot（spec P2 第一步的
+    // 纵深防御——svc 名与 bot 角色双查；admin 签发恒 roles:["bot"]，手签漏 bot
+    // 角色的 token 在此拦下）。
+    const uroles = ((http.user && http.user.roles) || []) as unknown[];
+    if (typeof svcName !== "string" || !svcName || !uroles.includes("bot")) {
       await audit("", false, "not_svc");
       json.fail(OBO.NOT_SVC, OBO_MSG[OBO.NOT_SVC]);
       return;

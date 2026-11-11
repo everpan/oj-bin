@@ -366,6 +366,15 @@ async fn mcp_e2e_obo_full_matrix() {
     .await;
     assert_eq!(s, 200, "{v}");
 
+    // 为「roles 缺 bot」纵深腿预播 jt-e2e（须在首次 svc admit 之前落表——SvcGate
+    // 30s TTL 快照在首个 jti 门查询时定型，晚了会被 fail-closed 拒成 403）。
+    db_exec(
+        &t.join("db.sqlite"),
+        "INSERT INTO oj_svc_token (jti, name, scopes, created_by, created_at) \
+         VALUES ('jt-e2e', 'e2e', '[\"read\"]', 'e2e', 0)",
+    )
+    .await;
+
     // 换签：600s + act.sub 指回 svc；无 tenant（部署关时缺失即正形状）。
     let (s, v) = req_auth(
         addr,
@@ -413,6 +422,27 @@ async fn mcp_e2e_obo_full_matrix() {
     )
     .await;
     assert_eq!((s, v["code"].as_i64()), (500, Some(40312)), "非 svc：{v}");
+    // 40312 纵深腿：claims.svc/jti 俱在但 roles 缺 bot——同判非 svc（spec P2 双查）。
+    // jt-e2e 已在首 admit 前播种（缓存含它），admit 放行到 handler，由 roles 双查收口。
+    let now = serve::test_support::now_secs();
+    let nobot = sign_hs256(
+        SVC_SECRET,
+        json!({ "sub": "svc:e2e", "roles": ["user"], "iat": now, "exp": now + 3600,
+                "svc": "e2e", "jti": "jt-e2e" }),
+    );
+    let (s, v) = req_auth(
+        addr,
+        "POST",
+        "/v1/api/auth/obo",
+        Some(r#"{"provider":"wecom","external_sub":"zhang"}"#),
+        &nobot,
+    )
+    .await;
+    assert_eq!(
+        (s, v["code"].as_i64()),
+        (500, Some(40312)),
+        "roles 缺 bot：{v}"
+    );
     db_exec(
         &t.join("db.sqlite"),
         "UPDATE users SET disabled = 1 WHERE id = 2",
