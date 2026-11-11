@@ -85,6 +85,10 @@ MCP/机器人三痛点（spec 2026-11-11）：**模型看不懂接口**（descri
 - **验收待办（人工）**：P1 加 description 前后的模型任务成功率对比（5-10 条自然
   语言任务对 sample MCP 面人工跑）未执行——机械锚（description 键逐字透传）已由
   e2e 钉住，人工对比结果待补录本节。
+- **fix（sample，CI typecheck 红转绿）**：`bot/wecom` 骨架 `r.json()` 返回 `Json`
+  联合类型未收窄（6 处 TS2339）→ 两个调用点各补一次形状断言；`cert/renew` 的
+  `#_shared/guard` 在 tsc paths 扁平候选下被 `admin/_shared/guard` 遮蔽（TS2305，
+  运行时按就近模块根解析无此问题）→ 改相对导入 `../_shared/guard` 消歧。
 
 ## v0.1.129（2026-11-09）
 

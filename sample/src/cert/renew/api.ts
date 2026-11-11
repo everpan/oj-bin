@@ -1,4 +1,6 @@
-import { isAdmin, parseDays } from "#_shared/guard";
+// 相对导入而非 `#_shared/guard`：tsc paths 扁平候选下 admin/_shared/guard 遮蔽 cert 的
+// （运行时按就近模块根解析无此问题，见 module_loader resolve_alias——类型检查需消歧）。
+import { isAdmin, parseDays } from "../_shared/guard";
 
 // POST {id, days?=365} ：读库中私钥重签，公钥与 private_pem 不变。
 async function post(): Promise<void> {

@@ -23,7 +23,7 @@ async function obo(svcToken: string, userid: string): Promise<string> {
     headers: { "content-type": "application/json", authorization: `Bearer ${svcToken}` },
     body: JSON.stringify({ provider: "wecom", external_sub: userid }),
   });
-  const v = await r.json();
+  const v = (await r.json()) as { code?: number; data?: { access_token?: string } };
   if (!r.ok) throw new Error(`obo failed: ${v.code}`); // 40310-40313 → 告警 + 文明兜底话术
   return v.data.access_token as string;
 }
@@ -44,7 +44,10 @@ async function callTool(token: string, name: string, args: unknown): Promise<str
       params: { name, arguments: args },
     }),
   });
-  const v = await r.json();
+  const v = (await r.json()) as {
+    error?: { code?: number };
+    result?: { content?: { text?: string }[] };
+  };
   if (v.error) throw new Error(`rpc ${v.error.code}`); // 含 [code=403] 权限拒绝（换签过期→重换签一次再试）
   return String(v.result?.content?.[0]?.text ?? JSON.stringify(v.result));
 }
