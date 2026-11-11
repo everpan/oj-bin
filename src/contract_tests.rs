@@ -557,6 +557,51 @@ fn dsl_boundary_is_exactly_the_documented_zod_subset() {
 }
 
 #[test]
+fn description_keyword_allowed_and_must_be_string() {
+    // spec 2026-11-11 P1：组级（.schema 顶层）与动词/属性级 description 均为
+    // 合法声明——字符串；随 RouteRow.schema 透传给 openapi/mcp。
+    assert!(
+        audit_schema(&json!({
+            "description": "查询用户账户详情",
+            "params": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "用户 ID" }
+                }
+            },
+            "response": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "姓名" }
+                }
+            },
+        }))
+        .is_ok(),
+        "顶层 + 属性级 description（字符串）必须放行"
+    );
+
+    // 非字符串（数字 / 对象，任一处）→ fail-fast，不静默忽略。
+    let err = audit_schema(&json!({ "description": 42 })).unwrap_err();
+    assert!(
+        err.contains("description must be a string"),
+        "顶层 description 数字必须 fail-fast: {err}"
+    );
+    let err = audit_schema(&json!({
+        "body": {
+            "type": "object",
+            "properties": {
+                "a": { "type": "string", "description": { "long": "x" } }
+            }
+        },
+    }))
+    .unwrap_err();
+    assert!(
+        err.contains("description must be a string"),
+        "属性级 description 对象必须 fail-fast: {err}"
+    );
+}
+
+#[test]
 fn prototype_pollution_names_are_rejected_in_properties() {
     // openapi.json 是下游生成 TS/zod 的输入，`properties` 的键会原样变成生成源码
     // 里的键——这三个名字生成的字面量对象会改到原型上。

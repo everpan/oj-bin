@@ -46,13 +46,17 @@ pub const SUPPORTED_KEYWORDS: &[&str] = &[
     "minItems",
     "maxItems",
     "default",
+    "description",
 ];
 
 /// `.schema` 允许的通道（顶层键白名单）。
 ///
+/// `description` 不是通道而是组级说明（spec 2026-11-11 P1，string-only），
+/// 与四通道同居顶层键白名单——openapi/mcp 透传用它。
+///
 /// 顶层出现白名单外的键 → 装配期 fail-fast：入参三通道拼错（如 `param` / `bodys`）
 /// 会让整份契约静默不生效，这正是本项目最重的缺陷类，宁可启动失败。
-pub const SCHEMA_CHANNELS: &[&str] = &["params", "query", "body", "response"];
+pub const SCHEMA_CHANNELS: &[&str] = &["params", "query", "body", "response", "description"];
 
 /// params / query 允许的类型（`HashMap<String, String>` 只能表达这些）。
 const SCALAR_TYPES: &[&str] = &["string", "number", "integer", "boolean", "null"];
@@ -305,6 +309,12 @@ fn audit_channel_opt(
 pub fn audit_schema(schema: &Value) -> Result<(), String> {
     let mut pats = Vec::new();
     audit_channels(schema)?;
+    // 组级 description：string-only（openapi/mcp 透传要求）。
+    if let Some(d) = schema.get("description")
+        && !d.is_string()
+    {
+        return Err(".schema: description must be a string".to_string());
+    }
     audit_scalar_channel(&schema.get("params").cloned(), "params", &mut pats)?;
     audit_scalar_channel(&schema.get("query").cloned(), "query", &mut pats)?;
     audit_channel_opt(&schema.get("body").cloned(), "body", &mut pats)?;
@@ -362,6 +372,12 @@ fn audit_keywords(v: &Value, path: &str, pats: &mut Vec<String>) -> Result<(), S
     }
     if let Some(t) = obj.get("type") {
         declared_types(t).map_err(|e| format!("{path}: {e}"))?;
+    }
+    // description：string-only（递归天然覆盖属性级；spec 2026-11-11 P1）。
+    if let Some(d) = obj.get("description")
+        && !d.is_string()
+    {
+        return Err(format!("{path}: description must be a string"));
     }
     if let Some(p) = obj.get("pattern") {
         let Some(s) = p.as_str() else {
