@@ -24,7 +24,7 @@
 | 8 | admit async 化 + scopes/jti/act_mask 门 | 完成 | 53eac73；svc_gate.rs（TTL 30s/fail-closed）+ 三检查冻结序 + /auth/obo 豁免；serve 239/only-js 1119/oj 311+e2e 60 全绿；补 admin/manifest.yaml 三表（S005） |
 | 9 | mcp_http 展示层裁剪 + isError 前缀 | 完成 | 959c1e2；filter_tools_for_display 与 admit 同口径（只裁展示面）；[code=<n>] 前缀两面统一；serve 243 全绿 |
 | 10 | e2e 全矩阵 | 完成 | e09d264；e2e_svc 4/4（desc 透传/scopes 三面/obo 全矩阵/tenant 复制）+ e2e 60/60 零回归；勘误：插件每进程单例 → 拆 e2e_svc.rs + tests/common；/mcp+/rpc 端点级 scopes 豁免（传输动词非业务动词） |
-| 11 | 配置示范 + devkit 四件套 + CHANGELOG | 待办 | |
+| 11 | 配置示范 + devkit 四件套 + CHANGELOG | 完成 | a485505；oj 0.1.130 + 四件套对齐（api-manual/scenarios 场景 75+指标口径/SKILL 九行/README）+ sample mcp 示范段 + bot 骨架；xtask 10/10 + smoke + e2e 60/60 + e2e_svc 4/4 全绿；插件 bump 复核仅 oj-auth 0.1.1 |
 
 ## Global Constraints
 
