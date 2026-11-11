@@ -4,12 +4,17 @@ export default {
   async post() {
     const body = http.body || {};
     const rows = await db.table("users")
-      .select(["id", "password_hash", "roles"])
+      .select(["id", "password_hash", "roles", "disabled"])
       .where({ field: "username", op: "eq", value: String(body.username ?? "") })
       .all();
     const row = rows[0];
-    // 用户不存在与密码错同报（不泄露用户存在性）。
-    if (!row || !(await bcrypt.verify(String(body.password ?? ""), String(row.password_hash || "")))) {
+    // 用户不存在与密码错同报（不泄露用户存在性）；停用账号同报
+    // （spec 2026-11-11 P2：不泄露账号状态——停用与密码错完全同文案同状态）。
+    if (
+      !row ||
+      Number(row.disabled) === 1 ||
+      !(await bcrypt.verify(String(body.password ?? ""), String(row.password_hash || "")))
+    ) {
       json.fail(401, "invalid credentials");
       return;
     }
