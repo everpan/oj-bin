@@ -152,6 +152,38 @@ fn apply_modules_filter(tools: Vec<McpTool>, modules: Option<&Vec<String>>) -> V
         .collect()
 }
 
+/// tools/list 展示裁剪（spec 2026-11-11 P3）：scopes/act_mask 只裁「可见性」，
+/// **不进调用面**——call_tool 仍解析 modules 后全集，执行期由 admit 单点以同一
+/// 口径拦（三面同规则；被裁 tool 直呼 → 403 而非 -32601，Task 10 e2e 钉住）。
+/// scopes 缺席 → 全量（零破坏）；scopes present（任意形状）→ 档位在册才可见
+/// （与 admit 同：present-but-empty 全隐、无档位动词不设防）；act_mask 开且
+/// user.claims.act 存在 → destructive 档整体排除。
+fn filter_tools_for_display<'a>(
+    tools: &'a [McpTool],
+    user: Option<&Value>,
+    act_mask: bool,
+) -> Vec<&'a McpTool> {
+    let claims = user.and_then(|u| u.get("claims"));
+    let list: Option<Vec<&str>> = claims.and_then(|c| c.get("scopes")).map(|s| {
+        s.as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default()
+    });
+    let act = act_mask && claims.and_then(|c| c.get("act")).is_some();
+    tools
+        .iter()
+        .filter(|t| {
+            let tier = crate::svc_gate::tier_of(&t.dispatch.method);
+            if let (Some(list), Some(tier)) = (&list, tier) {
+                list.contains(&tier)
+            } else {
+                true
+            }
+        })
+        .filter(|t| !(act && crate::svc_gate::tier_of(&t.dispatch.method) == Some("destructive")))
+        .collect()
+}
+
 /// oa_path（`{*x}` 已收敛 `{x}`）+ method → 路由表行反查谓词。
 fn row_matches(r: &crate::routes::RouteRow, oa_path: &str, method: &str) -> bool {
     let oa_of_row = r
@@ -246,14 +278,27 @@ fn is_error(msg: &str) -> Value {
     json!({ "isError": true, "content": [{ "type": "text", "text": msg }] })
 }
 
+/// 信封错误 → "[code=<n>] msg"（冻结前缀文案，spec 2026-11-11 P3：模型可读
+/// 错因，code 是契约；/mcp isError 与 /rpc error.message 两面同形状）。
+fn prefixed_err(code: i64, msg: &str) -> String {
+    format!("[code={code}] {msg}")
+}
+
 /// Capture → CallToolResult（R3：content 必填 + structuredContent；
-/// 业务 code!=0 → isError；R6：stream → isError 不缓冲）。
+/// 业务 code!=0 → isError + [code] 前缀；R6：stream → isError 不缓冲）。
 fn capture_to_result(cap: &Capture) -> Value {
     if cap.stream.is_some() {
         return is_error("streaming endpoint, not supported via MCP");
     }
     if !(200..300).contains(&cap.status) {
-        return is_error(&String::from_utf8_lossy(&cap.body));
+        // 非 2xx：信封体取 code/msg 加前缀；非信封 → 原文（raw/文本豁免）。
+        return match serde_json::from_slice::<Value>(&cap.body) {
+            Ok(v) if !cap.raw && is_envelope(&v) => is_error(&prefixed_err(
+                v["code"].as_i64().unwrap_or(i64::from(cap.status)),
+                v["msg"].as_str().unwrap_or("business error"),
+            )),
+            _ => is_error(&String::from_utf8_lossy(&cap.body)),
+        };
     }
     match serde_json::from_slice::<Value>(&cap.body) {
         // raw（json.raw）豁免信封检测：裸业务数据恰好带 code/msg/data 键不得误判。
@@ -261,7 +306,10 @@ fn capture_to_result(cap: &Capture) -> Value {
             if v["code"].as_i64() == Some(0) {
                 ok_result(&v["data"])
             } else {
-                is_error(v["msg"].as_str().unwrap_or("business error"))
+                is_error(&prefixed_err(
+                    v["code"].as_i64().unwrap_or(-32000),
+                    v["msg"].as_str().unwrap_or("business error"),
+                ))
             }
         }
         _ => json!({
@@ -286,11 +334,17 @@ fn initialize_result(params: &Value, st: &AppState) -> Value {
     })
 }
 
+// large_enum_variant：Notification 是零尺寸占位，Request 天然大——Box<Option>
+// 属包装噪音，不收。
+#[allow(clippy::large_enum_variant)]
 enum Inbound {
     Request {
         id: Value,
         method: String,
         params: Value,
+        /// endpoint admit 的 user（R9 P3：tools/list 展示裁剪的消费面；read_inbound
+        /// 已有 admit 结果在手，零额外开销）。
+        user: Option<Value>,
     },
     /// 无 id 的通知/响应消息：回 202 空 body，不进方法分派。
     Notification,
@@ -308,9 +362,11 @@ async fn read_inbound(
     endpoint: &str,
 ) -> Result<Inbound, Response> {
     // R9 B1：endpoint 级 admit（字面端点路径）——拒绝 → 401 传输语义，不进 JSON-RPC 层。
-    if let Err(resp) = admit(st, headers, "POST", Some(endpoint)).await {
-        return Err(*resp);
-    }
+    // Ok 的 user 带出（P3 tools/list 裁剪消费）。
+    let user = match admit(st, headers, "POST", Some(endpoint)).await {
+        Err(resp) => return Err(*resp),
+        Ok(out) => out.0,
+    };
     if !is_json_content_type(headers) {
         return Err(crate::dispatch::fail_response(
             415,
@@ -375,6 +431,7 @@ async fn read_inbound(
             .unwrap_or("")
             .to_string(),
         params: obj.get("params").cloned().unwrap_or(Value::Null),
+        user,
     })
 }
 
@@ -388,7 +445,13 @@ pub async fn handle(
         Ok(i) => i,
         Err(resp) => return resp,
     };
-    let Inbound::Request { id, method, params } = inbound else {
+    let Inbound::Request {
+        id,
+        method,
+        params,
+        user,
+    } = inbound
+    else {
         return StatusCode::ACCEPTED.into_response();
     };
     let result = match method.as_str() {
@@ -400,7 +463,18 @@ pub async fn handle(
             };
             match method.as_str() {
                 "tools/list" => tools_for(&st, prefix, table)
-                    .map(|tools| json!({ "tools": tools.into_iter().map(|t| t.tool).collect::<Vec<_>>() }))
+                    .map(|tools| {
+                        // P3：按 endpoint user 的 scopes/act_mask 裁剪**展示面**；
+                        // 调用面（tools/call → tools_for）不裁——admit 单点拦。
+                        let act_mask = st
+                            .pipeline
+                            .mcp
+                            .as_ref()
+                            .map(|m| m.act_mask_destructive)
+                            .unwrap_or(false);
+                        let shown = filter_tools_for_display(&tools, user.as_ref(), act_mask);
+                        json!({ "tools": shown.into_iter().map(|t| t.tool.clone()).collect::<Vec<_>>() })
+                    })
                     .map_err(|e| ("-32603", e)),
                 _ => call_tool(&st, &headers, prefix, table, &params).await,
             }
@@ -429,7 +503,11 @@ pub async fn rpc_handle(
         Ok(i) => i,
         Err(resp) => return resp,
     };
-    let Inbound::Request { id, method, params } = inbound else {
+    // /rpc 无列表语义：user 不消费（ scopes/act_mask 只裁 MCP 展示面）。
+    let Inbound::Request {
+        id, method, params, ..
+    } = inbound
+    else {
         return StatusCode::ACCEPTED.into_response();
     };
     let Some((prefix, table)) = mount_for_endpoint(&st, uri.path(), "rpc") else {
@@ -454,7 +532,8 @@ pub async fn rpc_handle(
     }
 }
 
-/// Capture → 裸 JSON-RPC result（/rpc 变体：业务错误是 error 对象而非 isError）。
+/// Capture → 裸 JSON-RPC result（/rpc 变体：业务错误是 error 对象而非 isError，
+/// message 带 [code] 前缀——与 MCP 面同形状）。
 fn capture_to_rpc_result(cap: &Capture) -> Result<Value, (i64, String)> {
     if cap.stream.is_some() {
         return Err((
@@ -463,10 +542,20 @@ fn capture_to_rpc_result(cap: &Capture) -> Result<Value, (i64, String)> {
         ));
     }
     if !(200..300).contains(&cap.status) {
-        return Err((
-            i64::from(cap.status),
-            String::from_utf8_lossy(&cap.body).into_owned(),
-        ));
+        // 非 2xx：信封体取信封 code/msg 加前缀；非信封 → (HTTP status, 原文)。
+        return match serde_json::from_slice::<Value>(&cap.body) {
+            Ok(v) if !cap.raw && is_envelope(&v) => {
+                let code = v["code"].as_i64().unwrap_or(i64::from(cap.status));
+                Err((
+                    code,
+                    prefixed_err(code, v["msg"].as_str().unwrap_or("business error")),
+                ))
+            }
+            _ => Err((
+                i64::from(cap.status),
+                String::from_utf8_lossy(&cap.body).into_owned(),
+            )),
+        };
     }
     match serde_json::from_slice::<Value>(&cap.body) {
         // raw（json.raw）豁免信封检测（与 MCP 变体同口径）。
@@ -474,9 +563,10 @@ fn capture_to_rpc_result(cap: &Capture) -> Result<Value, (i64, String)> {
             if v["code"].as_i64() == Some(0) {
                 Ok(v["data"].clone())
             } else {
+                let code = v["code"].as_i64().unwrap_or(-32000);
                 Err((
-                    v["code"].as_i64().unwrap_or(-32000),
-                    v["msg"].as_str().unwrap_or("business error").to_string(),
+                    code,
+                    prefixed_err(code, v["msg"].as_str().unwrap_or("business error")),
                 ))
             }
         }
@@ -741,12 +831,13 @@ mod tests {
         assert_eq!(r["structuredContent"]["n"], 1);
         assert_eq!(r["content"][0]["type"], "text");
         assert!(r.get("isError").is_none());
-        // 业务错误 → isError + msg（HTTP 200，非 JSON-RPC error）。
+        // 业务错误 → isError + "[code=<n>] msg" 前缀（冻结文案，spec 2026-11-11 P3：
+        // 模型可读错因，code 是契约）。
         cap.body = serde_json::to_vec(&json!({ "code": 40401, "msg": "not found", "data": null }))
             .unwrap();
         let r = capture_to_result(&cap);
         assert_eq!(r["isError"], true);
-        assert_eq!(r["content"][0]["text"], "not found");
+        assert_eq!(r["content"][0]["text"], "[code=40401] not found");
     }
 
     // Given cap.stream.is_some()（SSE/stream 端点）
@@ -810,6 +901,136 @@ mod tests {
         assert_eq!(r["content"][0]["text"], body.to_string());
         let rpc = capture_to_rpc_result(&cap).expect("raw 数据不得变 JSON-RPC error");
         assert_eq!(rpc, body);
+    }
+
+    // ---- spec 2026-11-11 P3：isError [code=<n>] 前缀 + tools/list 展示裁剪 ----
+
+    fn tool_with_method(name: &str, method: &str, tags: Value) -> McpTool {
+        McpTool {
+            name: name.into(),
+            tool: json!({ "name": name, "tags": tags }),
+            dispatch: crate::mcp::ToolDispatch {
+                operation_id: name.into(),
+                method: method.into(),
+                oa_path: format!("/t/{name}"),
+                catch_all: Vec::new(),
+            },
+        }
+    }
+
+    fn cap_of(status: u16, body: Value) -> Capture {
+        Capture {
+            status,
+            headers: vec![],
+            body: serde_json::to_vec(&body).unwrap(),
+            stream: None,
+            raw: false,
+        }
+    }
+
+    // Given cap 信封 code!=0（admit 的档位拒绝原样到达 MCP 面）
+    // When capture_to_result
+    // Then text = "[code=403] missing scope: write" 且 isError=true
+    #[test]
+    fn business_error_prefixes_code_in_iserror() {
+        let cap = cap_of(
+            200,
+            json!({ "code": 403, "msg": "missing scope: write", "data": null }),
+        );
+        let r = capture_to_result(&cap);
+        assert_eq!(r["isError"], true);
+        assert_eq!(r["content"][0]["text"], "[code=403] missing scope: write");
+    }
+
+    // Given cap 非 2xx 且 body 为信封
+    // When capture_to_result
+    // Then 同前缀（信封 code/msg）；body 非信封 → 原文不变（raw/文本豁免语义保留）
+    #[test]
+    fn non_2xx_envelope_gets_prefix_raw_passes_through() {
+        let cap = cap_of(
+            403,
+            json!({ "code": 403, "msg": "missing scope: read", "data": null }),
+        );
+        let r = capture_to_result(&cap);
+        assert_eq!(r["content"][0]["text"], "[code=403] missing scope: read");
+        let cap = Capture {
+            status: 500,
+            headers: vec![],
+            body: b"boom".to_vec(),
+            stream: None,
+            raw: false,
+        };
+        let r = capture_to_result(&cap);
+        assert_eq!(r["content"][0]["text"], "boom");
+    }
+
+    // Given /rpc 变体同口径
+    // When capture_to_rpc_result
+    // Then 业务错误 error.message 带前缀（code 取信封值）；非 2xx 信封同形状
+    #[test]
+    fn rpc_variants_share_prefix_shape() {
+        let cap = cap_of(
+            200,
+            json!({ "code": 40311, "msg": "svc token revoked or unverifiable", "data": null }),
+        );
+        let (code, msg) = capture_to_rpc_result(&cap).unwrap_err();
+        assert_eq!(code, 40311);
+        assert_eq!(msg, "[code=40311] svc token revoked or unverifiable");
+        let cap = cap_of(
+            403,
+            json!({ "code": 403, "msg": "missing scope: write", "data": null }),
+        );
+        let (code, msg) = capture_to_rpc_result(&cap).unwrap_err();
+        assert_eq!(
+            (code, msg.as_str()),
+            (403, "[code=403] missing scope: write")
+        );
+    }
+
+    // Given tools [get, post, delete]
+    // When filter_tools_for_display
+    // Then scopes=["read"] → 仅 get；present-but-empty → 全隐；scopes 缺席 → 全量；
+    // act_mask+act+全档 → 无 delete；act_mask 开但无 act → 全量
+    #[test]
+    fn display_filter_scopes_and_act_mask() {
+        let tools = vec![
+            tool_with_method("t_get", "get", Value::Null),
+            tool_with_method("t_post", "post", Value::Null),
+            tool_with_method("t_del", "delete", Value::Null),
+        ];
+        let names =
+            |v: Vec<&McpTool>| -> Vec<String> { v.into_iter().map(|t| t.name.clone()).collect() };
+        let read = json!({ "id": "9", "claims": { "svc": "bot", "jti": "j", "scopes": ["read"] } });
+        assert_eq!(
+            names(filter_tools_for_display(&tools, Some(&read), false)),
+            ["t_get"]
+        );
+        // present-but-empty = 全拒同口径 → 全隐。
+        let empty = json!({ "id": "9", "claims": { "scopes": [] } });
+        assert!(filter_tools_for_display(&tools, Some(&empty), false).is_empty());
+        // scopes 缺席 → 全量（零破坏，含 user=None 匿名）。
+        let plain = json!({ "id": "9", "claims": { "sub": "9" } });
+        assert_eq!(
+            names(filter_tools_for_display(&tools, Some(&plain), false)).len(),
+            3
+        );
+        assert_eq!(
+            names(filter_tools_for_display(&tools, None, false)).len(),
+            3
+        );
+        // act_mask + claims.act + 全档 → 无 delete（GET 照常可见）。
+        let full_act = json!({ "id": "9", "claims": {
+            "act": { "sub": "svc:bot" }, "scopes": ["read", "write", "destructive"] } });
+        assert_eq!(
+            names(filter_tools_for_display(&tools, Some(&full_act), true)),
+            ["t_get", "t_post"]
+        );
+        // act_mask 开但无 act → 不遮蔽。
+        let full = json!({ "id": "9", "claims": { "scopes": ["read", "write", "destructive"] } });
+        assert_eq!(
+            names(filter_tools_for_display(&tools, Some(&full), true)).len(),
+            3
+        );
     }
 
     // ---- query 字符串化 ----
