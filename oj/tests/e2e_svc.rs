@@ -145,6 +145,17 @@ async fn db_exec(file: &Path, sql: &str) {
     db.exec_with_params(sql, &[]).await.unwrap();
 }
 
+/// 诊断用：直接数表里某 jti 的行数（绕开 SvcGate 缓存看真相源）。
+async fn table_count(t: &Path, jti: &str) -> usize {
+    let dsn = oj_plugin_ffi::path_util::sqlite_file_dsn(&t.join("db.sqlite"));
+    let db = only_js::bridge::SqlxAccessor::arc(&dsn).await.unwrap();
+    let rows = db
+        .query_with_params("SELECT jti FROM oj_svc_token WHERE jti = ?", &[jti.into()])
+        .await
+        .unwrap();
+    rows.len()
+}
+
 fn has_svc_token_table(t: &Path) -> impl std::future::Future<Output = bool> + '_ {
     let dsn = oj_plugin_ffi::path_util::sqlite_file_dsn(&t.join("db.sqlite"));
     async move {
@@ -164,21 +175,15 @@ const TOOLS_LIST: &str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","param
 
 /// mcp_desc（P1）：声明 description 的路由透传声明值（无契约通道叠加 inspect
 /// 提示）；未声明路由回落合成 summary（同一 openapi 生成器——两线字节同源）。
-/// auth 在册（本二进制统一引导），allow_anonymous 放行匿名 tools/list。
+/// auth 在册（本二进制统一引导），带 admin token 取全量 tools/list。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_e2e_description_passthrough_and_summary_fallback() {
     let _g = lock();
-    let (addr, _h, _t) = boot_svc(|c| {
-        // 匿名放行走 auth.anonymous_paths（mcp.allow_anonymous 只是拒启门禁，
-        // 不是鉴权豁免）——守卫按无 base 路径匹配。
-        c.auth
-            .as_mut()
-            .unwrap()
-            .anonymous_paths
-            .push(only_js::config::AnonPath::Plain("/mcp".into()));
-    })
-    .await;
-    let (_s, v) = rpc_req_auth(addr, "/v1/api/mcp", TOOLS_LIST, "").await;
+    // 本用例不得偏离 boot_svc 缺省 auth cfg：oj-auth 守卫是进程级 OnceLock
+    // 单例（首启 cfg 定终身），这里若给 anonymous_paths 加 /mcp 会污染同进程
+    // 后续 boot 的 /mcp 鉴权（scopes/jti 检查随之失效）。带 admin token 即可。
+    let (addr, _h, _t) = boot_svc(|_| {}).await;
+    let (_s, v) = rpc_req_auth(addr, "/v1/api/mcp", TOOLS_LIST, &admin_token(json!({}))).await;
     let tools = v["result"]["tools"]
         .as_array()
         .unwrap_or_else(|| panic!("tools/list 响应形状异常：{v}"));
@@ -238,7 +243,7 @@ async fn mcp_e2e_scopes_three_tiers_three_faces() {
         let n = tt["name"].as_str().unwrap_or("");
         assert!(
             !writers.iter().any(|w| n.ends_with(w)),
-            "read 档不得见写面 tool：{n}"
+            "read 档不得见写面 tool：{n}（全量 tools={v}）"
         );
     }
     assert!(
@@ -514,7 +519,8 @@ async fn mcp_e2e_obo_full_matrix() {
         }
         assert!(
             std::time::Instant::now() < dl,
-            "jti 吊销须在 30s TTL 后全网生效"
+            "jti 吊销须在 30s TTL 后全网生效（诊断：表内 jti2 行数={}",
+            table_count(&t, &jti2).await
         );
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
     }
