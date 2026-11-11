@@ -68,6 +68,16 @@ pub fn generate(table: &RouteTable, base: &str) -> Result<Value, String> {
         let mut op = serde_json::Map::new();
         op.insert("operationId".to_string(), Value::String(operation_id));
         op.insert("summary".to_string(), Value::String(summary));
+        // description（spec 2026-11-11 P1）：`.schema` 顶层声明值透传；
+        // 无声明 → 键缺失（不是 null），openapi.json 对未声明路由字节兼容。
+        if let Some(d) = row
+            .schema
+            .as_ref()
+            .and_then(|s| s.get("description"))
+            .and_then(|v| v.as_str())
+        {
+            op.insert("description".to_string(), Value::String(d.to_string()));
+        }
         op.insert("x-oj-file".to_string(), Value::String(file));
         // 模块归属（v0.1.70）：生成代码必须知道端点属于哪个模块，否则下游只能靠
         // `x-oj-file` 猜目录。用标准 `tags` —— 通用 OpenAPI 工具同样按它归组。
@@ -448,6 +458,38 @@ mod tests {
         assert_eq!(
             op["requestBody"]["content"]["application/json"]["schema"]["required"][0],
             "name"
+        );
+    }
+
+    // Given 契约带顶层 description（spec 2026-11-11 P1）
+    // When generate
+    // Then op["description"]==声明值 且 summary 仍为合成串；
+    // Given 无 description 的契约
+    // Then op 无 description 键（键缺失，不是 null——字节兼容）。
+    #[test]
+    fn description_passes_through_and_absent_stays_absent() {
+        let (_d, t) = table_with_contract(
+            "get",
+            "/v1/api/user/account",
+            "user-0.1.0/api.js",
+            json!({ "description": "查询用户账户详情" }),
+        );
+        let spec = generate(&t, "/v1/api").unwrap();
+        let op = &spec["paths"]["/v1/api/user/account"]["get"];
+        assert_eq!(op["description"], "查询用户账户详情");
+        assert_eq!(op["summary"], "GET v1/api/user/account", "summary 恒合成不变");
+
+        let (_d2, t2) = table_with_contract(
+            "get",
+            "/v1/api/user/account",
+            "user-0.1.0/api.js",
+            json!({}),
+        );
+        let spec2 = generate(&t2, "/v1/api").unwrap();
+        let op2 = &spec2["paths"]["/v1/api/user/account"]["get"];
+        assert!(
+            op2.get("description").is_none(),
+            "无声明 → 键缺失（不是 null）：{op2}"
         );
     }
 

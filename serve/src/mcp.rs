@@ -107,9 +107,12 @@ pub fn spec_to_tools(spec: &Value) -> Result<Vec<McpTool>, String> {
             }
             seen.insert(name.clone(), operation_id.clone());
 
+            // description 选取（spec 2026-11-11 P1）：`.schema` 声明值优先，
+            // 回落合成 summary；no-contract 后缀叠加在选取值之后（不变）。
             let mut description = op
-                .get("summary")
+                .get("description")
                 .and_then(|v| v.as_str())
+                .or_else(|| op.get("summary").and_then(|v| v.as_str()))
                 .unwrap_or("")
                 .to_string();
             let (input_schema, declared) = build_input_schema(op, &name)?;
@@ -475,9 +478,34 @@ mod tests {
         let s = spec(&[("/a", "get", op("a_get", json!({})))]);
         let tools = spec_to_tools(&s).unwrap();
         let d = tools[0].tool["description"].as_str().unwrap();
-        assert!(
-            d.ends_with("(no declared input contract — inspect source)"),
-            "{d}"
+        assert_eq!(d, "OP a_get (no declared input contract — inspect source)");
+    }
+
+    // Given op 带 description "D" 与 summary "S"（spec 2026-11-11 P1：声明值优先）
+    // When spec_to_tools
+    // Then tool.description=="D"；
+    // Given 仅 summary
+    // Then description=="S" 且 no-contract 后缀仍叠加。
+    #[test]
+    fn description_preferred_over_summary() {
+        let s = spec(&[(
+            "/a",
+            "get",
+            op("a_get", json!({ "description": "查询用户账户详情" })),
+        )]);
+        let tools = spec_to_tools(&s).unwrap();
+        assert_eq!(
+            tools[0].tool["description"],
+            "查询用户账户详情 (no declared input contract — inspect source)",
+            "声明值优先 + no-contract 后缀仍叠加（叠加在选取值之后）"
+        );
+
+        let s2 = spec(&[("/b", "get", op("b_get", json!({})))]);
+        let tools2 = spec_to_tools(&s2).unwrap();
+        assert_eq!(
+            tools2[0].tool["description"],
+            "OP b_get (no declared input contract — inspect source)",
+            "回落 summary + 后缀叠加"
         );
     }
 
