@@ -1,6 +1,6 @@
 [package]
 name = "oj-auth"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "auth 轴守卫 cdylib 插件：JWT 验签 + 匿名路径匹配（迁自 server/auth.rs）"
 
