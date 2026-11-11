@@ -75,7 +75,10 @@ MCP/机器人三痛点（spec 2026-11-11）：**模型看不懂接口**（descri
   （MsgId 去重 → obo → tools/call → 中文模板回复）；`user/account` GET 补声明
   description。
 - **文档**：devkit 四件套逐条对齐（api-manual §8 jwt.sign/§14 MCP/错误限制表、
-  scenarios 场景 75 企微端到端、SKILL 陷阱速查、README 交叉引用）。
+  scenarios 场景 75 企微端到端、SKILL 陷阱速查、README 交叉引用）；新增
+  `docs/devkit/mcp-bot-guide.md` **MCP 机器人对接指导手册**（「从零到上线」任务
+  导向：线路选型 / 运营开通清单 / 凭据模型 / obo 四码分流 / `[code=<n>]` 解析 /
+  运维手册 / 上线检查单，随包分发）。
 - **测试**：e2e 拆 `e2e_svc.rs` 独立二进制（插件每进程单例——auth 配置不同的 boot
   不得同进程混跑）；四用例钉 description 透传/scopes 三面矩阵/obo 全失败码+审计/
   tenant 复制，既有 e2e 60 用例零回归。

@@ -649,6 +649,8 @@ mod tests {
         assert!(dk.join("sql-builder-guide.md").exists());
         // oj test 测试专题指引随包分发；api-manual §9 与 SKILL 工作流指向它。
         assert!(dk.join("oj-test-guide.md").exists());
+        // MCP 机器人对接指导手册随包分发（v0.1.130）；api-manual §14 与 README 索引指向它。
+        assert!(dk.join("mcp-bot-guide.md").exists());
     }
 
     #[test]
