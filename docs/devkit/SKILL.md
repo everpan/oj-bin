@@ -431,6 +431,14 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | table 的 ddlDiff `to:null` 曾静默零语句（v0.1.113 已改为参数错误） | DROP TABLE 是独立高危语义，不进 ddlDiff——删表走显式迁移；objectType=view/index/sequence/routine/trigger 的 to:null 才是 drop |
 | MySQL 表改名语句序（v0.1.113） | 表 `previousName` 产 `ALTER TABLE old RENAME TO new`（**RENAME TO**，非 RENAME TABLE）恒首条；与列级 previousName 同 spec 时表 rename 在先、列 rename 用新表名 |
 | 直连想用 HTTP/2 但 curl/fetch 都跑成 1.1（v0.1.118） | 明文端口仅支持 **h2c prior knowledge**（无 `Upgrade: h2c`）——显式用 `curl --http2-prior-knowledge` / `node:http2`；升级式客户端静默按 1.1 完成，不是故障。**WS 必须走 HTTP/1.1**（无 RFC 8441）；浏览器 h2 由反代 ALPN 承担。见场景 70 |
+| read 档 svc token 打 `/mcp` 全 401 或全 403（v0.1.130） | 分清两道门：**守卫** 401（token 没验过/过期）与 **admit** 403（scopes 档位不符，文案 `missing scope: <tier>`）。端点级 POST 在 `/auth/obo`、`/mcp`、`/rpc` 是传输动词非业务动词——scopes **不做端点级判定**（按工具/路由以真实动词收口）；jti 门在这三个端点照常查 |
+| svc token 刚签发就 403 / 刚吊销还能用一会儿（v0.1.130） | jti 门走 30s TTL 缓存：签发后**最长 30s** 才可见、吊销后最长 30s 全网失效——测试/自动化要等窗口过（deadline 轮询，勿固定 sleep 猜）；查库失败恒 fail-closed 拒 |
+| 机器人直连工具判权限（客户端 scopes 解码）（v0.1.130） | **不要**——三档收口在服务端 admit 单点（`/mcp`、`/rpc`、直连 REST 三面同规则）；`tools/list` 裁剪只是展示面，调用面不裁（被裁 tool 直呼得 403 非 -32601）。客户端只管带 token 调，403 按 `[code=403] missing scope: <tier>` 提示换签发档位 |
+| 以为 svc 的 scopes 约束换签产物（v0.1.130） | **不约束**——scopes 收口机器人直连面；obo 换签出的受托 token 按**员工本人 roles** 生效（10min、`claims.act` 指回 svc 名）。想约束代操作面用 `server.mcp.act_mask_destructive: true`（act 会话拒 delete） |
+| `jwt.sign` 带 `claims` 后守卫读不到 / 报保留键（v0.1.130） | claims 是**平铺**进 JWT 顶层的（`http.user.claims` 读回全部）；`sub/roles/iat/exp` 是保留键不能进 `claims`（防伪造时效）。`ttl_secs` 上限 90 天，越界按上限钳不报错 |
+| obo 换签失败按 HTTP 状态分流（v0.1.130） | 四失败路径 HTTP 恒 500（code>599 钳制）——**按信封 `code` 分流**：40310 未绑定 / 40311 已吊销 / 40312 非 svc / 40313 员工停用。受托 token 401 → 重换签**一次**再试（10min 短时效设计），仍 401 告警 |
+| MCP 错误文案做等值断言（v0.1.130） | isError/message 带 `[code=<n>] ` 前缀且**文案冻结**——断言用前缀正则 `^\[code=(\d+)\] `，勿全文等值（msg 后续可能充实）。`tools/list` 结果勿跨会话缓存（scopes 裁剪因 token 而异） |
+| 给机器人开 WS 工具面（v0.1.130） | `/ws` 升级**不经** admit（scopes/jti/act_mask 均不查，只过守卫 verify）——敏感路由勿开 WS 面；线路 A 静态快照同样不经 scopes 展示裁剪（执行仍由服务端收口） |
 
 ## 手册
 

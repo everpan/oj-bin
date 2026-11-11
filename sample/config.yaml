@@ -58,6 +58,14 @@ server:
   # 私钥仅示例用，勿用于生产）；生产用 `tools/oj-cert` 生成并妥善保管私钥。
   public_key_path: "./config/public.pem"
   certificate_path: "./config/cert.jws"
+  # ── MCP agent 接入（spec 2026-11-11）：挂 {base}/mcp（streamable HTTP，需 Bearer）。
+  mcp:
+    enabled: true
+    # 模块白名单（fail-closed）：auth/admin 等运营面**绝不**进机器可读目录。
+    modules: [user, news, order]
+    # 代操作遮蔽（**推荐开启**的运营选项，缺省 false）：claims.act 存在的会话
+    # （机器人代员工，obo 换签而来）一律拒 delete——删改类破坏面只留给人。
+    act_mask_destructive: true
 db:
   default: "sqlite://db.sqlite"
   test: "sqlite://db_test.sqlite"

@@ -16,6 +16,72 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.130（2026-11-11，未打标签）
+
+MCP/机器人三痛点（spec 2026-11-11）：**模型看不懂接口**（description 透传）、
+**机器人凭据越权**（svc token 三档 scopes + 代操作遮蔽）、**机器人难以代表员工
+操作**（obo 换签）。oj-auth 插件同步 bump 0.1.0→0.1.1（守卫端 claims 透传）。
+
+- **feat（oj-auth 守卫 + bridge：JWT 自定义 claims 与可控 TTL）**：`jwt.sign` 载荷扩为
+  `{ sub, roles?, claims?, ttl_secs? }`——`claims` 对象**平铺**进 JWT 顶层（保留键
+  `{sub,roles,iat,exp}` 拒绝，防伪造时效与 flatten 重复键）；`ttl_secs` 指定有效期，
+  服务端钳制上限 **90d**（`JWT_TTL_CAP_SECS=7_776_000`）。守卫端旧 token（无自定义
+  claims）零破坏，`http.user.claims` 读回全部自定义 claims（flatten 孪生形状）。
+  - 配套租户生效变化：`tenant.require_signed_claim: true` 部署下，`claims.tenant`
+    的租户门只认**验签后 claim**（裸头不自证）；换签 token 原样复制 `tenant`。
+- **feat（contract/openapi/mcp：路由 description 透传）**：`api.ts` 的
+  `<verb>.schema.description`（顶层与属性级，**仅 string**——非串 fail-fast）进
+  OpenAPI `description` 键与 `/mcp` tools/list 的 `description`；未声明路由回落合成
+  summary（叠加既有 `(no declared input contract — inspect source)` 后缀，字节兼容
+  对拍 md5 基线全等）。写给模型看的路由说明书：开发者代码声明优先，管理端可补。
+- **feat（serve：svc token 三档 scopes + jti 吊销门，三面同规则）**：`claims.scopes`
+  为 `["read"|"write"|"destructive"]` 数组——get→read、post/put/patch→write、
+  delete/del→destructive；**缺席 = 全量随 roles（旧 token 零破坏）**，present-but-empty
+  = 全拒，未知档 = 档位不符拒。单点收口在 admit（守卫 verify 之后、租户提取之前，
+  冻结序 scopes→jti→act_mask），三个调用面**同规则**：`/mcp` tools/list 展示裁剪
+  （只裁可见性）、tools/call 与 `/rpc`/直连 REST 逐请求拦（文案逐字
+  `missing scope: <tier>`）。
+  - jti 门：svc 凭据（`claims.svc` 存在）逐请求查 `oj_svc_token` 表（静态 SQL，
+    SchemaRegistry 外白名单同 `_oj_migrations` 先例），30s TTL 缓存——创建与吊销
+    双向生效滞后上限 30s；查库失败/无行 **fail-closed**。
+  - 无 default db 而鉴权开启 → WARN「svc tokens cannot be verified」且 svc 恒拒
+    （不静默放行）。
+  - 端点级豁免：`/auth/obo`、`/mcp`、`/rpc` 不做 scopes 端点级判定（POST 在此是
+    **传输动词**非业务动词——scopes 按工具/路由在执行面以真实动词收口）；jti 门
+    在端点级照常。
+- **feat（serve：代操作遮蔽 `server.mcp.act_mask_destructive`）**：缺省 false
+  （零行为变化）；true 时 `claims.act` 存在的会话（obo 换签而来）一律拒 delete
+  （403 `destructive tools are masked for delegated sessions`）且 tools/list 隐藏
+  destructive tool。**推荐开启**的运营选项。
+- **feat（sample：`/auth/obo` 换签端点 + admin 运营端点，v0.1.130 sample 迁移三表）**：
+  - `POST /v1/api/auth/obo`（svc token + `{provider, external_sub}` → 员工受托
+    token，10min，`claims.act.sub` 指回 svc 名）：四失败路径错误码契约
+    **40310 未绑定 / 40311 jti 已吊销 / 40312 非 svc 凭据 / 40313 员工已停用**
+    （信封 `code` 是契约，>599 落 HTTP 500）；每次调用（成败均）落 `oj_obo_audit`。
+  - admin：`service-token`（签发返回**唯一一次明文**/列表/吊销）、`bot-binding`
+    （CRUD+CSV 导入导出）、`obo-audit`（分页+CSV 导出）。迁移新增
+    `oj_svc_token` / `oj_bot_binding` / `oj_obo_audit` 三表（admin 模块 0002）。
+- **feat（mcp/rpc：isError 与 error 统一 `[code=<n>] <msg>` 前缀，文案冻结）**：
+  业务信封错误与非 2xx 信封体的 text/message 一律 `[code=<n>] <msg>` 前缀
+  （非信封体原样）——agent 侧可程序化解析错误码（含 obo 40310-40313）。
+- **边界（重要）**：`/ws`（WebSocket 升级）**不经 admit**（scopes/jti/act_mask
+  三门均不查——升级面沿用守卫 verify；需约束时勿把敏感路由开 WS）；线路 A
+  （`oj mcp` 离线 codegen）不受三档 scopes 展示裁剪影响（静态快照，鉴权/执行
+  仍由服务端收口）。`tools/list` 结果**勿跨会话缓存**（scopes 裁剪因 token 而异，
+  展示面每次请求实时计算）。
+- **sample**：`config.yaml` 增 `server.mcp` 示范段（modules 白名单排除 auth/admin +
+  `act_mask_destructive: true`）；新增 `src/bot/wecom/api.ts` 企微回调骨架
+  （MsgId 去重 → obo → tools/call → 中文模板回复）；`user/account` GET 补声明
+  description。
+- **文档**：devkit 四件套逐条对齐（api-manual §8 jwt.sign/§14 MCP/错误限制表、
+  scenarios 场景 75 企微端到端、SKILL 陷阱速查、README 交叉引用）。
+- **测试**：e2e 拆 `e2e_svc.rs` 独立二进制（插件每进程单例——auth 配置不同的 boot
+  不得同进程混跑）；四用例钉 description 透传/scopes 三面矩阵/obo 全失败码+审计/
+  tenant 复制，既有 e2e 60 用例零回归。
+- **验收待办（人工）**：P1 加 description 前后的模型任务成功率对比（5-10 条自然
+  语言任务对 sample MCP 面人工跑）未执行——机械锚（description 键逐字透传）已由
+  e2e 钉住，人工对比结果待补录本节。
+
 ## v0.1.129（2026-11-09）
 
 - **feat（bridge，SQL 构造器：语句级跨租户身份 `db.table().forTenant(id)`，需求

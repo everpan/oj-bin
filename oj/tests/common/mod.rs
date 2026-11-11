@@ -70,9 +70,12 @@ pub async fn boot_inner(
         oj_plugin_ffi::path_util::sqlite_file_dsn(&tmp.join("db.sqlite")),
     );
     // e2e 是 v0.1 UC 验收（不带租户头/不登录）；sample 的 tenant/auth 留给手工冒烟，
-    // 租户注入/400 与鉴权全链路在 mdm-server::tests 覆盖。
+    // 租户注入/400 与鉴权全链路在 mdm-server::tests 覆盖。mcp 同理清掉：sample
+    // config 带 mcp.enabled 示范段，而本夹具 auth=None → enabled 无 auth 拒启
+    // fail-fast；需要 mcp/rpc 的用例（e2e_svc）在 tweak 里显式开。
     cfg.tenant = Default::default();
     cfg.auth = None;
+    cfg.server.mcp = None;
     // sample/config.yaml 的 web 挂载指向 dist（gitignore，CI 新克隆无此目录）且
     // api 挂载固定 src——boot() 按本用例的 dev/release 目录重挂：清掉 sample 挂载，
     // 由 start() 注入 (dir, /v1/api) 一条（UC 不覆盖静态兜底，多站点静态有专属 e2e，

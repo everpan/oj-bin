@@ -2172,7 +2172,7 @@ secret / 算法 / 有效期由 config `auth:` 段在装配期注入，handler �
 
 | API | 签名 | 说明 |
 |---|---|---|
-| `jwt.sign` | `sign(payload: { sub: string; roles?: string[] }): string` | 签发 access token（payload 至少含 `sub`，`roles` 缺省空数组） |
+| `jwt.sign` | `sign(payload: { sub: string; roles?: string[]; claims?: object; ttl_secs?: number }): string` | 签发 access token（payload 至少含 `sub`，`roles` 缺省空数组）。v0.1.130：`claims` 对象**平铺**进 JWT 顶层（保留键 `{sub,roles,iat,exp}` 报错——不得伪造时效）；`ttl_secs` 指定有效期（秒），服务端钳制上限 **90 天**（越界按上限取，不报错） |
 | `jwt.verify` | `verify(token: string): { sub, roles, iat, exp }` | 验签 + 过期检查（leeway 0）；篡改 / 过期 / 算法不符直接抛错 |
 | `jwt.accessDuration` | `readonly number` | 配置的 access 有效期（秒；getter 惰性求值） |
 | `jwt.refreshDuration` | `readonly number` | 配置的 refresh 有效期（秒） |
@@ -2180,7 +2180,19 @@ secret / 算法 / 有效期由 config `auth:` 段在装配期注入，handler �
 ```ts
 const token = jwt.sign({ sub: user.id, roles: user.roles });   // 登录端点签发
 const claims = jwt.verify(token);                               // 受守卫保护的端点一般直接读 http.user
+// v0.1.130 自定义 claims + 可控 TTL：claims 平铺进 JWT 顶层，守卫侧 http.user.claims 读回
+const svc = jwt.sign({
+  sub: "svc:bot", roles: ["bot"],
+  claims: { svc: "bot", jti: "t-1234", scopes: ["read", "write"] },
+  ttl_secs: 3600,
+});
 ```
+
+> **claims 约定**（v0.1.130）：`svc`（机器凭据标记）/`jti`（凭据 id，admin 端点
+> 可吊销）/`scopes`（三档权限，见第 14 章）/`act`（代操作标记，obo 换签写入）/
+> `tenant`（租户门只认验签后 claim——`tenant.require_signed_claim: true` 部署下
+> 裸租户头不自证）。守卫把平铺字段孪生回 `http.user.claims`，旧 token（无自定义
+> claims）`claims` 为空对象，行为零变化。
 
 ### bcrypt —— 密码哈希（始终可用）
 
@@ -4031,6 +4043,10 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | `db.access.revoke` 回落 config，非删 config（v0.1.93） | 撤销的是运行期表项，别名回到 config 兜底；对纯 config 兜底项 `revoke` 显式报错（不静默），防越权/DoS 撤销他人静态授权 |
 | 改 `db_access` / `db_client` 段须重启（v0.1.93） | 两段纳入热更 diff 的 `restart_pending`（不再误标 `applied` 静默盲区）；运行期零重启改授权请用 `db.access.grant/revoke` |
 | `db.epoch` 仅优化 JS 缓存新鲜度，正确性不依赖它（v0.1.93） | 查询 op 始终按名从 host registry 重解析 accessor；即便 JS 覆写缓存 epoch 跳过失效，也拿不到已删连接（host 直接报未登记） |
+| svc scopes 三档与 POST 档位（v0.1.130） | `claims.scopes` 三档按**动词**映射：get→read、post/put/patch→**write**（含按 POST 发查询的业务路由——POST 一律 write 档）、delete/del→destructive；缺席=全量随 roles（旧 token 零破坏）、`[]`=全拒、未知档=拒（`missing scope: <tier>`，MCP/RPC 面 `[code=403] ` 前缀）。绕行：查询路由改 GET+query，或签发时纳入 write。三面对 `/mcp`、`/rpc`、直连 REST 同规则（tools/list 只是展示裁剪，调用面不裁——被裁 tool 直呼得 403 非 -32601）；`/ws` 升级与线路 A 静态快照不经 scopes 门 |
+| `jwt.sign` 的 `ttl_secs` 上限 90 天（v0.1.130） | `claims` 平铺进 JWT 顶层（保留键 `{sub,roles,iat,exp}` 报错）；`ttl_secs` 越界按 90d 上限钳（不报错）——长时效凭据要可控吊销用 admin service-token（jti 在册核销，30s TTL 生效滞后双向成立） |
+| obo 换签错误码是信封 `code` 契约（v0.1.130） | 40310 未绑定 / 40311 jti 已吊销 / 40312 非 svc / 40313 员工停用；HTTP 状态恒 500（code>599 钳制）——**勿按 HTTP 状态分流**，按 code 分流。svc 的 scopes 不约束换签面：受托 token 按**员工本人 roles** 生效（10min、带 `claims.act`） |
+| `/mcp` isError 与 `/rpc` error 的 `[code=<n>] <msg>` 前缀已冻结（v0.1.130） | 业务信封错误与非 2xx 信封体统一前缀（非信封体原样）——agent 按正则 `^\[code=(\d+)\] ` 解析，**勿做文案等值断言**；`tools/list` 结果勿跨会话缓存（scopes 裁剪因 token 而异，展示面每请求实时算） |
 
 ### 常见陷阱清单
 
@@ -4112,6 +4128,9 @@ server:
     enabled: true          # 挂 {base}/mcp（缺省不挂）
     modules: [user, order] # 可选：模块 tag 白名单（fail-closed，无交集 = 空 catalog）
     allow_anonymous: false # enabled 且未装配 auth 插件时缺省拒启；显式 true 才放行
+    act_mask_destructive: true  # v0.1.130 代操作遮蔽（缺省 false；推荐开启）：
+                                # claims.act 存在的会话（obo 换签的机器人代员工）
+                                # 一律拒 delete 且 tools/list 隐藏 destructive tool
   rpc:
     enabled: true          # 挂 {base}/rpc（缺省 false）
     allow_anonymous: false # 与 mcp 同口径：enabled 且未装配 auth 插件时缺省拒启
@@ -4144,8 +4163,8 @@ path 参数键内恒必填（单段值 `encodeURIComponent`——含 `/` 会正�
 | 上游 | tools/call 结果 |
 |---|---|
 | 信封 `code==0` | `content`（text）+ `structuredContent`（= data） |
-| 信封 `code!=0`（业务错） | `isError: true` + 业务 `msg`（HTTP 200，**不**是 JSON-RPC error） |
-| 非 envelope（如 `json.raw`） | 原样 text content，无 structuredContent（raw 响应**豁免**信封检测——裸业务数据恰好带 code/msg/data 键也不误判） |
+| 信封 `code!=0`（业务错） | `isError: true` + `[code=<n>] <msg>` 前缀 text（HTTP 200，**不**是 JSON-RPC error；v0.1.130 起前缀**文案冻结**——agent 侧可程序化解析 `code`，正则 `^\[code=(\d+)\] `） |
+| 非 envelope（如 `json.raw`） | 原样 text content，无 structuredContent（raw 响应**豁免**信封检测——裸业务数据恰好带 code/msg/data 键也不误判）；非 2xx 信封体同样加前缀，非信封体原样 |
 | `json.stream`/`json.sse`（SSE） | `isError`「streaming endpoint, not supported via MCP」（不缓冲） |
 | 传输失败 / 超时（30s） | `isError` |
 
@@ -4154,7 +4173,8 @@ path 参数键内恒必填（单段值 `encodeURIComponent`——含 `/` 会正�
 method = operationId（如 `user_account_get`），params 形如
 `{"path": {...}, "query": {...}, "body": {...}}`（与 MCP arguments 同构）。成功：
 `result` = 信封 `data`；业务错误：JSON-RPC **error 对象**（code 取业务 code、message
-取业务 msg——MCP 用 isError 而裸 RPC 没有该概念，error 对象才是正确载体）。同一
+取业务 msg 带 `[code=<n>] ` 前缀（v0.1.130 冻结文案）——MCP 用 isError 而裸 RPC 没有该
+概念，error 对象才是正确载体）。同一
 `initialize`/`ping`/通知/batch 纪律。
 
 ```bash
@@ -4163,6 +4183,50 @@ curl -s http://localhost:9778/v1/api/rpc -H 'content-type: application/json' \
   '{"jsonrpc":"2.0","id":1,"method":"user_account_get","params":{"query":{"id":"1"}}}'
 # → {"jsonrpc":"2.0","id":1,"result":[...]}
 ```
+
+### 机器人凭据：svc 三档 scopes + obo 换签（v0.1.130）
+
+`claims.scopes` 非缺席时，凭据按**三档动词映射**收口（对 `/mcp`、`/rpc`、直连
+REST 三面同规则，服务端单点判定——客户端侧不判权限）：
+
+| 档位 | 动词 | 说明 |
+|---|---|---|
+| `read` | GET | 只读面 |
+| `write` | POST / PUT / PATCH | 含**按 POST 发查询**的业务路由（企业 admin 惯例）——POST 一律按 write 档判定 |
+| `destructive` | DELETE / DEL | 破坏面 |
+
+语义细则：**缺席** = 全量随 roles（旧 token 零破坏）；present-but-empty（`[]`）=
+全拒；未知档名 = 档位不符拒（文案逐字 `missing scope: <tier>`，HTTP 403 信封 /
+`[code=403] missing scope: <tier>` isError）。两条绕过 POST-as-query 判定的正路：
+① 查询类业务路由改 GET + query 参数（首选）；② 该机器人签发时纳入 `write` 档。
+`/ws`（WebSocket 升级）**不经** scopes/jti/act_mask 门（升级面只过守卫 verify）。
+
+**svc 凭据与 jti 吊销**：`claims.svc` 存在的凭据逐请求查 `oj_svc_token` 表核销
+（30s TTL 缓存——签发后**最长 30s** 才可过门；吊销后最长 30s 全网失效；查库
+失败/无行 fail-closed 恒拒）。运营走 admin 端点：
+`POST /v1/api/admin/service-token/`（`{name, scopes}` → `{token, jti}`，**明文
+token 仅此一次**，落库只存 jti）、`GET /v1/api/admin/service-token/`（列表，
+无明文）、`DELETE /v1/api/admin/service-token/{jti}`（吊销）、`bot-binding`
+（provider+external_sub ↔ 员工 id 绑定 CRUD + CSV）、`obo-audit`（换签审计
+分页 + CSV）。`svc` 的 scopes **不约束换签面**——scopes 收口的是机器人直连
+工具/路由的动词档位；换签产物（受托 token）按**员工本人 roles** 生效
+（"够用，最终以员工本身的权限为准"）。
+
+**obo 换签**：`POST /v1/api/auth/obo`（Bearer svc token + `{provider,
+external_sub}`）→ 员工受托 token（10 分钟，`claims.act.sub` 指回 svc 名——
+`act_mask_destructive` 据此遮蔽 delete）。错误码契约（信封 `code`，HTTP 500）：
+
+| code | 场景 |
+|---|---|
+| 40310 | 绑定缺失（该 external_sub 没有绑定行） |
+| 40311 | svc 凭据已吊销（jti 不在册） |
+| 40312 | 凭据非 svc（普通员工 token 打到 obo） |
+| 40313 | 员工已停用（users.disabled） |
+
+标准消费模式：捕获 code → 40311/40312 告警运营（凭据/绑定面问题）→ 40310 提示
+"未绑定，联系管理员" → 40313 提示 "账号已停用"；10min 过期（401）→ 重换签**一次**
+再试，仍 401 告警。端到端骨架见 `sample/src/bot/wecom/api.ts` +
+`scenarios.md` 场景 75。
 
 ### 线路 A：`oj mcp` 生成 stdio server
 
