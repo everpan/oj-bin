@@ -17,6 +17,7 @@ pub(crate) fn dummy_app_state() -> AppState {
         certificate_valid_until: Arc::new(RwLock::new(None)),
         plugins: Arc::default(),
         exec_registry: None,
+        svc_gate: None,
     }
 }
 
@@ -2611,10 +2612,35 @@ impl only_js::bridge::AuthGuard for CountingGuard {
     }
 }
 
+/// 固定用户守卫：verify 恒返回预置 user（claims 三检查用例的材料）。
+struct FixedGuard(Value);
+impl only_js::bridge::AuthGuard for FixedGuard {
+    fn verify(
+        &self,
+        _path: &str,
+        _method: &str,
+        _auth: Option<&str>,
+        _headers: Option<&str>,
+    ) -> Result<Option<Value>, String> {
+        Ok(Some(self.0.clone()))
+    }
+}
+
+/// svc claims 用户（Task 7 create 形状：claims.svc/jti/scopes 平铺顶层）。
+fn svc_user(jti: &str, scopes: Value) -> Value {
+    // scopes=Null → 键整个缺席（真实语义：scopes 门不触发，而非 present-but-invalid）。
+    let claims = if scopes.is_null() {
+        serde_json::json!({ "svc": "bot", "jti": jti })
+    } else {
+        serde_json::json!({ "svc": "bot", "jti": jti, "scopes": scopes })
+    };
+    serde_json::json!({ "id": "svc:bot", "roles": ["bot"], "claims": claims })
+}
+
 /// D4/B8：auth_anon 命中 → 跳过 verify（0 次）、user=None、hdr_map 照建
 /// （匿名请求 handler 侧 headers 不得消失）；名单外路径 verify 照跑。
-#[test]
-fn admit_short_circuits_auth_anon_without_verify() {
+#[tokio::test]
+async fn admit_short_circuits_auth_anon_without_verify() {
     let mut st = dummy_app_state();
     let g = Arc::new(CountingGuard(AtomicUsize::new(0)));
     st.pipeline.auth = Some(g.clone());
@@ -2622,22 +2648,26 @@ fn admit_short_circuits_auth_anon_without_verify() {
     let mut headers = axum::http::HeaderMap::new();
     headers.insert("x-a", "1".parse().unwrap());
     let (user, _tid, anonymous, hm) =
-        crate::dispatch::admit(&st, &headers, "GET", Some("/probe/deep")).unwrap();
+        crate::dispatch::admit(&st, &headers, "GET", Some("/probe/deep"))
+            .await
+            .unwrap();
     assert!(user.is_none(), "anon short-circuit: user must be None");
     assert!(!anonymous, "anonymous flag is tenant-side; untouched here");
     let hm = hm.expect("hdr_map still built for handler-side headers");
     assert_eq!(hm.get("x-a").map(String::as_str), Some("1"));
     assert_eq!(g.0.load(Ordering::SeqCst), 0, "verify must be skipped");
     // 名单外：verify 照跑，user 透传。
-    let (user, _, _, _) = crate::dispatch::admit(&st, &headers, "GET", Some("/other")).unwrap();
+    let (user, _, _, _) = crate::dispatch::admit(&st, &headers, "GET", Some("/other"))
+        .await
+        .unwrap();
     assert!(user.is_some());
     assert_eq!(g.0.load(Ordering::SeqCst), 1);
 }
 
 /// B9 前半回归：tenant_anon 命中 → 免租户头 + anonymous=true，但 verify **照跑**
 /// （tenant 豁免 ≠ 鉴权豁免，两条名单语义不同，并集是自设红线）。
-#[test]
-fn admit_tenant_anon_still_verifies() {
+#[tokio::test]
+async fn admit_tenant_anon_still_verifies() {
     let mut st = dummy_app_state();
     let g = Arc::new(CountingGuard(AtomicUsize::new(0)));
     st.pipeline.auth = Some(g.clone());
@@ -2645,7 +2675,148 @@ fn admit_tenant_anon_still_verifies() {
     st.pipeline.tenant_anon = vec!["/jump/*".to_string()];
     let headers = axum::http::HeaderMap::new();
     let (_user, _tid, anonymous, _hm) =
-        crate::dispatch::admit(&st, &headers, "GET", Some("/jump/leg")).unwrap();
+        crate::dispatch::admit(&st, &headers, "GET", Some("/jump/leg"))
+            .await
+            .unwrap();
     assert!(anonymous, "tenant_anon hit → anonymous");
     assert_eq!(g.0.load(Ordering::SeqCst), 1, "verify must still run");
+}
+
+// ===== spec 2026-11-11 P3：admit 单点 scopes/jti/act_mask 门 =====
+
+fn guard_state(user: Value) -> AppState {
+    let mut st = dummy_app_state();
+    st.pipeline.auth = Some(Arc::new(FixedGuard(user)));
+    st
+}
+
+fn svc_gate_with(rows: &[&str]) -> Arc<crate::svc_gate::SvcGate> {
+    let acc = only_js::bridge::InMemoryAccessor::new();
+    acc.seed(rows.iter().map(|j| serde_json::json!({ "jti": j })));
+    Arc::new(crate::svc_gate::SvcGate::with_ttl(
+        Arc::new(acc),
+        std::time::Duration::from_secs(3600),
+    ))
+}
+
+async fn admit_err(r: Result<crate::dispatch::AdmitOut, Box<Response>>) -> (u16, String) {
+    let resp = r.expect_err("admit must deny");
+    let status = resp.status().as_u16();
+    let body = axum::body::to_bytes(resp.into_body(), 4096)
+        .await
+        .unwrap_or_default();
+    let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    (status, v["msg"].as_str().unwrap_or_default().to_string())
+}
+
+/// Review Focus 3：cookie 会话与 Bearer 在 admit 层**无差别**——守卫把两种来源
+/// 归一成同一个 user Value（oj-auth cookie 腿返回同形状），三检查只看 user。
+#[tokio::test]
+async fn admit_scopes_gate_three_tiers_and_shapes() {
+    // read 档：GET 过、POST/DELETE 拒，文案点名档位。
+    let mut st = guard_state(svc_user("jt-ok", serde_json::json!(["read"])));
+    // scopes 门是本组被测对象：jti 门须放行（fail-closed 缺门即拒，另测覆盖）。
+    st.svc_gate = Some(svc_gate_with(&["jt-ok"]));
+    let headers = axum::http::HeaderMap::new();
+    crate::dispatch::admit(&st, &headers, "GET", Some("/x"))
+        .await
+        .unwrap_or_else(|_| panic!("read scope must admit GET"));
+    let (s, m) = admit_err(crate::dispatch::admit(&st, &headers, "POST", Some("/x")).await).await;
+    assert_eq!((s, m.as_str()), (403, "missing scope: write"));
+    let (s, m) = admit_err(crate::dispatch::admit(&st, &headers, "DELETE", Some("/x")).await).await;
+    assert_eq!((s, m.as_str()), (403, "missing scope: destructive"));
+
+    // present-but-empty = 全拒；垃圾串 = 档位不匹配拒（Review Focus 2）。
+    for scopes in [serde_json::json!([]), serde_json::json!(["banana"])] {
+        let mut st = guard_state(svc_user("jt-ok", scopes));
+        st.svc_gate = Some(svc_gate_with(&["jt-ok"]));
+        let (s, m) =
+            admit_err(crate::dispatch::admit(&st, &headers, "GET", Some("/x")).await).await;
+        assert_eq!((s, m.as_str()), (403, "missing scope: read"));
+    }
+    // 无 scopes 旧 token → 不设防（零破坏，Review Focus 1）。
+    let st = guard_state(serde_json::json!({"id": "1", "roles": [], "claims": {"sub": "1"}}));
+    crate::dispatch::admit(&st, &headers, "DELETE", Some("/x"))
+        .await
+        .unwrap_or_else(|_| panic!("scopes absent must not gate"));
+}
+
+/// scopes 门豁免 /auth/obo（换签端点自身，svc token 必达）。
+#[tokio::test]
+async fn admit_scopes_exempt_obo_path() {
+    let mut st = guard_state(svc_user("jt-ok", serde_json::json!(["read"])));
+    st.svc_gate = Some(svc_gate_with(&["jt-ok"]));
+    let headers = axum::http::HeaderMap::new();
+    crate::dispatch::admit(&st, &headers, "POST", Some("/auth/obo"))
+        .await
+        .unwrap_or_else(|_| panic!("/auth/obo exempt from scopes gate"));
+    // 豁免只此一字面路径。
+    let (s, m) =
+        admit_err(crate::dispatch::admit(&st, &headers, "POST", Some("/auth/obo/extra")).await)
+            .await;
+    assert_eq!((s, m.as_str()), (403, "missing scope: write"));
+}
+
+/// jti 门：集合含 → 过；不含 / 缺 jti claim / 查询 Err / svc_gate None → 403
+/// fail-closed；无 svc claim 的普通 token 完全不受影响。
+#[tokio::test]
+async fn admit_jti_gate_fail_closed() {
+    let headers = axum::http::HeaderMap::new();
+    let mut st = guard_state(svc_user("jt-ok", Value::Null));
+    st.svc_gate = Some(svc_gate_with(&["jt-ok"]));
+    crate::dispatch::admit(&st, &headers, "GET", Some("/x"))
+        .await
+        .unwrap_or_else(|_| panic!("registered jti must admit"));
+
+    for u in [
+        svc_user("jt-gone", Value::Null),
+        // 缺 jti claim（无法验证）→ 拒。
+        serde_json::json!({"id": "svc:bot", "roles": ["bot"], "claims": {"svc": "bot"}}),
+    ] {
+        let st = {
+            let mut s = guard_state(u);
+            s.svc_gate = Some(svc_gate_with(&["jt-ok"]));
+            s
+        };
+        let (s, m) =
+            admit_err(crate::dispatch::admit(&st, &headers, "GET", Some("/x")).await).await;
+        assert_eq!((s, m.as_str()), (403, "svc token revoked or unverifiable"));
+    }
+
+    // svc_gate None（未配 default db）→ 同拒。
+    let st = guard_state(svc_user("jt-ok", Value::Null));
+    let (s, m) = admit_err(crate::dispatch::admit(&st, &headers, "GET", Some("/x")).await).await;
+    assert_eq!((s, m.as_str()), (403, "svc token revoked or unverifiable"));
+
+    // 无 svc claim → 门不触发。
+    let st = guard_state(serde_json::json!({"id": "1", "roles": [], "claims": {"sub": "1"}}));
+    crate::dispatch::admit(&st, &headers, "GET", Some("/x"))
+        .await
+        .unwrap_or_else(|_| panic!("non-svc token untouched by jti gate"));
+}
+
+/// act_mask：pipeline.act_mask_destructive=true 且 claims.act 存在 → DELETE 拒
+/// （GET 照常）；false → 不遮蔽（缺省零行为变化）。
+#[tokio::test]
+async fn admit_act_mask_destructive() {
+    let headers = axum::http::HeaderMap::new();
+    let user = serde_json::json!({
+        "id": "2", "roles": ["user"],
+        "claims": {"sub": "2", "act": {"sub": "svc:bot"}}
+    });
+    let mut st = guard_state(user.clone());
+    st.pipeline.act_mask_destructive = true;
+    let (s, m) = admit_err(crate::dispatch::admit(&st, &headers, "DELETE", Some("/x")).await).await;
+    assert_eq!(
+        (s, m.as_str()),
+        (403, "destructive tools are masked for delegated sessions")
+    );
+    crate::dispatch::admit(&st, &headers, "GET", Some("/x"))
+        .await
+        .unwrap_or_else(|_| panic!("act_mask only gates delete"));
+
+    let st = guard_state(user);
+    crate::dispatch::admit(&st, &headers, "DELETE", Some("/x"))
+        .await
+        .unwrap_or_else(|_| panic!("default off: no masking"));
 }

@@ -345,6 +345,7 @@ fn comp_state(
         certificate_valid_until: Arc::new(RwLock::new(None)),
         plugins: Arc::default(),
         exec_registry: None,
+        svc_gate: None,
     };
     let mount = WebMount {
         prefix: "/".into(),

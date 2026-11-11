@@ -14,13 +14,13 @@
 
 | Task | 名称 | 状态 | 小结 |
 |---|---|---|---|
-| 1 | crypto.rs claims+ttl 签发端 | 待办 | |
-| 2 | oj-auth 守卫端 claims 透传 | 待办 | |
-| 3 | contract.rs description 白名单 | 待办 | |
-| 4 | openapi/mcp description 透传 | 待办 | |
-| 5 | sample 迁移四表 + users.disabled | 待办 | |
-| 6 | auth/obo 端点 + 换签审计 | 待办 | |
-| 7 | admin 运营端点（svc-token/绑定/审计） | 待办 | |
+| 1 | crypto.rs claims+ttl 签发端 | 完成 | dbc9502；4 新用例；JWT_TTL_CAP_SECS=90d 钳制 |
+| 2 | oj-auth 守卫端 claims 透传 | 完成 | c8841c7；flatten 字段孪生；旧 token 键集不变；12/12 |
+| 3 | contract.rs description 白名单 | 完成 | f6edee4；顶层+属性级 string-only，非串 fail-fast；1119/1119 |
+| 4 | openapi/mcp description 透传 | 完成 | 22b815c；232/232；md5 基线全等（字节零漂移） |
+| 5 | sample 迁移四表 + users.disabled | 完成 | 92bcfea；sqlite 幂等实证 + pg/mysql scratch 方言腿通过；users 归 _platform |
+| 6 | auth/obo 端点 + 换签审计 | 完成 | 4892903；六路实测全对（含 /me 解 act/tenant/600s）；oj-auth bump 0.1.1（4d665b3，用户约定：改插件必 bump） |
+| 7 | admin 运营端点（svc-token/绑定/审计） | 完成 | 3e7b00b；实测全过（revoke→obo 40311 闭环）；多路由=组对象+组 .route |
 | 8 | admit async 化 + scopes/jti/act_mask 门 | 待办 | |
 | 9 | mcp_http 展示层裁剪 + isError 前缀 | 待办 | |
 | 10 | e2e 全矩阵 | 待办 | |

@@ -164,7 +164,7 @@ pub(crate) async fn run_capture(
 ) -> Result<only_js::bridge::Capture, RunFail> {
     // 前置管线（鉴权 + 租户）统一进口：run_route 与 blob 直传 PUT 共用（v0.1.30 抽出，
     // 防两处准入语义漂移）。401/400 以 RunFail 返回（run_route 转为 Response）。
-    let (user, tenant_id, anonymous, hdr_map) = match admit(st, headers, verb, path_no_base) {
+    let (user, tenant_id, anonymous, hdr_map) = match admit(st, headers, verb, path_no_base).await {
         Ok(v) => v,
         Err(resp) => return Err(run_fail_from_response(*resp).await),
     };
@@ -220,8 +220,11 @@ pub(crate) struct RunFail {
     pub msg: String,
 }
 
-/// 前置管线准入（v0.1.30 抽出）：鉴权（ABI 9 四参守卫）+ 租户提取。
-/// Ok((user, tenant_id, anonymous, headers_map))；Err = 已构造的 401/400 响应。
+/// 前置管线准入（v0.1.30 抽出）：鉴权（ABI 9 四参守卫）+ svc 三检查（spec
+/// 2026-11-11 P3：scopes/jti/act_mask，检查顺序 guard 验签后、租户提取前）
+/// + 租户提取。async（v0.1.130：jti 门查 default db，30s TTL）。
+///
+/// Ok((user, tenant_id, anonymous, headers_map))；Err = 已构造的 401/400/403 响应。
 /// headers_map：鉴权已构建的头 map（perf F8，run_route 复用免二次字符串化）；
 /// 鉴权未激活为 None。
 pub(crate) type AdmitOut = (
@@ -231,7 +234,7 @@ pub(crate) type AdmitOut = (
     Option<HashMap<String, String>>,
 );
 
-pub(crate) fn admit(
+pub(crate) async fn admit(
     st: &AppState,
     headers: &HeaderMap,
     verb: &str,
@@ -269,6 +272,61 @@ pub(crate) fn admit(
         }
         _ => None,
     };
+    // svc 三检查（spec 2026-11-11 P3）：仅对验签成功的 user 生效；检查顺序
+    // scopes → jti → act_mask 冻结（先便宜的纯判定，后查库）。Cookie 会话与
+    // Bearer 在此层无差别——守卫把两种来源归一成同一个 user Value。
+    if let Some(u) = user.as_ref() {
+        let claims = u.get("claims");
+        // ① scopes：缺席 = 跳过（零破坏）；present-but-empty = 全拒；
+        // 未知串 = 档位不匹配拒。豁免：/auth/obo 一字面路径（换签端点自身，
+        // svc token 必达；svc token 天然没有员工权限全档）。
+        if let Some(scopes) = claims.and_then(|c| c.get("scopes")) {
+            let list: Vec<&str> = scopes
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            let exempt = path_no_base == Some("/auth/obo");
+            if !exempt
+                && let Some(tier) = crate::svc_gate::tier_of(verb)
+                && !list.contains(&tier)
+            {
+                return Err(Box::new(fail_response(
+                    403,
+                    &format!("missing scope: {tier}"),
+                )));
+            }
+        }
+        // ② jti：claims.svc 为字符串即 svc 凭据 → 查 SvcGate（30s TTL）；不含
+        // 该 jti / 缺 jti claim / 查询 Err / svc_gate None → 403 fail-closed。
+        if claims
+            .and_then(|c| c.get("svc"))
+            .and_then(|v| v.as_str())
+            .is_some()
+        {
+            let jti = claims.and_then(|c| c.get("jti")).and_then(|v| v.as_str());
+            let ok = match (jti, st.svc_gate.as_ref()) {
+                (Some(j), Some(g)) => g.admits(j).await,
+                _ => false,
+            };
+            if !ok {
+                return Err(Box::new(fail_response(
+                    403,
+                    "svc token revoked or unverifiable",
+                )));
+            }
+        }
+        // ③ act_mask：代操作会话（claims.act 存在）+ delete → 拒（运营选项，
+        // 缺省关；tools/list 展示裁剪在 mcp_http 另有镜像）。
+        if st.pipeline.act_mask_destructive
+            && claims.and_then(|c| c.get("act")).is_some()
+            && crate::svc_gate::tier_of(verb) == Some("destructive")
+        {
+            return Err(Box::new(fail_response(
+                403,
+                "destructive tools are masked for delegated sessions",
+            )));
+        }
+    }
     // 租户提取（启用后缺失/空 → 400；anonymous_paths 命中的跳转腿
     // 豁免"缺失 400"——OIDC 302 带不了自定义头——但已带的头仍注入）。
     // anonymous：db.asTenant 的授信判据（v0.1.20）。只有「豁免命中 + 确实没带

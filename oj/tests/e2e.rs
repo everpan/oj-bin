@@ -3351,6 +3351,7 @@ async fn mcp_e2e_full_flow() {
             enabled: true,
             allow_anonymous: true,
             modules: None,
+            ..Default::default()
         });
     })
     .await
@@ -3414,6 +3415,7 @@ async fn mcp_e2e_business_error_is_iserror_result() {
             enabled: true,
             allow_anonymous: true,
             modules: None,
+            ..Default::default()
         });
     })
     .await
@@ -3455,6 +3457,7 @@ async fn mcp_e2e_modules_whitelist_fail_closed() {
             enabled: true,
             allow_anonymous: true,
             modules: Some(vec!["no_such_module".into()]),
+            ..Default::default()
         });
     })
     .await
@@ -3602,6 +3605,7 @@ async fn mcp_e2e_path_param_tool_roundtrip() {
             enabled: true,
             allow_anonymous: true,
             modules: None,
+            ..Default::default()
         });
     })
     .await

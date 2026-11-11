@@ -503,8 +503,7 @@ mod tests {
         let s2 = spec(&[("/b", "get", op("b_get", json!({})))]);
         let tools2 = spec_to_tools(&s2).unwrap();
         assert_eq!(
-            tools2[0].tool["description"],
-            "OP b_get (no declared input contract — inspect source)",
+            tools2[0].tool["description"], "OP b_get (no declared input contract — inspect source)",
             "回落 summary + 后缀叠加"
         );
     }

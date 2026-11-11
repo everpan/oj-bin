@@ -144,6 +144,11 @@ pub struct McpCfg {
     /// 显式允许无 auth 插件时暴露（默认 fail-fast：enabled && auth 未装配 → 拒启）。
     #[serde(default)]
     pub allow_anonymous: bool,
+    /// 代操作遮蔽（spec 2026-11-11 P3）：true = claims.act 存在的会话拒 delete
+    /// （403 "destructive tools are masked for delegated sessions"）。缺省 false
+    /// （零行为变化；标注「推荐开启」的运营选项）。
+    #[serde(default)]
+    pub act_mask_destructive: bool,
 }
 
 /// 裸 JSON-RPC 2.0 端点（spec 2026-10-30）：`server.rpc.enabled: true` → 挂

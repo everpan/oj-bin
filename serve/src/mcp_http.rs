@@ -308,7 +308,7 @@ async fn read_inbound(
     endpoint: &str,
 ) -> Result<Inbound, Response> {
     // R9 B1：endpoint 级 admit（字面端点路径）——拒绝 → 401 传输语义，不进 JSON-RPC 层。
-    if let Err(resp) = admit(st, headers, "POST", Some(endpoint)) {
+    if let Err(resp) = admit(st, headers, "POST", Some(endpoint)).await {
         return Err(*resp);
     }
     if !is_json_content_type(headers) {

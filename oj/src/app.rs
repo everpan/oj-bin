@@ -2279,6 +2279,20 @@ impl App {
                 );
             }
         }
+        // R9 scopes 线：SvcGate——svc token 的 jti 吊销面（查 oj_svc_token，30s TTL）。
+        // 无 default 库时缺位：dispatch 端 jti 门 fail-closed，svc 标记的 token 一律拒；
+        // auth 关闭时无 token 可验，不告警。
+        let svc_gate = match stable.dbs.get("default") {
+            Some(acc) => Some(Arc::new(serve::svc_gate::SvcGate::new(acc.clone()))),
+            None => {
+                if auth.is_some() {
+                    tracing::warn!(
+                        "svc tokens cannot be verified without a default db — svc-marked tokens will be denied"
+                    );
+                }
+                None
+            }
+        };
         // U-18 批 T1.3：装配期 fail-fast——pattern 悬空（零命中/含 {}）在监听前拒绝，
         // 热更路径复用同一装配，悬空 reload 同样被点名拒绝。
         let route_timeouts: Vec<(String, std::time::Duration)> = cfg
@@ -2322,10 +2336,13 @@ impl App {
             mcp: mcp_cfg.enabled.then(|| serve::McpConfig {
                 modules: mcp_cfg.modules.clone(),
                 allow_anonymous: mcp_cfg.allow_anonymous,
+                // R9 scopes 线：destructive 级换签掩码（运营选项，缺省关）。
+                act_mask_destructive: mcp_cfg.act_mask_destructive,
                 // serverInfo.version 与 `oj --version` 同一来源。
                 server_version: env!("CARGO_PKG_VERSION").to_string(),
             }),
             rpc: cfg.server.rpc.enabled,
+            act_mask_destructive: mcp_cfg.act_mask_destructive,
         };
         // WS 目录镜像挂载：逐 api 挂载。路径口径与 api.ts **同源**（`ws::ws_mounts`
         // 走 `routes::mirror_rel`）——`--module-root` 下由模块索引给 `{prefix}/{模块根内路径}`，
@@ -2447,6 +2464,8 @@ impl App {
             Arc::new(stable.plugins.clone()),
             // REQ-11 G2：挂断联动登记表（与 StableState.exec_sessions 同一 Arc）。
             Some(stable.exec_sessions.clone()),
+            // R9 scopes 线：jti 吊销门（fail-closed 缺位即拒 svc 标记 token）。
+            svc_gate,
             cfg.server.cors.clone(),
         )
         .merge(ws_router);

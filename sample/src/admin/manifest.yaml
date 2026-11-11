@@ -6,5 +6,8 @@ tables:            # 与 schema.yaml 双向一致（S005）
   - menu
   - role_menu
   - notification
+  - oj_svc_token
+  - oj_bot_binding
+  - oj_obo_audit
 deps:              # user-info 读 _platform.users（ownership_guard: deny 下必须声明）
   _platform: "^0.1.0"

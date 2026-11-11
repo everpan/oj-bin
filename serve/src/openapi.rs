@@ -477,7 +477,10 @@ mod tests {
         let spec = generate(&t, "/v1/api").unwrap();
         let op = &spec["paths"]["/v1/api/user/account"]["get"];
         assert_eq!(op["description"], "查询用户账户详情");
-        assert_eq!(op["summary"], "GET v1/api/user/account", "summary 恒合成不变");
+        assert_eq!(
+            op["summary"], "GET v1/api/user/account",
+            "summary 恒合成不变"
+        );
 
         let (_d2, t2) = table_with_contract(
             "get",

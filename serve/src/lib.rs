@@ -26,6 +26,7 @@ pub mod reload;
 pub mod routes;
 /// 静态资源层（web 服务/etag/range/blob key）。
 pub mod static_files;
+pub mod svc_gate;
 pub mod tasks;
 /// 测试支撑（仅 dev/test 编译）：生成真实签名 JWS 证书，供装配测试使用。
 #[cfg(any(test, feature = "test-support"))]
@@ -127,6 +128,9 @@ pub struct AppState {
     /// REQ-11 G2：进程级执行登记表（与 StableState.exec_sessions 同一 Arc）。
     /// None = 无登记表（挂断联动不挂；池执行仍可由 db.cancel 取消）。
     pub exec_registry: Option<Arc<only_js::bridge::db_exec::ExecRegistry>>,
+    /// svc 凭据 jti 吊销门（spec 2026-11-11 P3）：default db 的 accessor 驱动。
+    /// None = 未配 default db（claims.svc 的 token 一律 403 fail-closed）。
+    pub svc_gate: Option<Arc<crate::svc_gate::SvcGate>>,
 }
 
 /// web 默认缓存策略（v0.1.116 OJ-10，`server.static.web_cache_policy`）。
@@ -204,6 +208,9 @@ pub struct Pipeline {
     /// Some = MCP 启用：挂 `{base}/mcp`（streamable HTTP，spec 2026-10-30 R7/R8/R9）。
     /// None = 不挂（默认）。modules 白名单 fail-closed；装配期已做无 auth fail-fast。
     pub mcp: Option<McpConfig>,
+    /// 代操作遮蔽（spec 2026-11-11 P3，`server.mcp.act_mask_destructive`）：
+    /// true = admit 对 claims.act 存在的会话拒 delete（403 masked）。缺省 false。
+    pub act_mask_destructive: bool,
     /// true = 挂 `{base}/rpc`（裸 JSON-RPC 2.0，method=operationId）。独立门。
     pub rpc: bool,
 }
@@ -218,6 +225,9 @@ pub struct McpConfig {
     /// oj 版本号（MCP `initialize` 的 serverInfo.version，与 `oj --version` 同源；
     /// 装配层自 oj crate 的 CARGO_PKG_VERSION 注入）。
     pub server_version: String,
+    /// 代操作遮蔽（spec 2026-11-11 P3）：config `server.mcp.act_mask_destructive`
+    /// 原样透传进 Pipeline（admit 的 act_mask 检查读这里）。
+    pub act_mask_destructive: bool,
 }
 
 impl Default for Pipeline {
@@ -233,6 +243,7 @@ impl Default for Pipeline {
             route_timeouts: Vec::new(),
             blob: None,
             mcp: None,
+            act_mask_destructive: false,
             rpc: false,
         }
     }
@@ -301,6 +312,7 @@ pub fn app(
         certificate_valid_until,
         plugins,
         None,
+        None,
         cors,
     )
 }
@@ -318,6 +330,8 @@ pub fn app_with_exec(
     certificate_valid_until: Arc<RwLock<Option<std::time::SystemTime>>>,
     plugins: Arc<Vec<PluginInfo>>,
     exec_registry: Option<Arc<only_js::bridge::db_exec::ExecRegistry>>,
+    // svc 凭据 jti 吊销门（spec 2026-11-11 P3）：default db 缺席 → None（fail-closed）。
+    svc_gate: Option<Arc<crate::svc_gate::SvcGate>>,
     cors: Option<CorsCfg>,
 ) -> Router {
     let mut router = Router::new();
@@ -387,6 +401,7 @@ pub fn app_with_exec(
         certificate_valid_until,
         plugins,
         exec_registry,
+        svc_gate,
     })
 }
 
@@ -735,7 +750,7 @@ async fn handle_api(
         && let Some(key) = decode_blob_key(key)
     {
         let path_no_base = format!("/blob/{key}");
-        if let Err(resp) = admit(st, headers, verb, Some(&path_no_base)) {
+        if let Err(resp) = admit(st, headers, verb, Some(&path_no_base)).await {
             return *resp;
         }
         return blob_put_direct(st, blob.clone(), &key, headers, body).await;

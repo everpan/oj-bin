@@ -126,7 +126,7 @@ pub fn op_jwt_sign(
         Some(_) => {
             return Err(JsErrorBox::generic(
                 "jwt.sign: payload.claims must be an object",
-            ))
+            ));
         }
     };
     let ttl = match payload.get("ttl_secs") {
@@ -513,7 +513,10 @@ mod tests {
             .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
         assert!(
-            v["data"]["err"].as_str().unwrap_or("").contains("reserved claim key"),
+            v["data"]["err"]
+                .as_str()
+                .unwrap_or("")
+                .contains("reserved claim key"),
             "{v}"
         );
     }
