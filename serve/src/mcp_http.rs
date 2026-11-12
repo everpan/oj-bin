@@ -158,6 +158,78 @@ pub fn build_groups(tools: &[&McpTool]) -> serde_json::Value {
     serde_json::Value::Array(groups)
 }
 
+/// L2 routed（spec 2026-11-12）：裁剪后集合上的**同形状**检索——命中/无权/不存在
+/// 都返回 `{matches: [...]}`（防探测），且检索与 tools/list 用同一展示集合
+/// （search 不放大暴露面）。固定全量扫描后排序（score desc, name asc），不提前
+/// 退出。匹配为大小写不敏感子串、可叠加：name=2 / description=1 / group(tags[0])=1；
+/// `group` 参数 = tags[0] **精确**过滤；limit > 50 钳 50。match 项携带
+/// name/description/inputSchema/group（无 tag 缺席）/annotations（透传，无则缺席）。
+pub fn search_tools(
+    tools: &[&McpTool],
+    query: &str,
+    group: Option<&str>,
+    limit: usize,
+) -> serde_json::Value {
+    let q = query.to_lowercase();
+    let limit = limit.min(50);
+    fn tag_of(t: &McpTool) -> Option<&str> {
+        t.tool
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_str())
+    }
+    let mut scored: Vec<(u32, &McpTool)> = tools
+        .iter()
+        .filter(|t| group.is_none_or(|g| tag_of(t).is_some_and(|tag| tag == g)))
+        .filter_map(|t| {
+            let name = t.name.to_lowercase();
+            let desc = t
+                .tool
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_lowercase();
+            let tag = tag_of(t).unwrap_or_default().to_lowercase();
+            let mut score = 0u32;
+            if name.contains(&q) {
+                score += 2;
+            }
+            if desc.contains(&q) {
+                score += 1;
+            }
+            if tag.contains(&q) {
+                score += 1;
+            }
+            (score > 0).then_some((score, *t))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
+    let matches: Vec<serde_json::Value> = scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, t)| {
+            let mut m = json!({
+                "name": t.name,
+                "description": t.tool.get("description").cloned().unwrap_or(Value::Null),
+                "inputSchema": t
+                    .tool
+                    .get("inputSchema")
+                    .cloned()
+                    .unwrap_or_else(|| json!({ "type": "object" })),
+            });
+            if let Some(tag) = tag_of(t) {
+                m["group"] = json!(tag);
+            }
+            if let Some(ann) = t.tool.get("annotations") {
+                m["annotations"] = ann.clone();
+            }
+            m
+        })
+        .collect();
+    json!({ "matches": matches })
+}
+
 /// modules 白名单（R9 fail-closed）：Some 时仅保留 tags 与名单**有交集**的 tool，
 /// 无 tags 的路由排除；名单匹配不到任何模块 → 空列表（不得回落全集）。
 fn apply_modules_filter(tools: Vec<McpTool>, modules: Option<&Vec<String>>) -> Vec<McpTool> {
@@ -499,6 +571,17 @@ pub async fn handle(
                             .map(|m| m.act_mask_destructive)
                             .unwrap_or(false);
                         let shown = filter_tools_for_display(&tools, user.as_ref(), act_mask);
+                        // L2 routed（spec 2026-11-12）：list 面只回元工具，业务工具
+                        // 经 oj_search_tools 检索后直呼（call 面不变——spec 允许
+                        // call 名不在 list 内，客户端策略差异，warden/Codex 先例）。
+                        if st
+                            .pipeline
+                            .mcp
+                            .as_ref()
+                            .is_some_and(|m| m.expose == crate::mcp::ExposeMode::Routed)
+                        {
+                            return json!({ "tools": crate::mcp::meta_tool_defs() });
+                        }
                         // L1 grouped（spec 2026-11-12）：分组面在消费 shown 之前算——
                         // _meta 扩展位（反域名点分键）；groups 与 tools 同一裁剪后
                         // 集合，分组信息不放大暴露面。flat/routed 不出此键。
@@ -517,7 +600,7 @@ pub async fn handle(
                         result
                     })
                     .map_err(|e| ("-32603", e)),
-                _ => call_tool(&st, &headers, prefix, table, &params).await,
+                _ => call_tool(&st, &headers, prefix, table, &params, user.as_ref()).await,
             }
         }
         _ => Err(("-32601", format!("method not found: {method}"))),
@@ -625,17 +708,64 @@ async fn call_tool(
     prefix: &str,
     table: &RouteTable,
     params: &Value,
+    user: Option<&Value>,
 ) -> Result<Value, (&'static str, String)> {
     let Some(name) = params.get("name").and_then(|v| v.as_str()) else {
         return Err(("-32602", "params.name must be a string".to_string()));
     };
     let args = params.get("arguments").and_then(|v| v.as_object());
+    // L2 routed（spec 2026-11-12）：oj_* 保留前缀在 tools_for **之前**短路——
+    // catalog 生成错误不得把元工具误报 -32601（spec 允许 call 名不在 list 内，
+    // 客户端策略差异，warden/Codex 先例）；未知 oj_ 名归 -32601。
+    if name.starts_with(crate::mcp::META_PREFIX) {
+        return run_meta_tool(st, prefix, table, name, args, user).await;
+    }
     let tools = tools_for(st, prefix, table).map_err(|e| ("-32603", e))?;
     let Some(tool) = tools.iter().find(|t| t.name == name) else {
         return Err(("-32601", format!("unknown tool: {name}")));
     };
     let cap = run_tool(st, headers, prefix, table, tool, args).await?;
     Ok(capture_to_result(&cap))
+}
+
+/// L2 routed 元工具执行（spec 2026-11-12）：检索/分组跑在**展示裁剪后**集合上——
+/// 无权工具在 search 与 tools/list 两个面都不存在（同形状防探测）。catalog
+/// 生成错误 → -32603（catalog 坏则检索无意义，与 tools/list 同侧）。
+async fn run_meta_tool(
+    st: &AppState,
+    prefix: &str,
+    table: &RouteTable,
+    name: &str,
+    args: Option<&Map<String, Value>>,
+    user: Option<&Value>,
+) -> Result<Value, (&'static str, String)> {
+    let tools = tools_for(st, prefix, table).map_err(|e| ("-32603", e))?;
+    let act_mask = st
+        .pipeline
+        .mcp
+        .as_ref()
+        .map(|m| m.act_mask_destructive)
+        .unwrap_or(false);
+    let shown = filter_tools_for_display(&tools, user, act_mask);
+    match name {
+        "oj_search_tools" => {
+            let Some(query) = args.and_then(|a| a.get("query")).and_then(|v| v.as_str()) else {
+                return Err((
+                    "-32602",
+                    "params.arguments.query must be a string".to_string(),
+                ));
+            };
+            let group = args.and_then(|a| a.get("group")).and_then(|v| v.as_str());
+            let limit = args
+                .and_then(|a| a.get("limit"))
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(10);
+            Ok(search_tools(&shown, query, group, limit))
+        }
+        "oj_list_groups" => Ok(json!({ "groups": build_groups(&shown) })),
+        _ => Err(("-32601", format!("unknown tool: {name}"))),
+    }
 }
 
 /// 公共执行段（MCP 与 /rpc 共用，零语义漂移）：path 填充 → normalize → lookup →
@@ -883,6 +1013,179 @@ mod tests {
     #[test]
     fn build_groups_empty_in_empty_out() {
         assert_eq!(build_groups(&[]), json!([]));
+    }
+
+    // ---- L2 routed（spec 2026-11-12）：search_tools ----
+
+    fn search_fixture() -> Vec<McpTool> {
+        let mk = |name: &str, desc: &str, method: &str, tags: Value, ann: Value| McpTool {
+            name: name.into(),
+            tool: {
+                let mut t = json!({
+                    "name": name,
+                    "description": desc,
+                    "inputSchema": { "type": "object", "properties": { "p": { "type": "string" } } },
+                });
+                if tags != Value::Null {
+                    t["tags"] = tags;
+                }
+                if ann != Value::Null {
+                    t["annotations"] = ann;
+                }
+                t
+            },
+            dispatch: crate::mcp::ToolDispatch {
+                operation_id: name.into(),
+                method: method.into(),
+                oa_path: format!("/{name}"),
+                catch_all: Vec::new(),
+            },
+        };
+        vec![
+            mk(
+                "user_account_get",
+                "查询用户账户",
+                "get",
+                json!(["user"]),
+                json!({ "readOnlyHint": true }),
+            ),
+            mk(
+                "wiki_search_post",
+                "全文检索 wiki 词条，支持高亮",
+                "post",
+                json!(["wiki"]),
+                Value::Null,
+            ),
+            mk(
+                "admin_user_delete",
+                "删除用户（含其账户数据）",
+                "delete",
+                json!(["admin"]),
+                json!({ "destructiveHint": true }),
+            ),
+            mk(
+                "report_export_get",
+                "导出报表",
+                "get",
+                json!([]),
+                Value::Null,
+            ),
+        ]
+    }
+
+    // Given 混合 tool 集
+    // Then name 命中优先于 description 命中；大小写不敏感；match 项带
+    //      name/description/inputSchema/group；annotations 透传（无则缺席）
+    #[test]
+    fn search_tools_matches_and_ranks() {
+        let owned = search_fixture();
+        let refs: Vec<&McpTool> = owned.iter().collect();
+        // "user"：user_account_get = name 2 + group 1 = 3 分，admin_user_delete = name
+        // 2 分——group 命中参与计分（spec：name=2/desc=1/group=1），故 user 组在前。
+        let out = search_tools(&refs, "user", None, 10);
+        let names: Vec<&str> = out["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["user_account_get", "admin_user_delete"],
+            "{out}"
+        );
+        // name 命中（score 2）优先于 description 命中（score 1）：
+        // "报表" 只命中 report_export_get 的 description。
+        let out = search_tools(&refs, "报表", None, 10);
+        assert_eq!(out["matches"].as_array().unwrap().len(), 1);
+        assert_eq!(out["matches"][0]["name"], "report_export_get");
+        // 大小写不敏感：name 小写、query 大写。
+        let out = search_tools(&refs, "USER", None, 10);
+        assert_eq!(out["matches"].as_array().unwrap().len(), 2);
+        // match 项键集：group（无 tag 缺席）、annotations 透传。
+        let m = &out["matches"][0];
+        assert!(m.get("inputSchema").is_some() && m.get("description").is_some());
+        assert_eq!(m["group"], "user");
+        assert_eq!(m["annotations"]["readOnlyHint"], true);
+        let m1 = &out["matches"][1];
+        assert_eq!(m1["group"], "admin");
+        assert_eq!(m1["annotations"]["destructiveHint"], true);
+        // 无 tag 工具的 match 无 group 键。
+        let out = search_tools(&refs, "报表", None, 10);
+        assert!(out["matches"][0].get("group").is_none());
+        // 无命中 → 空数组（与「无权/不存在」同形状，防探测）。
+        let out = search_tools(&refs, "zzz-no-such-tool", None, 10);
+        assert_eq!(out["matches"], json!([]));
+    }
+
+    // Given group 过滤与 limit
+    // Then group 精确过滤；limit 超限钳 50
+    #[test]
+    fn search_tools_group_filter_and_limit_clamp() {
+        let owned = search_fixture();
+        let refs: Vec<&McpTool> = owned.iter().collect();
+        let out = search_tools(&refs, "user", Some("admin"), 10);
+        let names: Vec<&str> = out["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["admin_user_delete"],
+            "group=admin 只回 admin 组"
+        );
+        // limit 100 → 钳 50（构造 60 个工具）。
+        let many: Vec<McpTool> = (0..60)
+            .map(|i| McpTool {
+                name: format!("bulk_{i}_get"),
+                tool: json!({
+                    "name": format!("bulk_{i}_get"),
+                    "description": format!("bulk op {i}"),
+                    "inputSchema": { "type": "object", "properties": {} },
+                }),
+                dispatch: crate::mcp::ToolDispatch {
+                    operation_id: format!("bulk_{i}_get"),
+                    method: "get".into(),
+                    oa_path: format!("/bulk/{i}"),
+                    catch_all: Vec::new(),
+                },
+            })
+            .collect();
+        let refs: Vec<&McpTool> = many.iter().collect();
+        let out = search_tools(&refs, "bulk", None, 100);
+        assert_eq!(
+            out["matches"].as_array().unwrap().len(),
+            50,
+            "limit 必须钳到 50"
+        );
+        let out = search_tools(&refs, "bulk", None, 5);
+        assert_eq!(out["matches"].as_array().unwrap().len(), 5);
+    }
+
+    // Given 展示裁剪后的集合（防探测：search 与 tools/list 同一集合）
+    // Then 被 scopes/act_mask 裁掉的工具不出现在 search 结果
+    #[test]
+    fn search_tools_over_display_trimmed_set_leaks_nothing() {
+        let owned = search_fixture();
+        // 模拟 read 档 token + act_mask：destructive 被裁、非 read 动词被裁。
+        let user = json!({ "claims": { "scopes": ["read"] } });
+        let shown = filter_tools_for_display(&owned, Some(&user), true);
+        let shown_names: Vec<&str> = shown.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            !shown_names.contains(&"admin_user_delete"),
+            "destructive 被 act_mask 裁掉: {shown_names:?}"
+        );
+        // 在裁剪后集合上检索：destructive 工具不可见（无权≡不存在）。
+        let out = search_tools(&shown, "user", None, 10);
+        let names: Vec<&str> = out["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["user_account_get"], "{out}");
     }
 
     // Given 无参数模板（e2e 抓出的回归：曾把缺省 path 对象一律判 -32602）
