@@ -3382,7 +3382,9 @@ async fn mcp_e2e_grouped_meta_groups() {
     // tools 本体与 flat 同口径（非空、含业务 tool）。
     let tools = v["result"]["tools"].as_array().expect("tools 数组：{v}");
     assert!(
-        tools.iter().any(|t| t["name"].as_str().unwrap_or("").contains("user_account")),
+        tools
+            .iter()
+            .any(|t| t["name"].as_str().unwrap_or("").contains("user_account")),
         "grouped 不得裁 tools 本体：{v}"
     );
     // flat 回归：缺省模式响应无 _meta 键。
