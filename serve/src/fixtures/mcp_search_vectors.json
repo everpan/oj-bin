@@ -1,0 +1,139 @@
+{
+  "comment": "serve search_tools 共享一致性向量（spec 2026-11-12 L2）——Rust 与 oj mcp 模板内 JS shim 双实现同钉。expect 为命中名有序列表（score desc, name asc；score = name 命中 2 + description 命中 1 + group(tags[0]) 命中 1，大小写不敏感子串）。tags 缺省/null = 无组。",
+  "cases": [
+    {
+      "name": "name 命中优先序（group 命中参与计分）",
+      "tools": [
+        { "name": "user_account_get", "description": "查询用户账户", "tags": ["user"] },
+        { "name": "admin_user_delete", "description": "删除用户（含其账户数据）", "tags": ["admin"] },
+        { "name": "wiki_search_post", "description": "全文检索 wiki 词条，支持高亮", "tags": ["wiki"] }
+      ],
+      "query": "user",
+      "group": null,
+      "limit": 10,
+      "expect": ["user_account_get", "admin_user_delete"]
+    },
+    {
+      "name": "description 命中（name 未命中）",
+      "tools": [
+        { "name": "report_export_get", "description": "导出报表为 CSV", "tags": ["report"] },
+        { "name": "user_account_get", "description": "查询用户账户", "tags": ["user"] }
+      ],
+      "query": "csv",
+      "group": null,
+      "limit": 10,
+      "expect": ["report_export_get"]
+    },
+    {
+      "name": "大小写混合不敏感",
+      "tools": [
+        { "name": "wiki_search_post", "description": "全文检索 wiki 词条", "tags": ["wiki"] }
+      ],
+      "query": "WIKI",
+      "group": null,
+      "limit": 10,
+      "expect": ["wiki_search_post"]
+    },
+    {
+      "name": "group 精确过滤",
+      "tools": [
+        { "name": "user_account_get", "description": "查询用户账户", "tags": ["user"] },
+        { "name": "admin_user_delete", "description": "删除用户（含其账户数据）", "tags": ["admin"] }
+      ],
+      "query": "user",
+      "group": "admin",
+      "limit": 10,
+      "expect": ["admin_user_delete"]
+    },
+    {
+      "name": "无命中空数组（防探测同形状）",
+      "tools": [
+        { "name": "user_account_get", "description": "查询用户账户", "tags": ["user"] }
+      ],
+      "query": "zzz-no-such-tool",
+      "group": null,
+      "limit": 10,
+      "expect": []
+    },
+    {
+      "name": "limit 钳 50（同分按 name asc）",
+      "tools": [
+        { "name": "bulk_0_get", "description": "bulk op 0", "tags": ["bulk"] },
+        { "name": "bulk_1_get", "description": "bulk op 1", "tags": ["bulk"] },
+        { "name": "bulk_2_get", "description": "bulk op 2", "tags": ["bulk"] },
+        { "name": "bulk_3_get", "description": "bulk op 3", "tags": ["bulk"] },
+        { "name": "bulk_4_get", "description": "bulk op 4", "tags": ["bulk"] },
+        { "name": "bulk_5_get", "description": "bulk op 5", "tags": ["bulk"] },
+        { "name": "bulk_6_get", "description": "bulk op 6", "tags": ["bulk"] },
+        { "name": "bulk_7_get", "description": "bulk op 7", "tags": ["bulk"] },
+        { "name": "bulk_8_get", "description": "bulk op 8", "tags": ["bulk"] },
+        { "name": "bulk_9_get", "description": "bulk op 9", "tags": ["bulk"] },
+        { "name": "bulk_10_get", "description": "bulk op 10", "tags": ["bulk"] },
+        { "name": "bulk_11_get", "description": "bulk op 11", "tags": ["bulk"] },
+        { "name": "bulk_12_get", "description": "bulk op 12", "tags": ["bulk"] },
+        { "name": "bulk_13_get", "description": "bulk op 13", "tags": ["bulk"] },
+        { "name": "bulk_14_get", "description": "bulk op 14", "tags": ["bulk"] },
+        { "name": "bulk_15_get", "description": "bulk op 15", "tags": ["bulk"] },
+        { "name": "bulk_16_get", "description": "bulk op 16", "tags": ["bulk"] },
+        { "name": "bulk_17_get", "description": "bulk op 17", "tags": ["bulk"] },
+        { "name": "bulk_18_get", "description": "bulk op 18", "tags": ["bulk"] },
+        { "name": "bulk_19_get", "description": "bulk op 19", "tags": ["bulk"] },
+        { "name": "bulk_20_get", "description": "bulk op 20", "tags": ["bulk"] },
+        { "name": "bulk_21_get", "description": "bulk op 21", "tags": ["bulk"] },
+        { "name": "bulk_22_get", "description": "bulk op 22", "tags": ["bulk"] },
+        { "name": "bulk_23_get", "description": "bulk op 23", "tags": ["bulk"] },
+        { "name": "bulk_24_get", "description": "bulk op 24", "tags": ["bulk"] },
+        { "name": "bulk_25_get", "description": "bulk op 25", "tags": ["bulk"] },
+        { "name": "bulk_26_get", "description": "bulk op 26", "tags": ["bulk"] },
+        { "name": "bulk_27_get", "description": "bulk op 27", "tags": ["bulk"] },
+        { "name": "bulk_28_get", "description": "bulk op 28", "tags": ["bulk"] },
+        { "name": "bulk_29_get", "description": "bulk op 29", "tags": ["bulk"] },
+        { "name": "bulk_30_get", "description": "bulk op 30", "tags": ["bulk"] },
+        { "name": "bulk_31_get", "description": "bulk op 31", "tags": ["bulk"] },
+        { "name": "bulk_32_get", "description": "bulk op 32", "tags": ["bulk"] },
+        { "name": "bulk_33_get", "description": "bulk op 33", "tags": ["bulk"] },
+        { "name": "bulk_34_get", "description": "bulk op 34", "tags": ["bulk"] },
+        { "name": "bulk_35_get", "description": "bulk op 35", "tags": ["bulk"] },
+        { "name": "bulk_36_get", "description": "bulk op 36", "tags": ["bulk"] },
+        { "name": "bulk_37_get", "description": "bulk op 37", "tags": ["bulk"] },
+        { "name": "bulk_38_get", "description": "bulk op 38", "tags": ["bulk"] },
+        { "name": "bulk_39_get", "description": "bulk op 39", "tags": ["bulk"] },
+        { "name": "bulk_40_get", "description": "bulk op 40", "tags": ["bulk"] },
+        { "name": "bulk_41_get", "description": "bulk op 41", "tags": ["bulk"] },
+        { "name": "bulk_42_get", "description": "bulk op 42", "tags": ["bulk"] },
+        { "name": "bulk_43_get", "description": "bulk op 43", "tags": ["bulk"] },
+        { "name": "bulk_44_get", "description": "bulk op 44", "tags": ["bulk"] },
+        { "name": "bulk_45_get", "description": "bulk op 45", "tags": ["bulk"] },
+        { "name": "bulk_46_get", "description": "bulk op 46", "tags": ["bulk"] },
+        { "name": "bulk_47_get", "description": "bulk op 47", "tags": ["bulk"] },
+        { "name": "bulk_48_get", "description": "bulk op 48", "tags": ["bulk"] },
+        { "name": "bulk_49_get", "description": "bulk op 49", "tags": ["bulk"] },
+        { "name": "bulk_50_get", "description": "bulk op 50", "tags": ["bulk"] },
+        { "name": "bulk_51_get", "description": "bulk op 51", "tags": ["bulk"] },
+        { "name": "bulk_52_get", "description": "bulk op 52", "tags": ["bulk"] },
+        { "name": "bulk_53_get", "description": "bulk op 53", "tags": ["bulk"] },
+        { "name": "bulk_54_get", "description": "bulk op 54", "tags": ["bulk"] },
+        { "name": "bulk_55_get", "description": "bulk op 55", "tags": ["bulk"] },
+        { "name": "bulk_56_get", "description": "bulk op 56", "tags": ["bulk"] },
+        { "name": "bulk_57_get", "description": "bulk op 57", "tags": ["bulk"] },
+        { "name": "bulk_58_get", "description": "bulk op 58", "tags": ["bulk"] },
+        { "name": "bulk_59_get", "description": "bulk op 59", "tags": ["bulk"] }
+      ],
+      "query": "bulk",
+      "group": null,
+      "limit": 100,
+      "expect": [
+        "bulk_0_get", "bulk_10_get", "bulk_11_get", "bulk_12_get", "bulk_13_get",
+        "bulk_14_get", "bulk_15_get", "bulk_16_get", "bulk_17_get", "bulk_18_get",
+        "bulk_19_get", "bulk_1_get", "bulk_20_get", "bulk_21_get", "bulk_22_get",
+        "bulk_23_get", "bulk_24_get", "bulk_25_get", "bulk_26_get", "bulk_27_get",
+        "bulk_28_get", "bulk_29_get", "bulk_2_get", "bulk_30_get", "bulk_31_get",
+        "bulk_32_get", "bulk_33_get", "bulk_34_get", "bulk_35_get", "bulk_36_get",
+        "bulk_37_get", "bulk_38_get", "bulk_39_get", "bulk_3_get", "bulk_40_get",
+        "bulk_41_get", "bulk_42_get", "bulk_43_get", "bulk_44_get", "bulk_45_get",
+        "bulk_46_get", "bulk_47_get", "bulk_48_get", "bulk_49_get", "bulk_4_get",
+        "bulk_50_get", "bulk_51_get", "bulk_52_get", "bulk_53_get", "bulk_54_get"
+      ]
+    }
+  ]
+}

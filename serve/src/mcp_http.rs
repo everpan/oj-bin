@@ -1073,6 +1073,62 @@ mod tests {
         ]
     }
 
+    // Given 共享向量文件（Rust 与 oj mcp 模板内 JS shim 双实现同钉）
+    // Then 每个 case 的命中名有序列表与 expect 一致
+    #[test]
+    fn search_tools_honors_shared_vectors() {
+        let v: Value =
+            serde_json::from_str(include_str!("fixtures/mcp_search_vectors.json")).unwrap();
+        for c in v["cases"].as_array().unwrap() {
+            let owned: Vec<McpTool> = c["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| {
+                    let name = t["name"].as_str().unwrap();
+                    let mut tool = json!({
+                        "name": name,
+                        "description": t["description"].clone(),
+                        "inputSchema": { "type": "object", "properties": {} },
+                    });
+                    if let Some(tags) = t.get("tags") {
+                        tool["tags"] = tags.clone();
+                    }
+                    McpTool {
+                        name: name.into(),
+                        tool,
+                        dispatch: crate::mcp::ToolDispatch {
+                            operation_id: name.into(),
+                            method: "get".into(),
+                            oa_path: format!("/{name}"),
+                            catch_all: Vec::new(),
+                        },
+                    }
+                })
+                .collect();
+            let refs: Vec<&McpTool> = owned.iter().collect();
+            let out = search_tools(
+                &refs,
+                c["query"].as_str().unwrap(),
+                c["group"].as_str(),
+                c["limit"].as_u64().unwrap_or(10) as usize,
+            );
+            let got: Vec<&str> = out["matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["name"].as_str().unwrap())
+                .collect();
+            let want: Vec<&str> = c["expect"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e.as_str().unwrap())
+                .collect();
+            assert_eq!(got, want, "向量 {} 不符", c["name"]);
+        }
+    }
+
     // Given 混合 tool 集
     // Then name 命中优先于 description 命中；大小写不敏感；match 项带
     //      name/description/inputSchema/group；annotations 透传（无则缺席）
