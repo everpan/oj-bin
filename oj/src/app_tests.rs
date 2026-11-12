@@ -1030,3 +1030,50 @@ fn static_opts_of_validates_and_three_state_dir() {
         serve::CachePolicy::None_
     );
 }
+
+/// MCP `oj_` 保留名扫描（评审 Important 收口）：catalog 生成失败的挂载**不得**
+/// 扩大爆炸半径——v0.1.134 前这类挂载 REST 照常、仅 /mcp 请求期 -32603；扫描
+/// 只把「保留名碰撞」升级为拒启（fail-fast 意图不变），生成缺陷维持既有行为
+/// （warn 留痕 + 请求期 -32603）。
+#[test]
+fn mcp_reserved_scan_skips_broken_catalog_but_rejects_oj_prefix() {
+    let dir = std::env::temp_dir().join(format!("oj-mcpscan-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("m.ts"), "export default {};\n").unwrap();
+    let mk = |pairs: &[(&str, &str)]| {
+        let entries: Vec<serve::routes::RouteEntry> = pairs
+            .iter()
+            .map(|(pattern, method)| serve::routes::RouteEntry {
+                method: (*method).into(),
+                pattern: (*pattern).into(),
+                file: "m.ts".into(),
+                handler: None,
+                schema: None,
+            })
+            .collect();
+        let (t, failures) = serve::routes::RouteTable::from_entries(&dir, &entries);
+        assert!(failures.is_empty(), "{failures:?}");
+        t
+    };
+    // 生成失败表：派生 operationId 碰撞（a-b / a_b 同净化为 a_b_get）。
+    let broken = mk(&[("/v1/api/a-b", "get"), ("/v1/api/a_b", "get")]);
+    assert!(
+        serve::openapi::generate(&broken, "/v1/api").is_err(),
+        "前置：该表 catalog 生成必须失败"
+    );
+    // 仅生成失败的表 → 扫描放行（不拒启）。
+    let only_broken = vec![("/v1/api".to_string(), broken.clone())];
+    assert!(
+        scan_reserved_tool_names(&only_broken).is_ok(),
+        "生成缺陷不得升级为整机拒启（维持请求期 -32603 既有行为）"
+    );
+    // 含 oj_ 前缀碰撞的表（模块名 oj）→ 拒启，报错点名保留前缀。
+    let colliding = mk(&[("/v1/api/oj/search", "get")]);
+    let tables = vec![("/v1/api".to_string(), colliding)];
+    let err = scan_reserved_tool_names(&tables).unwrap_err();
+    assert!(err.contains("oj_"), "{err}");
+    // 健康表 → 通过。
+    let healthy = mk(&[("/v1/api/user/account", "get")]);
+    assert!(scan_reserved_tool_names(&[("/v1/api".to_string(), healthy)]).is_ok());
+}

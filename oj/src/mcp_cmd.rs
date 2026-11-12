@@ -130,9 +130,11 @@ function callMeta(name, args) {
       return { isError: true, content: [{ type: "text", text: "params.arguments.query must be a string" }] };
     }
     const started = Date.now();
-    const result = searchTools(args.query, args.group == null ? null : args.group, args.limit);
+    // 非字符串 group 与 serve 同口径：忽略过滤（serve 侧 as_str → None）。
+    const grp = typeof args.group === "string" ? args.group : null;
+    const result = searchTools(args.query, grp, args.limit);
     console.error("mcp search: query=" + JSON.stringify(args.query) +
-      " group=" + (args.group == null ? "None" : JSON.stringify(args.group)) +
+      " group=" + (grp == null ? "None" : JSON.stringify(grp)) +
       " limit=" + (args.limit == null ? 10 : args.limit) +
       " returned=" + result.matches.length +
       " zero=" + (result.matches.length === 0) +
@@ -636,6 +638,8 @@ mod tests {
         }
         // 本地检索函数在场（与 Rust search_tools 同钉共享向量语义）
         assert!(js.contains("function searchTools"), "{js}");
+        // group 类型守卫（评审收口）：非字符串 group 与 serve「忽略过滤」同口径
+        assert!(js.contains("typeof args.group === \"string\""), "{js}");
         // 命中率日志（stderr，stdout 纯净纪律不破）
         assert!(js.contains("mcp search:"), "{js}");
         assert!(js.contains("console.error"), "{js}");

@@ -872,6 +872,36 @@ pub(crate) fn static_opts_of(
     ))
 }
 
+/// MCP `oj_` 保留名扫描（spec 2026-11-12）：逐挂载 generate → spec_to_tools →
+/// check_reserved_names；**生成/spec 缺陷不升级为拒启**——warn 留痕并跳过该挂载
+/// （其 /mcp 请求期 -32603 的既有行为不变，REST 不受影响）；只有「生成成功且
+/// 净化名撞 `oj_` 前缀」才拒启（fail-fast 意图收窄到保留名本身）。
+fn scan_reserved_tool_names(tables: &[(String, routes::RouteTable)]) -> Result<(), String> {
+    for (prefix, table) in tables {
+        let spec = match serve::openapi::generate(table, prefix) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "warn: mcp reserved-name scan skipped for mount {prefix}: \
+                     catalog generation failed ({e})——该挂载 /mcp 维持请求期报错，与既有行为一致"
+                );
+                continue;
+            }
+        };
+        let tools = match serve::mcp::spec_to_tools(&spec) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!(
+                    "warn: mcp reserved-name scan skipped for mount {prefix}: spec_to_tools failed ({e})"
+                );
+                continue;
+            }
+        };
+        serve::mcp::check_reserved_names(&tools)?;
+    }
+    Ok(())
+}
+
 fn validate_html_meta_handler(
     cfg: &Config,
     tables: &[(String, routes::RouteTable)],
@@ -2432,12 +2462,10 @@ impl App {
         // MCP `oj_` 保留名 fail-fast（spec 2026-11-12 L1/L2 基座）：每个挂载的
         // 净化后 tool 名撞元工具前缀（oj_search_tools/oj_list_groups）→ 拒启，
         // 报错点名肇事 route。覆盖所有 mount；dev 热重载新增 oj_* 不在此列（已知限制）。
+        // 评审 Important 收口：catalog 生成失败的挂载**不扩大爆炸半径**（v0.1.134
+        // 前这类部署 REST 照常、仅 /mcp 请求期 -32603）——扫描只升级保留名碰撞。
         if cfg.server.mcp.as_ref().is_some_and(|m| m.enabled) {
-            for (prefix, table) in &tables {
-                let spec = serve::openapi::generate(table, prefix)?;
-                let tools = serve::mcp::spec_to_tools(&spec)?;
-                serve::mcp::check_reserved_names(&tools)?;
-            }
+            scan_reserved_tool_names(&tables)?;
         }
         // server.cors（v0.1.35）：credentials 需显式 origins——否则 tower-http 运行期
         // panic（Any 源 + credentials 不被允许）。装配期 fail-fast 比请求期崩溃更友好。

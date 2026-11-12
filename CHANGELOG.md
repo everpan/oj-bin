@@ -26,7 +26,9 @@ smart-router/warden 业界调研基座）。
   （flat/grouped/routed，serde lowercase）+ `oj mcp --expose` 覆盖；启动装配与
   `oj mcp` 双路扫描——业务 tool 净化名撞 `oj_` 前缀**启动即拒**（潜在破坏性：
   既有撞名部署将从「静默可跑」变「fail-fast」，报错列 sanitized name +
-  operationId + method + oa_path 便于改名）。
+  operationId + method + oa_path 便于改名）。**爆炸半径收窄（评审收口）**：
+  扫描只升级保留名碰撞——catalog 生成失败的挂载不拒启（warn 留痕，该挂载
+  /mcp 维持请求期 -32603 的既有行为，REST 不受影响）。
 - **feat（L1 grouped）**：`tools/list` 在 `_meta["com.only-js.groups"]` 扩展位
   带分组面（`[{name, tool_count}]` 首次出现序；**不在 result 顶层加键**——严格
   客户端 FAIL_ON_UNKNOWN 安全；groups 与 tools 同一**展示裁剪后**集合，分组信息

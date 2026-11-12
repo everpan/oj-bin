@@ -166,7 +166,7 @@ pub fn build_groups(tools: &[&McpTool]) -> serde_json::Value {
 /// L2 检索日志行（用户追加需求：命中率分析 + 后续优化依据）——纯函数钉格式。
 /// 字段：query/group（Debug 引号串，空格安全）、limit、returned（钳后返回数）、
 /// zero（returned==0，命中率分母分子离线可算）、elapsed_ms（检索耗时，全量扫描
-/// 成本监控）。limit>=1 时 zero 精确等价「无命中」。
+/// 成本监控）。search_tools 下限钳 1 后 zero 精确等价「无命中」。
 pub fn search_log_line(
     query: &str,
     group: Option<&str>,
@@ -185,7 +185,8 @@ pub fn search_log_line(
 /// 都返回 `{matches: [...]}`（防探测），且检索与 tools/list 用同一展示集合
 /// （search 不放大暴露面）。固定全量扫描后排序（score desc, name asc），不提前
 /// 退出。匹配为大小写不敏感子串、可叠加：name=2 / description=1 / group(tags[0])=1；
-/// `group` 参数 = tags[0] **精确**过滤；limit > 50 钳 50。match 项携带
+/// `group` 参数 = tags[0] **精确**过滤；limit 钳 1..=50（0 视为 1——与线路 A
+/// JS shim 同口径，防「limit=0 返回空」制造命中率假零信号）。match 项携带
 /// name/description/inputSchema/group（无 tag 缺席）/annotations（透传，无则缺席）。
 pub fn search_tools(
     tools: &[&McpTool],
@@ -194,7 +195,8 @@ pub fn search_tools(
     limit: usize,
 ) -> serde_json::Value {
     let q = query.to_lowercase();
-    let limit = limit.min(50);
+    // 评审收口：下限钳 1（两线一致）——limit=0 语义无意义且 zero= 日志信号被污染。
+    let limit = limit.clamp(1, 50);
     fn tag_of(t: &McpTool) -> Option<&str> {
         t.tool
             .get("tags")
@@ -779,10 +781,12 @@ async fn run_meta_tool(
                 ));
             };
             let group = args.and_then(|a| a.get("group")).and_then(|v| v.as_str());
+            // 负/零限界按 0 传给 search_tools（下限钳 1，两线一致）；
+            // 非整数 JSON 数（如 3.5）as_i64 得 None → 缺省 10（与 shim 同侧）。
             let limit = args
                 .and_then(|a| a.get("limit"))
-                .and_then(|v| v.as_u64())
-                .map(|n| n as usize)
+                .and_then(|v| v.as_i64())
+                .map(|n| n.clamp(0, 50) as usize)
                 .unwrap_or(10);
             // 命中率分析日志（用户追加需求）：每次检索记 query/命中数/耗时——
             // 零命中与耗时突增是后续排序/索引优化的信号源。
@@ -1190,7 +1194,7 @@ mod tests {
 
     // Given 检索日志行纯函数（命中率分析字段钉）
     // Then 字段齐：query/group（Debug 引号）、limit、returned、zero、elapsed_ms；
-    //      zero 精确反映 returned==0（limit>=1 即等价「无命中」）
+    //      zero 精确反映 returned==0（下限钳 1 即精确）
     #[test]
     fn search_log_line_format_pins_hit_rate_fields() {
         let line = search_log_line("user", Some("admin"), 10, 2, 3);

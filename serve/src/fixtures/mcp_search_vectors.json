@@ -56,6 +56,17 @@
       "expect": []
     },
     {
+      "name": "limit 0 钳 1（两线一致；防命中率日志假零信号）",
+      "tools": [
+        { "name": "user_account_get", "description": "查询用户账户", "tags": ["user"] },
+        { "name": "admin_user_delete", "description": "删除用户（含其账户数据）", "tags": ["admin"] }
+      ],
+      "query": "user",
+      "group": null,
+      "limit": 0,
+      "expect": ["user_account_get"]
+    },
+    {
       "name": "limit 钳 50（同分按 name asc）",
       "tools": [
         { "name": "bulk_0_get", "description": "bulk op 0", "tags": ["bulk"] },
