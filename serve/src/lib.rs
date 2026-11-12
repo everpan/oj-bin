@@ -230,6 +230,9 @@ pub struct McpConfig {
     /// 代操作遮蔽（spec 2026-11-11 P3）：config `server.mcp.act_mask_destructive`
     /// 原样透传进 Pipeline（admit 的 act_mask 检查读这里）。
     pub act_mask_destructive: bool,
+    /// tools/list 呈现模式（spec 2026-11-12 L1/L2）：Flat = 现行为零破坏；
+    /// Grouped = 附 `_meta` 模块分组；Routed = 只出元工具 + 调用面按需检索。
+    pub expose: crate::mcp::ExposeMode,
 }
 
 impl Default for Pipeline {

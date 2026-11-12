@@ -3417,6 +3417,7 @@ async fn generated_stdio_server_handshakes() {
         module_root: None,
         base: None,
         out: Some(out.display().to_string()),
+        expose: None,
     })
     .await
     .unwrap();

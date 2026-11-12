@@ -2872,6 +2872,7 @@ async fn spawn_dispatch_server(
             modules: None,
             allow_anonymous: true,
             act_mask_destructive: false,
+            expose: crate::mcp::ExposeMode::Flat,
             server_version: "test".into(),
         });
     }

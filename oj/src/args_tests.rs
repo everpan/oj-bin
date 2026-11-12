@@ -323,6 +323,34 @@ fn secret_subcommands_map_through() {
 }
 
 #[test]
+fn mcp_expose_flag_parses_three_modes() {
+    let cli =
+        |argv: &[&str]| Cli::try_parse_from(std::iter::once("oj").chain(argv.iter().copied()));
+    // 经 to_command 桥接断言（覆盖 clap 解析 + McpArgs 映射两段）。
+    let expose_of = |argv: &[&str]| match cmd(argv) {
+        Command::Mcp(a) => a.expose,
+        _ => panic!("expected mcp command"),
+    };
+    assert_eq!(expose_of(&["mcp"]), None, "缺省 None（跟随 config）");
+    assert_eq!(
+        expose_of(&["mcp", "--expose", "flat"]),
+        Some(serve::mcp::ExposeMode::Flat)
+    );
+    assert_eq!(
+        expose_of(&["mcp", "--expose", "grouped"]),
+        Some(serve::mcp::ExposeMode::Grouped)
+    );
+    assert_eq!(
+        expose_of(&["mcp", "--expose", "routed"]),
+        Some(serve::mcp::ExposeMode::Routed)
+    );
+    assert!(
+        cli(&["mcp", "--expose", "bogus"]).is_err(),
+        "非法值 clap 拒"
+    );
+}
+
+#[test]
 fn bad_usage_is_clap_error() {
     let cli =
         |argv: &[&str]| Cli::try_parse_from(std::iter::once("oj").chain(argv.iter().copied()));

@@ -791,6 +791,53 @@ fn mcp_and_rpc_sections_parse() {
 }
 
 #[test]
+fn mcp_expose_parses_three_modes_and_rejects_bad_value() {
+    // Given server.mcp.expose 三值 / 缺省 / 非法值
+    // When 解析
+    // Then flat/grouped/routed 各归其枚举；缺省 None（=flat 语义）；非法值 parse Err
+    let dir = std::env::temp_dir().join(format!("ojcfgexp-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (yaml_v, want) in [
+        ("flat", ExposeCfg::Flat),
+        ("grouped", ExposeCfg::Grouped),
+        ("routed", ExposeCfg::Routed),
+    ] {
+        std::fs::write(
+            dir.join("cfg.yaml"),
+            format!(
+                "mounts:\n  - {{ prefix: /, web: d }}\nserver:\n  mcp:\n    enabled: true\n    expose: {yaml_v}\n"
+            ),
+        )
+        .unwrap();
+        let c = load_from(&dir, Some("cfg.yaml")).unwrap();
+        assert_eq!(
+            c.server.mcp.expect("mcp 段").expose,
+            Some(want),
+            "expose: {yaml_v}"
+        );
+    }
+    // 缺省 = None
+    std::fs::write(
+        dir.join("cfg.yaml"),
+        "mounts:\n  - { prefix: /, web: d }\nserver:\n  mcp:\n    enabled: true\n",
+    )
+    .unwrap();
+    let c = load_from(&dir, Some("cfg.yaml")).unwrap();
+    assert_eq!(c.server.mcp.expect("mcp 段").expose, None);
+    // 非法值 fail-fast
+    std::fs::write(
+        dir.join("cfg.yaml"),
+        "mounts:\n  - { prefix: /, web: d }\nserver:\n  mcp:\n    enabled: true\n    expose: bogus\n",
+    )
+    .unwrap();
+    assert!(
+        load_from(&dir, Some("cfg.yaml")).is_err(),
+        "非法 expose 值必须 parse 失败"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn tenant_cfg_defaults_and_parse() {
     let c = load_from(std::path::Path::new("/nonexistent"), None).unwrap();
     assert!(!c.tenant.enable && c.tenant.header_key == "X-TENANT-ID");

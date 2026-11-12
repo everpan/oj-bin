@@ -142,6 +142,20 @@ pub struct McpArgs {
     pub base: Option<String>,
     /// 输出文件；缺省 `mcp/mcp-server.js`（相对当前目录）
     pub out: Option<String>,
+    /// 覆盖 `server.mcp.expose`（flat/grouped/routed）；缺省跟随 config
+    pub expose: Option<serve::mcp::ExposeMode>,
+}
+
+/// `--expose` 值解析（词表与 config serde 同：lowercase 三值）。
+fn parse_expose(s: &str) -> Result<serve::mcp::ExposeMode, String> {
+    match s {
+        "flat" => Ok(serve::mcp::ExposeMode::Flat),
+        "grouped" => Ok(serve::mcp::ExposeMode::Grouped),
+        "routed" => Ok(serve::mcp::ExposeMode::Routed),
+        other => Err(format!(
+            "invalid expose mode: {other} (expected flat|grouped|routed)"
+        )),
+    }
 }
 pub struct MigrateArgs {
     pub config: Option<String>,
@@ -596,6 +610,9 @@ enum Commands {
         /// 输出文件；缺省 `mcp/mcp-server.js`（相对当前目录）
         #[arg(short, long)]
         out: Option<String>,
+        /// tools/list 呈现模式：flat|grouped|routed（覆盖 config，缺省跟随 config）
+        #[arg(long = "expose", value_parser = parse_expose)]
+        expose: Option<serve::mcp::ExposeMode>,
     },
     /// phpinfo 风格诊断：版本/ABI/插件/后端注册/配置段（值不出）
     Info {
@@ -909,6 +926,7 @@ fn to_command(cli: Cli) -> Command {
             module_root,
             base,
             out,
+            expose,
         } => Command::Mcp(McpArgs {
             config,
             site,
@@ -916,6 +934,7 @@ fn to_command(cli: Cli) -> Command {
             module_root,
             base,
             out,
+            expose,
         }),
         Commands::Info { config } => Command::Info(InfoArgs { config }),
     }

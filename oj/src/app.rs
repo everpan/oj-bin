@@ -2361,6 +2361,12 @@ impl App {
                 allow_anonymous: mcp_cfg.allow_anonymous,
                 // R9 scopes 线：destructive 级换签掩码（运营选项，缺省关）。
                 act_mask_destructive: mcp_cfg.act_mask_destructive,
+                // L1/L2 呈现模式（spec 2026-11-12）：config 镜像枚举 → serve 枚举。
+                expose: match mcp_cfg.expose.unwrap_or_default() {
+                    config::ExposeCfg::Flat => serve::mcp::ExposeMode::Flat,
+                    config::ExposeCfg::Grouped => serve::mcp::ExposeMode::Grouped,
+                    config::ExposeCfg::Routed => serve::mcp::ExposeMode::Routed,
+                },
                 // serverInfo.version 与 `oj --version` 同一来源。
                 server_version: env!("CARGO_PKG_VERSION").to_string(),
             }),
@@ -2423,6 +2429,16 @@ impl App {
         // 路由——拼错 fail-fast（静默降级会让「已注入 meta」变成一句只在爬虫侧才暴露
         // 的谎话）。多 api 挂载：按 handler 前缀定表。
         validate_html_meta_handler(&cfg, &tables)?;
+        // MCP `oj_` 保留名 fail-fast（spec 2026-11-12 L1/L2 基座）：每个挂载的
+        // 净化后 tool 名撞元工具前缀（oj_search_tools/oj_list_groups）→ 拒启，
+        // 报错点名肇事 route。覆盖所有 mount；dev 热重载新增 oj_* 不在此列（已知限制）。
+        if cfg.server.mcp.as_ref().is_some_and(|m| m.enabled) {
+            for (prefix, table) in &tables {
+                let spec = serve::openapi::generate(table, prefix)?;
+                let tools = serve::mcp::spec_to_tools(&spec)?;
+                serve::mcp::check_reserved_names(&tools)?;
+            }
+        }
         // server.cors（v0.1.35）：credentials 需显式 origins——否则 tower-http 运行期
         // panic（Any 源 + credentials 不被允许）。装配期 fail-fast 比请求期崩溃更友好。
         if let Some(cors) = &cfg.server.cors

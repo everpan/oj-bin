@@ -291,6 +291,8 @@ pub async fn run(a: &McpArgs) -> Result<i32, String> {
     let tenant_header = (cfg.tenant.enable && !cfg.tenant.header_key.is_empty())
         .then(|| cfg.tenant.header_key.clone());
     let hash = spec_hash(&spec);
+    // `oj_` 保留名 fail-fast（spec 2026-11-12）：与 serve 装配同标准，产物不静默撞名。
+    serve::mcp::check_reserved_names(&tools)?;
     let js = render_server(&tools, &hash, &base, tenant_header.as_deref());
 
     let out_path: PathBuf = a

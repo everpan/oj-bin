@@ -149,6 +149,23 @@ pub struct McpCfg {
     /// （零行为变化；标注「推荐开启」的运营选项）。
     #[serde(default)]
     pub act_mask_destructive: bool,
+    /// tools/list 呈现模式（spec 2026-11-12，L1/L2）：缺省 None = flat（现行为
+    /// 零破坏）；grouped = 附 `_meta` 模块分组；routed = 只出 oj_search_tools /
+    /// oj_list_groups 元工具 + 调用面按需检索。镜像枚举（root crate 不依赖
+    /// serve），装配层转 serve::mcp::ExposeMode。
+    #[serde(default)]
+    pub expose: Option<ExposeCfg>,
+}
+
+/// `server.mcp.expose` 镜像枚举（root crate 不能依赖 serve；`#[serde(rename_all
+/// = "lowercase")]` 词表 flat/grouped/routed，非法值 parse 期 fail-fast）。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ExposeCfg {
+    #[default]
+    Flat,
+    Grouped,
+    Routed,
 }
 
 /// 裸 JSON-RPC 2.0 端点（spec 2026-10-30）：`server.rpc.enabled: true` → 挂

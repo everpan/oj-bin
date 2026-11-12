@@ -61,6 +61,67 @@ pub fn fnv1a64(bytes: &[u8]) -> u64 {
     h
 }
 
+/// 元工具保留名前缀（spec 2026-11-12）：业务 tool 名（**净化后**）以 `oj_` 开头
+/// 即与元工具撞名——serve 装配期与 `oj mcp` codegen 各跑一次 fail-fast。
+pub const META_PREFIX: &str = "oj_";
+
+/// `server.mcp.expose` 三态（L1 grouped / L2 routed，spec 2026-11-12）：
+/// 缺省 Flat = 现行为零破坏；serde lowercase 与 config 词表一致。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExposeMode {
+    #[default]
+    Flat,
+    Grouped,
+    Routed,
+}
+
+/// 装配期 fail-fast：业务 tool 名（净化后）占用 `oj_` 保留前缀 → Err（点名肇事
+/// 净化后名 + operationId + 路径，报错可定位到 route）。
+pub fn check_reserved_names(tools: &[McpTool]) -> Result<(), String> {
+    for t in tools {
+        if t.name.starts_with(META_PREFIX) {
+            return Err(format!(
+                "MCP tool name `{}` (operationId `{}`, {} {}) uses reserved prefix \
+                 `{META_PREFIX}` (oj_search_tools / oj_list_groups) — rename the route",
+                t.name, t.dispatch.operation_id, t.dispatch.method, t.dispatch.oa_path
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 常驻元工具定义（routed 模式 tools/list 全集；flat/grouped 的 call 面也可 call）。
+/// 两工具 annotations 恒 readOnlyHint + idempotentHint（客户端审批门控载体）。
+pub fn meta_tool_defs() -> Vec<Value> {
+    vec![
+        json!({
+            "name": "oj_search_tools",
+            "description": "Search the tool catalog by keyword (case-insensitive substring \
+                over name/description/group). Returns top matches with complete inputSchema \
+                and annotations — call the returned name directly via tools/call. \
+                Empty matches means no visible match (same shape as unauthorized).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "keyword to match" },
+                    "group": { "type": "string", "description": "optional exact module/group filter" },
+                    "limit": { "type": "integer", "description": "max matches, default 10, clamped to 50" }
+                },
+                "required": ["query"]
+            },
+            "annotations": { "readOnlyHint": true, "idempotentHint": true }
+        }),
+        json!({
+            "name": "oj_list_groups",
+            "description": "List module groups of the tool catalog with per-group tool counts \
+                (same group face as grouped mode's _meta).",
+            "inputSchema": { "type": "object", "properties": {} },
+            "annotations": { "readOnlyHint": true, "idempotentHint": true }
+        }),
+    ]
+}
+
 /// spec（`serve::openapi::generate` 产物）→ MCP tool 列表。
 ///
 /// 拼装规则（spec「共享核心」节，逐字）：
@@ -534,5 +595,38 @@ mod tests {
         let s = spec(&[("/a", "get", o)]);
         let tools = spec_to_tools(&s).unwrap();
         assert_eq!(tools[0].tool["tags"][0], "user");
+    }
+
+    // ---------- expose 三态（L1/L2 基座，2026-11-12 spec） ----------
+
+    // Given 无 oj_ 前缀工具 / 净化后与元工具撞名的 operationId
+    // When check_reserved_names
+    // Then 前者 Ok；后者 Err 且文案含净化后名与原始 operationId
+    #[test]
+    fn reserved_prefix_rejects_sanitized_collisions() {
+        let ok = spec(&[("/a", "get", op("user_list", json!({})))]);
+        assert!(check_reserved_names(&spec_to_tools(&ok).unwrap()).is_ok());
+        // "oj.search-tools" 净化后 = "oj_search_tools"，与元工具撞名
+        let bad = spec(&[("/a", "get", op("oj.search-tools", json!({})))]);
+        let err = check_reserved_names(&spec_to_tools(&bad).unwrap()).unwrap_err();
+        assert!(
+            err.contains("oj_search_tools") && err.contains("oj.search-tools"),
+            "{err}"
+        );
+    }
+
+    // Given meta_tool_defs
+    // Then 恰两个、名/annotations 逐字、inputSchema 在场
+    #[test]
+    fn meta_tool_defs_shape() {
+        let defs = meta_tool_defs();
+        assert_eq!(defs.len(), 2);
+        let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["oj_search_tools", "oj_list_groups"]);
+        for d in &defs {
+            assert_eq!(d["annotations"]["readOnlyHint"], true);
+            assert_eq!(d["annotations"]["idempotentHint"], true);
+            assert!(d.get("inputSchema").is_some(), "MCP tool 必需键");
+        }
     }
 }
