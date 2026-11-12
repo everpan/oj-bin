@@ -91,9 +91,14 @@ fn is_json_content_type(headers: &HeaderMap) -> bool {
         })
 }
 
+/// /mcp 与 /rpc 共用响应漏斗：统一 no-store（tools/list 按凭据裁剪可见集，
+/// 中介缓存会把甲的可见集回给乙——评审 minor 收口）。
 fn json_rpc_response(v: &Value) -> Response {
     (
-        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        [
+            (axum::http::header::CONTENT_TYPE, "application/json"),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
         v.to_string(),
     )
         .into_response()
@@ -1112,6 +1117,19 @@ mod tests {
                 Value::Null,
             ),
         ]
+    }
+
+    // Given /mcp 与 /rpc 共用响应漏斗 json_rpc_response
+    // Then 响应带 cache-control: no-store（评审 minor：tools/list 按凭据裁剪，
+    //      中介缓存会把甲的可见集回给乙——no-store 全响应统一加）
+    #[test]
+    fn json_rpc_response_carries_no_store() {
+        let resp = json_rpc_response(&json!({ "jsonrpc": "2.0", "id": 1, "result": {} }));
+        let cc = resp
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok());
+        assert_eq!(cc, Some("no-store"), "{:?}", resp.headers());
     }
 
     // Given 共享向量文件（Rust 与 oj mcp 模板内 JS shim 双实现同钉）
