@@ -2046,6 +2046,13 @@ export default {
 - **二级嵌套 503**：已在内部分发池上运行的 handler（即 `bridge.call` 的目标）
   再 `bridge.call` → 目标侧 503 `nested bridge.call is not supported`。
   编排链请压扁为深度 1：代理一次 `bridge.call` 直达最终端点。
+- **内部池禁 loopback fetch**：已在内部分发池上运行的 handler（dispatch
+  目标）`fetch` loopback 地址（`localhost` / `127.*` / `::1` / `0.0.0.0`）
+  在发真实请求前即被拒（TypeError 点名
+  `fetch to loopback is not supported on the internal dispatch pool (use bridge.call for in-process endpoints)`）——否则外层公共槽等内部池 handler、内部 handler 又
+  占公共槽，与公共池 fetch 回环死锁同构重现。runtime 不知自身监听地址，故
+  loopback 一律拦（其他本地端口服务同受此限）；同进程端点请用 `bridge.call`，
+  出进程转发走对外地址。
 - **非流式**：响应体整体缓冲（上限 64 MiB、缓冲等待 30s），SSE / 长下载类
   端点不适合经它转发（超限/超时收敛 502
   `dispatch response is streamed or exceeds the body cap`）。
@@ -4267,7 +4274,9 @@ REST 三面同规则，服务端单点判定——客户端侧不判权限）：
 **svc 凭据与 jti 吊销**：`claims.svc` 存在的凭据逐请求查 `oj_svc_token` 表核销
 （30s TTL 正缓存 + miss 穿透 v0.1.132、2s 负缓存 v0.1.133——吊销/宽限移出后最长 30s
 全网失效；**新签发/轮换的 jti 即时可过门**，miss 穿透重查；穿透仍 miss 的
-伪造/未知 jti 记 2s 负缓存，窗内不打库直接 fail-closed——探测不放大 DB 查询；
+伪造/未知 jti 开**全局 2s 负缓存窗**（所有未知 jti 共享：窗内一律不打库直接
+fail-closed，整窗至多 1 次真查——探测量与 DB 查询解耦；shortcut 不变：窗内
+新签发 jti 最长拖 2s 才可见）；
 查库失败/无行 fail-closed 恒拒）。行有效判定（v0.1.132）：无 `status`（存量行）/
 `active` 恒有效；`superseded` 仅在 `grace_until`（epoch 秒）未过时有效——宽限
 过期**自动移出有效集**（= 吊销，40311 同路径，无需删行）。运营走 admin 端点：
@@ -4286,16 +4295,17 @@ CRUD + CSV）、`obo-audit`（换签审计分页 + CSV）。`svc` 的 scopes **�
 
 | 端点 | 认证 | 行为 |
 |---|---|---|
-| `POST /v1/api/system/service-token/rotate` | 该 name **active** 的 svc bearer（守卫验签 + jti 门 + claims.svc/jti） | 旧行置 `superseded` + **24h 宽限**（宽限内旧 bearer 在途仍放行，过期自动 40311）→ 同 name/scopes 签新 token（新 jti，exp 重新计 90d）落库 → 返回 `{token, jti, expires_at}`。**幂等护栏**：宽限内的旧 bearer 再 rotate → 409；**并发栅栏**：两个并发 rotate 持同一 active bearer 时，条件 UPDATE（仅 active/存量 NULL 行可翻转，按影响行数判胜负）经行锁串行化——后到者命中 0 行 → 同一 409，不产生两行 active |
+| `POST /v1/api/system/service-token/rotate` | 该 name **active** 的 svc bearer（守卫验签 + jti 门 + claims.svc/jti） | 旧行置 `superseded` + **24h 宽限**（宽限内旧 bearer 在途仍放行，过期自动 40311）→ 同 name/scopes 签新 token（新 jti，exp 重新计 90d）落库 → 返回 `{token, jti, expires_at}`。**幂等护栏**：宽限内的旧 bearer 再 rotate → 409；**并发栅栏**：两个并发 rotate 持同一 active bearer 时，条件 UPDATE（仅 active/存量 NULL 行可翻转，按影响行数判胜负）经行锁串行化——后到者命中 0 行 → 同一 409，不产生两行 active；翻转 + 插入 **同事务**（`db.tx`）——insert 失败整事务回滚，旧 bearer 仍 active，宽限窗内可重试恢复（瞬态故障不卡死账号） |
 | `GET /v1/api/system/service-token/current` | 该 name 有效（active 或宽限内）的 svc bearer | 返回该 name 最新 active bearer `{token, jti, expires_at, scopes}`——消费方**跨重启恢复**最新令牌，避免重新人工配置 |
 
 两端点 **scopes 豁免**（read 档 bot 也必须能自轮换——强制 write 档反而是提权
 面；同 `/auth/obo` 先例），但 **jti 门照常**：吊销/宽限移出的旧 bearer 换不动。
 可见性语义：新签发/轮换的 jti **即时**可过门（SvcGate miss 穿透重查，v0.1.132——
 否则轮换后新 bearer 要等满 30s 缓存 TTL，"无感知续期"不成立）；吊销与宽限
-移出仍 ≤30s 全网生效；穿透仍 miss 的伪造/未知 jti 记 **2s 负缓存**（窗内直接
-fail-closed 不打库，探测不放大 DB 查询；shortcut：窗内新签发 jti 最长拖 2s 才
-可见——128bit 随机 jti 先探后签的概率可忽略）；查库失败恒 fail-closed 拒。
+移出仍 ≤30s 全网生效；穿透仍 miss 的伪造/未知 jti 开**全局 2s 负缓存窗**
+（所有未知 jti 共享，窗内一律不打库直接 fail-closed，整窗至多 1 次真查——
+探测量与 DB 查询解耦；shortcut：窗内新签发 jti 最长拖 2s 才可见——128bit
+随机 jti 先探后签的概率可忽略）；查库失败恒 fail-closed 拒。
 消费接法（惰性自愈轮换）：启动时 `GET current` 载入内存 → 临近 `expires_at`
 或收到 40311 时 `POST rotate` 换新回写。参考实现
 `sample/src/system/service-token/`（rotate/current）+ 集成测试

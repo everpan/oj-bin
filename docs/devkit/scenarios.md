@@ -4953,6 +4953,7 @@ export default {
 | 坑 | 解 |
 |---|---|
 | 目标里再 `bridge.call` | 深度限 1：dispatch 目标再 call → 503 `nested bridge.call is not supported`。聚合编排压扁成「代理一次 call 直达最终端点」，勿 A→B→C 链式 |
+| 目标里 `fetch` loopback 被拒（TypeError 点名 `use bridge.call`） | 预期护栏：内部池 handler 回环本进程会以「外层公共槽等内部池、内部又占公共槽」同构死锁——runtime 不知自身监听地址，故 `localhost`/`127.*`/`::1`/`0.0.0.0` 一律拦（其他本地端口服务同受限）；同进程端点一律 `bridge.call`，出进程走对外地址 |
 | 想转发 SSE/大下载 | `bridge.call` 体整体缓冲（64 MiB / 30s，超限 502）——流式端点走 `fetch` 出进程或 blob 中转 |
 | `oj test` 里测代理 handler 抛 `dispatch not available` | 不会——`oj test` 经 `App::from_config` 同样装配 dispatch hook，`bridge.call` **真派发**（真实管线、真实副作用，与 `client.*` 同哲学）。当集成腿用、测试数据自理；裸嵌入式（不经 App）才抛该错 |
 | 大 body（>几 MB）转发 | body 经 base64 过 op 边界有约 4/3 内存放大——超大上报走 `fetch` 出进程或先落 blob 再传 key |
