@@ -5015,3 +5015,56 @@ status 且**永不回显明文**。
 | read 档 bot 能不能自轮换 | 能——两端点 scopes 豁免（强制 write 档反而提权）；jti 门照常，吊销的 bearer 换不动 |
 | 新签/轮换后立刻用新 bearer 40311 | 不该发生——SvcGate miss 穿透重查，新 jti 即时可见（v0.1.132）；真遇到先查行是否落库、jti 是否抄错 |
 | 想服务端到点自动预签（rotates_at/rotation_policy） | R6 未做（消费方惰性 rotate 已覆盖）；「永不过期」另立 R 项 |
+
+## 场景 78：工具上百后的 MCP 折叠与检索——expose 三态（v0.1.134）
+
+> 何时抄我：`tools/list` 动辄几百个工具，agent 上下文被签名淹没、人也找不到
+> 模块；想按解决方案模块分组，或让 client 走「检索→直呼」两步流。配置一行
+> `server.mcp.expose`（`oj mcp --expose` 对线路 A 同义覆盖）；权威语义在
+> `api-manual.md` §14「工具分组与检索路由」。
+
+```yaml
+server:
+  mcp:
+    enabled: true
+    expose: grouped     # flat（缺省，零变化）| grouped（_meta 分组面）| routed（检索流）
+```
+
+grouped——client 列表面折叠（分组面与 tools 同集，被 scopes/act_mask 裁掉的
+工具不进组）：
+
+```json
+{"tools": [ ...全量... ],
+ "_meta": { "com.only-js.groups": [{ "name": "user", "tool_count": 9 }, ...] }}
+```
+
+routed——list 只回两个元工具，agent 两步走（检索发现 → 直呼；调用面不变，
+list 之外的 name 照呼）：
+
+```bash
+# 1) 检索（大小写不敏感子串：name 2 分 / description 1 / group 1，score desc+name asc）
+curl -s http://localhost:9778/v1/api/mcp -H 'content-type: application/json' \
+  -H 'accept: application/json' -d \
+  '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"oj_search_tools","arguments":{"query":"account","limit":5}}}'
+# → result.structuredContent.matches[]：name/description/inputSchema/group/annotations 齐备
+# 2) 直呼返回的 name（与 flat 完全相同的 arguments 形状）
+curl -s http://localhost:9778/v1/api/mcp -H 'content-type: application/json' \
+  -H 'accept: application/json' -d \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"user_account_get","arguments":{"query":{"id":"1"}}}}'
+# 分组枚举：oj_list_groups（分组面与 grouped 模式 _meta 同形）
+```
+
+验证口径：flat 回归（缺省 config 响应无 `_meta` 键、tools 全量）→ grouped
+（`_meta.com.only-js.groups` 含各模块、`tool_count` 与 tools 同集一致）→
+routed（list 恰好 `oj_search_tools`/`oj_list_groups`；search 的 match 带
+`inputSchema`；list 之外的业务 name 直呼成功；未知 `oj_` 名归 -32601）→
+`modules` 白名单落空时 routed list 仍回两元工具、search 空数组（fail-closed
+不回落）。
+
+| 坑 | 解 |
+|---|---|
+| client 报「list 只有 2 个工具」 | routed 是设计——spec 允许 call 名不在 list 内（warden/Codex 先例）；先 `oj_search_tools` 再直呼。只认 list 白名单的 client 用 `grouped`/`flat`（调用面三模式一致） |
+| search 返回空数组但工具明明存在 | 大概率被 scopes/act_mask 裁了（检索与 list 同一**展示裁剪后**集合，无权≡不存在同形状防探测）——拿被裁 name 直呼会得 403 而非 -32601；换高档位 token 再查 |
+| 检索效果差（查不到想要的） | 子串非语义：搜模块名/动词/路径片段；`group` 参数是精确过滤；`limit` 缺省 10 钳 50。命中率看 serve 日志 `mcp search: … zero=… elapsed_ms=…`（线路 A 在产物 stderr） |
+| 业务 tool 名撞 `oj_` 前缀启动报错 | v0.1.134 保留前缀 fail-fast（装配与 `oj mcp` 双路扫描）——按报错里的 operationId/method/oa_path 改路由名 |
+| 线路 A 分组/检索可见被 scopes 裁的工具 | 已知分歧：静态快照无 per-request user，聚合全量（仅名称/计数级；执行仍由服务端 admit 拦） |

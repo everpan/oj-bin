@@ -16,6 +16,48 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.134（2026-11-13，未打标签）
+
+MCP 工具分组（L1）与检索路由（L2）落地——方案市场膨胀后的上下文压缩
+与按解决方案模块分组（设计稿 `docs/superpowers/specs/2026-11-12-mcp-tool-grouping-routing-design.md`，
+smart-router/warden 业界调研基座）。
+
+- **feat（MCP expose 三态 + `oj_` 保留名 fail-fast）**：`server.mcp.expose`
+  （flat/grouped/routed，serde lowercase）+ `oj mcp --expose` 覆盖；启动装配与
+  `oj mcp` 双路扫描——业务 tool 净化名撞 `oj_` 前缀**启动即拒**（潜在破坏性：
+  既有撞名部署将从「静默可跑」变「fail-fast」，报错列 sanitized name +
+  operationId + method + oa_path 便于改名）。
+- **feat（L1 grouped）**：`tools/list` 在 `_meta["com.only-js.groups"]` 扩展位
+  带分组面（`[{name, tool_count}]` 首次出现序；**不在 result 顶层加键**——严格
+  客户端 FAIL_ON_UNKNOWN 安全；groups 与 tools 同一**展示裁剪后**集合，分组信息
+  不放大暴露面；flat 响应字节不变）。
+- **feat（L2 routed）**：`tools/list` 只回两个元工具 `oj_search_tools` /
+  `oj_list_groups`（META 定义与 serve::mcp::meta_tool_defs 单一来源）；检索在
+  **展示裁剪后**集合上跑（无权≡不存在，命中/无命中/未授权**同形状**防探测——
+  口径：隐藏上下文占用，非工具存在性）；score=name 2/description 1/group 1
+  大小写不敏感子串，score desc + name asc，limit 缺省 10 钳 50，match 项带
+  name/description/inputSchema/group/annotations（destructiveHint 透传不丢）；
+  `oj_*` 在 tools_for **之前**短路（catalog 生成错误不得误报 -32601），未知
+  `oj_` 名归 -32601。**已知限制（客户端策略差异，spec 允许 call 名不在
+  list 内）**：只认 list 白名单的客户端在 routed 下看不到业务工具——
+  warden/Codex 先例，调用面业务直呼不变（e2e 钉）。
+- **feat（线路 A `oj mcp` 同形落地）**：模板 `EXPOSE/GROUPS/META` 注入，本地
+  `searchTools` 与 Rust `search_tools` **共享一致性向量**钉语义
+  （`serve/src/fixtures/mcp_search_vectors.json`，Rust include_str! + node stdio
+  向量腿双实现同钉）；callTool `oj_` 拦截先于 DISPATCH；元结果封装
+  content+structuredContent 与线路 B 同形状。**已知分歧**：线路 A 静态快照无
+  per-request user，分组/检索面聚合**全量** tools（act/scopes 仍在执行侧
+  admit 拦，仅分组统计预可见——名称/计数级）。
+- **feat（MCP search 命中率日志）**：每次检索记 INFO——
+  `mcp search: query=.. group=.. limit=.. returned=.. zero=.. elapsed_ms=..`
+  （serve tracing；线路 A JS shim 走 stderr 同字段）——零命中与耗时突增是
+  后续排序/索引优化信号源。
+- **feat（/mcp、/rpc 响应 cache-control: no-store）**：tools/list 按凭据裁剪，
+  防中介缓存把甲的可见集回给乙（评审 minor；两端点共用漏斗统一加）。
+- **test**：serve 检索单测 6 例（排名/分组过滤/limit 钳/annotations 透传/裁剪
+  集防泄漏/日志格式）+ 共享向量 6 例 + e2e 三模式闭环（flat 回归、grouped
+  _meta、routed 元工具/直呼/未知 oj_、fail-closed×routed、stdio 向量腿）。
+
 ## v0.1.133（2026-11-12，未打标签）
 
 R6 评审发现收口（外部 review 三条，详见 `docs/upstream-proposals.md` R6

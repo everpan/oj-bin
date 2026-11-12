@@ -4024,6 +4024,8 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | 动态 meta 每次 HTML 请求**多派发一次 JS** | `server.html_meta_handler`（v0.1.25）：每次送 HTML 都调一次该 handler（无缓存层）。高流量站点请让 handler 只读缓存/轻查询，并用返回的 `cache_control` 让中间层替你挡住重复请求 |
 | release 下 WS URL 含版本段（v0.2） | `…/news-0.1.0/ws`，与 dev 的 `…/news/ws` **不同源**；客户端发现 WS 地址时按环境拼（勿硬编码）。WS 路径不做 `_name_` → `{param}` 转换（`_id_/ws.ts` 是字面段）；新增/删除 `ws.ts` 需重启（dev 无文件监听）。WS 不在路由表与 `openapi.json` 内，唯一权威面是启动打印的 `ws: N mount(s)` 清单 |
 | `{base}/mcp`、线路 A 产物的已知边界（v0.1.110） | stateless 子集：无 session 恢复/sampling/roots；SSE 流式 handler（`json.stream`/`json.sse`）经 MCP 调用恒 isError「streaming endpoint」；tool 名 = 净化 operationId（`[^a-zA-Z0-9_-]`→`_`，>64 截断 + 散列后缀），契约任意深度 `$ref` → 生成失败（须内联）；线路 A 是文件型快照——路由变更须重跑 `oj mcp`，线路 B 则每次请求读活路由表 |
+| expose 三态的客户端策略（v0.1.134） | `routed` 下 `tools/list` 只回 `oj_search_tools`/`oj_list_groups` 两个元工具——**spec 允许 call 名不在 list 内**，但只认 list 白名单的客户端看不到业务工具（warden/Codex 先例；调用面业务直呼不变）。`grouped` 的分组面在 `_meta` 扩展位（反域名点分键），result 顶层**无**新键——严格客户端 `FAIL_ON_UNKNOWN` 安全 |
+| `oj_search_tools` 检索口径（v0.1.134） | 大小写不敏感**子串**匹配（非分词/语义检索）：score = name 2 / description 1 / group 1，score desc + name asc；limit 缺省 10 钳 50；检索与 tools/list 同一**展示裁剪后**集合——无权≡不存在同形状（防探测；隐藏上下文占用，不隐藏存在性：被裁 tool 直呼 403、未知名 -32601）。线路 A 快照面为全量 tools（无 per-request 裁剪，act/scopes 仍在执行侧拦） |
 | `db.tx` 每请求至多一个；嵌套报错 | 合并事务回调 |
 | `db.session` 缺省**关闭**（v0.1.95） | `db_session.enabled: false` 时该能力不存在——`db.session.begin()` 直接报错点名怎么开（兼容优先，不做隐式放行）。开启须过装配期 fail-loud：`allow` 四维不能全空、`max_sessions`/`max_per_owner` 非 0、`max_per_owner ≤ max_sessions`、`idle_timeout_secs` 非 0、`max_lifetime_secs ≥ idle_timeout_secs` |
 | `db.session` = 一个 id 锁**一个别名**的一条连接 | attach 后跨别名查询报 `attached to db 'x', not 'y' (detach first)`；换别名须先 detach。会话内**禁止**事务控制/会话状态 SQL（`BEGIN/COMMIT/ROLLBACK/SAVEPOINT/RELEASE/START/SET/USE/ATTACH/DETACH/PRAGMA`）——MySQL 的隐式提交会让 `rollback()` 变成假回滚，故一律拒绝而不是"尽力而为" |
@@ -4190,6 +4192,61 @@ oj 从 OpenAPI 链一键出 agent 接口，两条线路共享同一份 tool 定�
 | **B：serve 内建** | `server.mcp.enabled: true` → `{base}/mcp`（MCP streamable HTTP）；`server.rpc.enabled: true` → `{base}/rpc` | 服务在线、client 可直连 | **自动**——端点每次请求读活路由表（热更/reload 代际即时生效；dev 裸新增目录路由不进 RouteTable，与 HTTP 直访同口径） |
 | **A：离线 codegen** | `oj mcp` 生成零依赖 Node.js stdio server | 服务在别处 / 不给直连 / 要经 MCP client 配置分发 | 须**重跑 `oj mcp`**（文件型快照，头注释带 spec_hash 可比对） |
 
+### 运作方式：从路由表到一次工具调用
+
+单一来源：**没有独立的「MCP 层」**——tool 定义就是路由表的投影，链路为：
+
+```
+路由表（src/ 目录镜像或 dist manifests）
+  → serve::openapi::generate            # 与 oj openapi 同一份 spec
+  → serve::mcp::spec_to_tools           # spec → tool 数组（净化名 + 嵌套三键 inputSchema + tags）
+  → 线路 B：每请求现算                   # 热更/reload 即时生效
+     线路 A：oj mcp 时内嵌进 JS 快照     # 路由变更须重跑 oj mcp
+```
+
+**tool 定义怎么来**：每个路由一行 tool。`name` = 净化 operationId
+（`[^a-zA-Z0-9_-]`→`_`，>64 截断 + 散列后缀；v0.1.134 起 `oj_` 前缀保留——
+撞名启动 fail-fast）；`inputSchema` 恒为嵌套三键 `{path?, query?, body?}`
+（path 键内全必填；未声明契约的端点 description 标注
+`(no declared input contract — inspect source)`）；`tags[0]` = 模块名
+（分组/检索的 group 维度）；`annotations` 由动词派生（GET →
+`readOnlyHint`，DELETE → `destructiveHint`——agent 的确认链靠它生效）。
+
+**tools/list 的决策点**（线路 B `handle()`；线路 A 模板同逻辑）：
+
+```
+tools_for（openapi→spec_to_tools，modules 白名单 fail-closed 过滤）
+  → filter_tools_for_display（scopes 档位 + act_mask 只裁**可见性**）
+  → expose 三态分面：
+       flat    → { tools }
+       grouped → { tools, _meta["com.only-js.groups"] }   # 分组面同一裁剪后集合
+       routed  → { tools: [oj_search_tools, oj_list_groups] }
+```
+
+**tools/call 的执行链**（两线零语义漂移）：`oj_` 前缀**先**短路进元工具
+（不经 tools_for——catalog 生成错误不得误报 -32601）→ 业务名进
+`tools_for` 全集查找（**调用面不裁**，展示裁剪只影响 list/search）→
+raw pattern 填充（单段 `encodeURIComponent`；catch-all 逐段编码、跨段 `/`
+保留）→ normalize → 路由表 lookup（命中行必须即本 tool 的行，防
+catch-all 阴影穿越）→ **admit 单点**以 scopes 三档动词映射终审（被裁
+tool 直呼 403，未知名 -32601）→ handler 执行 → Capture 映射
+（`code==0` → content+structuredContent；`code!=0` → isError +
+`[code=<n>]` 冻结前缀；SSE → isError 不缓冲）。
+
+**元工具执行**（routed 模式）：`run_meta_tool` 内部重跑
+`tools_for` + 同一 `filter_tools_for_display`——**search/list/groups 三个
+面共享同一集合**：无权工具在三面都不存在（命中/无命中/未授权同形状，
+防探测；隐藏的是上下文占用，不是存在性）。检索为纯本地全量扫描
+（大小写不敏感子串；name 2 / description 1 / group 1 叠加；score desc +
+name asc；limit 缺省 10 钳 50），每次记 INFO 命中率日志
+（`mcp search: query=.. group=.. limit=.. returned=.. zero=.. elapsed_ms=..`
+——线路 A 模板走 stderr 同字段）。结果经统一封装
+`{content:[{type:"text",text:JSON}], structuredContent}`——两线同形状。
+
+**响应缓存**：`/mcp`、`/rpc` 全部响应（含 JSON-RPC error）统一
+`cache-control: no-store`——list 按凭据裁剪，防共享中介缓存把甲的
+可见集回给乙。
+
 ### 配置
 
 ```yaml
@@ -4201,6 +4258,8 @@ server:
     act_mask_destructive: true  # v0.1.130 代操作遮蔽（缺省 false；推荐开启）：
                                 # claims.act 存在的会话（obo 换签的机器人代员工）
                                 # 一律拒 delete 且 tools/list 隐藏 destructive tool
+    expose: flat           # v0.1.134 列表面三态：flat（缺省）/ grouped / routed，见下
+                          # 「工具分组与检索路由」。`oj mcp --expose` 覆盖 config 值
   rpc:
     enabled: true          # 挂 {base}/rpc（缺省 false）
     allow_anonymous: false # 与 mcp 同口径：enabled 且未装配 auth 插件时缺省拒启
@@ -4237,6 +4296,47 @@ path 参数键内恒必填（单段值 `encodeURIComponent`——含 `/` 会正�
 | 非 envelope（如 `json.raw`） | 原样 text content，无 structuredContent（raw 响应**豁免**信封检测——裸业务数据恰好带 code/msg/data 键也不误判）；非 2xx 信封体同样加前缀，非信封体原样 |
 | `json.stream`/`json.sse`（SSE） | `isError`「streaming endpoint, not supported via MCP」（不缓冲） |
 | 传输失败 / 超时（30s） | `isError` |
+
+### 工具分组与检索路由（expose 三态，v0.1.134）
+
+工具数量膨胀后（方案市场多模块安装），`tools/list` 全量枚举既吃 client 上下文
+又难找工具。`server.mcp.expose`（线路 A 同形：`oj mcp --expose`，CLI 覆盖
+config）给列表面三态：
+
+| 模式 | tools/list 形态 | 适用 |
+|---|---|---|
+| `flat`（缺省） | 全量 tools，零变化 | 工具少（几十个内） |
+| `grouped` | 全量 tools + `_meta["com.only-js.groups"]` 分组面 | 人浏览/按模块折叠 |
+| `routed` | 只回两个**元工具**（见下）；业务工具经检索发现后直呼 | 工具多、client 支持检索流 |
+
+- **grouped**：`_meta` 是 MCP 协议**扩展位**（反域名点分键），不是 result 顶层
+  新键——严格客户端（如 Jackson `FAIL_ON_UNKNOWN`）不炸；groups 为
+  `[{name, tool_count}]`（模块 tag 首现序），与 tools **同一展示裁剪后集合**
+  （scopes/act_mask 裁掉的工具不进组——分组信息不放大暴露面）。
+- **routed**：list 恰好两个元工具——
+  `oj_search_tools`（args：`query` 必填，`group`/`limit` 选填）与
+  `oj_list_groups`。检索语义：对**展示裁剪后**集合大小写不敏感子串匹配，
+  score = name 2 / description 1 / group 1 可叠加，score desc + name asc；
+  limit 缺省 10、上限 50；match 项带完整 `inputSchema`（直呼所需契约）+
+  `group` + `annotations`（destructiveHint 透传不丢）。返回
+  `content` + `structuredContent`（两线同形状）。**call 面不变**：list 之外的
+  业务 tool 名照呼（spec 允许 call 名不在 list 内——客户端策略差异，
+  warden/Codex 先例；e2e 钉）。
+- **防探测口径**：search 与 tools/list 跑**同一**裁剪后集合——无权/不存在/无命中
+  同形状（`matches: []`）。隐藏的是**上下文占用**，不是工具存在性：已知工具名
+  直呼被 scopes 裁 → 403（`[code=403] `），未知名 → -32601（存在性 oracle 是
+  有意保留的文档化策略）。
+- **`oj_` 保留前缀**：业务 tool 净化名撞 `oj_` 前缀 → 启动 fail-fast（装配与
+  `oj mcp` 双路扫描；报错列 sanitized name + operationId + method + oa_path）。
+- **命中率日志**：每次检索记 INFO
+  `mcp search: query=.. group=.. limit=.. returned=.. zero=.. elapsed_ms=..`
+  （线路 A 模板走 stderr 同字段）——零命中与耗时突增是后续排序/索引优化信号源。
+- **线路 A 已知分歧**：静态快照无 per-request user，分组/检索面聚合**全量**
+  tools（act/scopes 仍在执行侧拦，仅分组统计预可见——名称/计数级）；
+  `searchTools` 本地实现与 serve 侧**共享一致性向量**钉语义
+  （`serve/src/fixtures/mcp_search_vectors.json`）。
+- **缓存**：`/mcp`、`/rpc` 响应统一 `cache-control: no-store`（tools/list 按凭据
+  裁剪，防中介缓存把甲的可见集回给乙）。
 
 ### `{base}/rpc`：裸 JSON-RPC 2.0
 

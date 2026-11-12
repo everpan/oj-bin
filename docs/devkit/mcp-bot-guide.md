@@ -172,6 +172,14 @@ const r = await fetch(`${OJ_ORIGIN}/v1/api/mcp`, {
   （不是 -32601——调用面不裁）。
 - `tools/list` 按 token 的 scopes 裁剪展示面：read 档不见写 tool、act 会话
   不见 destructive tool——**名单因人而异，勿跨会话缓存**。
+- 工具上百后（多方案模块安装）：`server.mcp.expose`（v0.1.134）——`grouped`
+  让 list 在 `_meta.com.only-js.groups` 带模块分组面；`routed` 只回
+  `oj_search_tools`/`oj_list_groups` 两元工具，bot 走「`oj_search_tools`
+  检索（`{query, group?, limit?}`，子串匹配、match 带完整 inputSchema）→
+  直呼 name」两步流（spec 允许 call 名不在 list 内；调用面不变）。bot 侧
+  建议：固定高频工具直呼 + 低频走检索；空 matches = 无可见匹配（无权同
+  形状，直呼被裁工具得 403 不是 -32601）。详见 api-manual §14「工具分组
+  与检索路由」与 scenarios.md 场景 78。
 
 ## 7. 运维手册
 
