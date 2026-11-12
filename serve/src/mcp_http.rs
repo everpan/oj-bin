@@ -158,6 +158,24 @@ pub fn build_groups(tools: &[&McpTool]) -> serde_json::Value {
     serde_json::Value::Array(groups)
 }
 
+/// L2 检索日志行（用户追加需求：命中率分析 + 后续优化依据）——纯函数钉格式。
+/// 字段：query/group（Debug 引号串，空格安全）、limit、returned（钳后返回数）、
+/// zero（returned==0，命中率分母分子离线可算）、elapsed_ms（检索耗时，全量扫描
+/// 成本监控）。limit>=1 时 zero 精确等价「无命中」。
+pub fn search_log_line(
+    query: &str,
+    group: Option<&str>,
+    limit: usize,
+    returned: usize,
+    elapsed_ms: u128,
+) -> String {
+    format!(
+        "mcp search: query={query:?} group={group:?} limit={limit} \
+         returned={returned} zero={} elapsed_ms={elapsed_ms}",
+        returned == 0
+    )
+}
+
 /// L2 routed（spec 2026-11-12）：裁剪后集合上的**同形状**检索——命中/无权/不存在
 /// 都返回 `{matches: [...]}`（防探测），且检索与 tools/list 用同一展示集合
 /// （search 不放大暴露面）。固定全量扫描后排序（score desc, name asc），不提前
@@ -761,7 +779,21 @@ async fn run_meta_tool(
                 .and_then(|v| v.as_u64())
                 .map(|n| n as usize)
                 .unwrap_or(10);
-            Ok(search_tools(&shown, query, group, limit))
+            // 命中率分析日志（用户追加需求）：每次检索记 query/命中数/耗时——
+            // 零命中与耗时突增是后续排序/索引优化的信号源。
+            let started = std::time::Instant::now();
+            let out = search_tools(&shown, query, group, limit);
+            tracing::info!(
+                "{}",
+                search_log_line(
+                    query,
+                    group,
+                    limit,
+                    out["matches"].as_array().map_or(0, |a| a.len()),
+                    started.elapsed().as_millis(),
+                )
+            );
+            Ok(out)
         }
         "oj_list_groups" => Ok(json!({ "groups": build_groups(&shown) })),
         _ => Err(("-32601", format!("unknown tool: {name}"))),
@@ -1127,6 +1159,24 @@ mod tests {
                 .collect();
             assert_eq!(got, want, "向量 {} 不符", c["name"]);
         }
+    }
+
+    // Given 检索日志行纯函数（命中率分析字段钉）
+    // Then 字段齐：query/group（Debug 引号）、limit、returned、zero、elapsed_ms；
+    //      zero 精确反映 returned==0（limit>=1 即等价「无命中」）
+    #[test]
+    fn search_log_line_format_pins_hit_rate_fields() {
+        let line = search_log_line("user", Some("admin"), 10, 2, 3);
+        assert!(line.contains(r#"query="user""#), "{line}");
+        assert!(line.contains(r#"group=Some("admin")"#), "{line}");
+        for f in ["limit=10", "returned=2", "zero=false", "elapsed_ms=3"] {
+            assert!(line.contains(f), "缺 {f}: {line}");
+        }
+        assert!(line.starts_with("mcp search: "), "{line}");
+        let miss = search_log_line("zzz", None, 50, 0, 1);
+        assert!(miss.contains("group=None"), "{miss}");
+        assert!(miss.contains("zero=true"), "{miss}");
+        assert!(miss.contains("returned=0"), "{miss}");
     }
 
     // Given 混合 tool 集
