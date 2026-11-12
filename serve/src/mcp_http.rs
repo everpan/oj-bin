@@ -793,11 +793,20 @@ async fn run_meta_tool(
                     started.elapsed().as_millis(),
                 )
             );
-            Ok(out)
+            Ok(meta_result(out))
         }
-        "oj_list_groups" => Ok(json!({ "groups": build_groups(&shown) })),
+        "oj_list_groups" => Ok(meta_result(json!({ "groups": build_groups(&shown) }))),
         _ => Err(("-32601", format!("unknown tool: {name}"))),
     }
+}
+
+/// 元工具 call 结果封装——与 capture_to_result / 线路 A JS shim 同形状
+/// （content 文本载体 + structuredContent 机器载体）：e2e 钉两线一致。
+fn meta_result(v: serde_json::Value) -> serde_json::Value {
+    json!({
+        "content": [{ "type": "text", "text": serde_json::to_string(&v).unwrap_or_default() }],
+        "structuredContent": v,
+    })
 }
 
 /// 公共执行段（MCP 与 /rpc 共用，零语义漂移）：path 填充 → normalize → lookup →

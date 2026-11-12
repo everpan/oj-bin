@@ -3349,6 +3349,310 @@ async fn mcp_e2e_modules_whitelist_fail_closed() {
     assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 0, "{v}");
 }
 
+/// L1 grouped（spec 2026-11-12）：list 在 _meta 扩展位带 com.only-js.groups
+/// 分组面（与 tools 同集，user 模块在场）；flat 响应**无** _meta 键（零破坏钉）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_e2e_grouped_meta_groups() {
+    let _g = lock();
+    let (addr, _h, _t) = boot_inner(true, |c| {
+        c.server.mcp = Some(only_js::config::McpCfg {
+            enabled: true,
+            allow_anonymous: true,
+            expose: Some(only_js::config::ExposeCfg::Grouped),
+            ..Default::default()
+        });
+    })
+    .await
+    .unwrap();
+    let (s, v) = rpc_req(
+        addr,
+        "/v1/api/mcp",
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#,
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    let groups = v["result"]["_meta"]["com.only-js.groups"]
+        .as_array()
+        .unwrap_or_else(|| panic!("grouped list 缺 _meta 分组面：{v}"));
+    let user_g = groups
+        .iter()
+        .find(|g| g["name"] == "user")
+        .unwrap_or_else(|| panic!("分组面缺 user 模块：{v}"));
+    assert!(user_g["tool_count"].as_u64().unwrap_or(0) > 0, "{v}");
+    // tools 本体与 flat 同口径（非空、含业务 tool）。
+    let tools = v["result"]["tools"].as_array().expect("tools 数组：{v}");
+    assert!(
+        tools.iter().any(|t| t["name"].as_str().unwrap_or("").contains("user_account")),
+        "grouped 不得裁 tools 本体：{v}"
+    );
+    // flat 回归：缺省模式响应无 _meta 键。
+    let (addr, _h, _t) = boot_inner(true, |c| {
+        c.server.mcp = Some(only_js::config::McpCfg {
+            enabled: true,
+            allow_anonymous: true,
+            ..Default::default()
+        });
+    })
+    .await
+    .unwrap();
+    let (s, v) = rpc_req(
+        addr,
+        "/v1/api/mcp",
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#,
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    assert!(
+        v["result"].get("_meta").is_none(),
+        "flat 响应不得带 _meta：{v}"
+    );
+}
+
+/// L2 routed（spec 2026-11-12）：list 恰好两个元工具；search 返回带
+/// inputSchema 的 matches；list_groups 回分组面；**业务 tool 直呼照常**
+///（call 面不变钉——spec 允许 call 名不在 list 内）；未知 oj_ 名归 -32601。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_e2e_routed_meta_tools_and_call_face() {
+    let _g = lock();
+    let (addr, _h, _t) = boot_inner(true, |c| {
+        c.server.mcp = Some(only_js::config::McpCfg {
+            enabled: true,
+            allow_anonymous: true,
+            expose: Some(only_js::config::ExposeCfg::Routed),
+            ..Default::default()
+        });
+    })
+    .await
+    .unwrap();
+    let (s, v) = rpc_req(
+        addr,
+        "/v1/api/mcp",
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#,
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    let tools = v["result"]["tools"].as_array().expect("tools 数组：{v}");
+    let names: Vec<&str> = tools
+        .iter()
+        .map(|t| t["name"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(names, vec!["oj_search_tools", "oj_list_groups"], "{v}");
+    // search：matches 非空且各项带 inputSchema（直呼所需契约）。
+    let (s, v) = rpc_req(
+        addr,
+        "/v1/api/mcp",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"oj_search_tools","arguments":{"query":"user"}}}"#,
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    let matches = v["result"]["structuredContent"]["matches"]
+        .as_array()
+        .unwrap_or_else(|| panic!("search 无 matches：{v}"));
+    assert!(!matches.is_empty(), "{v}");
+    for m in matches {
+        assert!(m["inputSchema"].is_object(), "match 缺 inputSchema：{v}");
+        assert!(m["name"].as_str().unwrap_or("").contains("user"), "{v}");
+    }
+    // list_groups：分组面（routed 模式下 group 发现通道）。
+    let (s, v) = rpc_req(
+        addr,
+        "/v1/api/mcp",
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"oj_list_groups","arguments":{}}}"#,
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    assert!(
+        v["result"]["structuredContent"]["groups"]
+            .as_array()
+            .is_some_and(|g| g.iter().any(|g| g["name"] == "user")),
+        "{v}"
+    );
+    // call 面不变：list 之外的业务 tool 名直呼照常执行（无 auth，匿名档全量）。
+    let (s, v) = rpc_req(
+        addr,
+        "/v1/api/mcp",
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"user_account_get","arguments":{"query":{"id":"1"}}}}"#,
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    assert!(v["result"].get("isError").is_none(), "{v}");
+    assert!(v["result"]["structuredContent"].is_array(), "{v}");
+    // 未知 oj_ 名：-32601（不泄漏内部细节）。
+    let (s, v) = rpc_req(
+        addr,
+        "/v1/api/mcp",
+        r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"oj_nope","arguments":{}}}"#,
+    )
+    .await;
+    assert_eq!(s, 200);
+    assert_eq!(v["error"]["code"], -32601, "{v}");
+}
+
+/// R9 fail-closed × routed（spec 2026-11-12）：modules 白名单落空 → 业务集空，
+/// 但 list 面**仍回两个元工具**（检索/分组通道不随业务集消失）；search 空数组。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_e2e_modules_fail_closed_routed_still_lists_meta() {
+    let _g = lock();
+    let (addr, _h, _t) = boot_inner(true, |c| {
+        c.server.mcp = Some(only_js::config::McpCfg {
+            enabled: true,
+            allow_anonymous: true,
+            modules: Some(vec!["no_such_module".into()]),
+            expose: Some(only_js::config::ExposeCfg::Routed),
+            ..Default::default()
+        });
+    })
+    .await
+    .unwrap();
+    let (s, v) = rpc_req(
+        addr,
+        "/v1/api/mcp",
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#,
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    let tools = v["result"]["tools"].as_array().expect("tools 数组：{v}");
+    assert_eq!(tools.len(), 2, "routed 空业务集仍列元工具：{v}");
+    let (s, v) = rpc_req(
+        addr,
+        "/v1/api/mcp",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"oj_search_tools","arguments":{"query":"user"}}}"#,
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(
+        v["result"]["structuredContent"]["matches"],
+        serde_json::json!([]),
+        "{v}"
+    );
+}
+
+/// 线路 A stdio 向量腿（spec 2026-11-12）：`oj mcp` 产物（render_server，routed）
+/// 在 node 下执行共享向量——JS searchTools 与 Rust search_tools 命中名序逐例一致。
+/// node 不可用 → 诚实 skip（env 探测门，同 repo 惯例）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_stdio_vector_leg() {
+    let _g = lock();
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("node 不可用——stdio 向量腿诚实 skip");
+        return;
+    }
+    let v: serde_json::Value = serde_json::from_str(include_str!(
+        "../../serve/src/fixtures/mcp_search_vectors.json"
+    ))
+    .unwrap();
+    let dir = std::env::temp_dir().join(format!("oj-mcp-vec-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (i, c) in v["cases"].as_array().unwrap().iter().enumerate() {
+        let owned: Vec<serve::mcp::McpTool> = c["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| {
+                let name = t["name"].as_str().unwrap();
+                let mut tool = serde_json::json!({
+                    "name": name,
+                    "description": t["description"].clone(),
+                    "inputSchema": { "type": "object", "properties": {} },
+                });
+                if let Some(tags) = t.get("tags") {
+                    tool["tags"] = tags.clone();
+                }
+                serve::mcp::McpTool {
+                    name: name.into(),
+                    tool,
+                    dispatch: serve::mcp::ToolDispatch {
+                        operation_id: name.into(),
+                        method: "get".into(),
+                        oa_path: format!("/{name}"),
+                        catch_all: Vec::new(),
+                    },
+                }
+            })
+            .collect();
+        // routed 模式产物：callTool 的 oj_ 拦截在场（search 本地执行，不触网）。
+        let js = oj::mcp_cmd::render_server(
+            &owned,
+            "0123456789abcdef",
+            "/v1/api",
+            None,
+            serve::mcp::ExposeMode::Routed,
+            &serde_json::json!([]),
+        );
+        let p = dir.join(format!("mcp-{i}.js"));
+        std::fs::write(&p, js).unwrap();
+        let arguments = serde_json::json!({
+            "query": c["query"].clone(),
+            "group": c["group"].clone(),
+            "limit": c["limit"].as_u64().unwrap_or(10),
+        });
+        let sc = run_node_search(&p, &arguments).await;
+        let got: Vec<&str> = sc["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["name"].as_str().unwrap())
+            .collect();
+        let want: Vec<&str> = c["expect"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e.as_str().unwrap())
+            .collect();
+        assert_eq!(got, want, "stdio 向量 {} 不符（JS shim）", c["name"]);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// node 驱动 stdio 产物执行一次 oj_search_tools，回 structuredContent。
+/// OJ_BASE 指向死端口——search 纯本地不过网；有界等待防 CI 挂死。
+async fn run_node_search(js: &Path, arguments: &serde_json::Value) -> serde_json::Value {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    let req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": { "name": "oj_search_tools", "arguments": arguments },
+    });
+    let mut child = Command::new("node")
+        .arg(js)
+        .env("OJ_BASE", "http://127.0.0.1:9")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, "{req}").unwrap();
+    drop(stdin); // EOF：node 处理完请求即退出。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "node 退出码 {status}（req={req}）");
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("node stdio 向量腿超时（req={req}）");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        if v["id"] == 1 {
+            return v["result"]["structuredContent"].clone();
+        }
+    }
+    panic!("node 未回 search 响应：stdout={stdout}");
+}
+
 /// Given server.rpc.enabled=true When POST {base}/rpc（method=operationId）
 /// Then 裸 JSON-RPC result 直透 envelope data；业务错误为 error 对象（取业务 code）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
