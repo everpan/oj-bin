@@ -36,6 +36,9 @@ const SPEC_HASH = "__HASH__";
 const SERVER_NAME = "oj-mcp-__HASH8__";
 const TOOLS = __TOOLS_JSON__;
 const DISPATCH = __DISPATCH_JSON__;
+const EXPOSE = "__EXPOSE__";
+const GROUPS = __GROUPS_JSON__;
+const META = __META_JSON__;
 __TENANT_HEADER__
 
 const BASE_URL = process.env.OJ_BASE;
@@ -86,7 +89,66 @@ function buildQuery(args) {
   return s ? "?" + s : "";
 }
 
+// 本地检索（L2 routed，与 serve::mcp_http::search_tools 同钉共享向量语义）：
+// 大小写不敏感子串可叠加 name=2/description=1/group(tags[0])=1；score desc +
+// name asc；limit 缺省 10 钳 50；match 项同键集（group/annotations 无则缺席）。
+// 离线快照无展示裁剪概念——全集即展示集（线路 A 静态产物，act/scopes 在执行侧）。
+function searchTools(query, group, limit) {
+  const q = String(query).toLowerCase();
+  const lim = Math.min(limit == null || !Number.isFinite(+limit) ? 10 : Math.max(1, Math.trunc(+limit)), 50);
+  const scored = [];
+  for (const t of TOOLS) {
+    const tag = Array.isArray(t.tags) && t.tags.length ? String(t.tags[0]) : null;
+    if (group != null && tag !== String(group)) continue;
+    let score = 0;
+    if (String(t.name).toLowerCase().indexOf(q) >= 0) score += 2;
+    if (String(t.description || "").toLowerCase().indexOf(q) >= 0) score += 1;
+    if (tag != null && tag.toLowerCase().indexOf(q) >= 0) score += 1;
+    if (score > 0) scored.push([score, t, tag]);
+  }
+  scored.sort((a, b) => b[0] - a[0] || (a[1].name < b[1].name ? -1 : a[1].name > b[1].name ? 1 : 0));
+  const matches = [];
+  for (const m of scored.slice(0, lim)) {
+    const t = m[1];
+    const item = {
+      name: t.name,
+      description: t.description == null ? null : t.description,
+      inputSchema: t.inputSchema || { type: "object" },
+    };
+    if (m[2] != null) item.group = m[2];
+    if (t.annotations != null) item.annotations = t.annotations;
+    matches.push(item);
+  }
+  return { matches };
+}
+
+// 元工具执行（L2 routed）：命中日志与 serve search_log_line 同字段（命中率分析），
+// 诊断走 stderr 不破 stdout 纯净纪律。
+function callMeta(name, args) {
+  if (name === "oj_search_tools") {
+    if (!args || typeof args.query !== "string") {
+      return { isError: true, content: [{ type: "text", text: "params.arguments.query must be a string" }] };
+    }
+    const started = Date.now();
+    const result = searchTools(args.query, args.group == null ? null : args.group, args.limit);
+    console.error("mcp search: query=" + JSON.stringify(args.query) +
+      " group=" + (args.group == null ? "None" : JSON.stringify(args.group)) +
+      " limit=" + (args.limit == null ? 10 : args.limit) +
+      " returned=" + result.matches.length +
+      " zero=" + (result.matches.length === 0) +
+      " elapsed_ms=" + (Date.now() - started));
+    return { content: [{ type: "text", text: JSON.stringify(result) }], structuredContent: result };
+  }
+  if (name === "oj_list_groups") {
+    const result = { groups: GROUPS };
+    return { content: [{ type: "text", text: JSON.stringify(result) }], structuredContent: result };
+  }
+  return { isError: true, content: [{ type: "text", text: "unknown tool: " + name }] };
+}
+
 async function callTool(name, args) {
+  // oj_* 保留前缀在 DISPATCH 查找**之前**拦截（同 serve call_tool 短路序）。
+  if (typeof name === "string" && name.indexOf("oj_") === 0) return callMeta(name, args);
   const d = DISPATCH[name];
   if (!d) return { isError: true, content: [{ type: "text", text: "unknown tool: " + name }] };
   let path;
@@ -173,8 +235,17 @@ async function dispatch(msg) {
     }
     case "ping":
       return isNotify ? undefined : { jsonrpc: "2.0", id: msg.id, result: {} };
-    case "tools/list":
-      return isNotify ? undefined : { jsonrpc: "2.0", id: msg.id, result: { tools: TOOLS } };
+    case "tools/list": {
+      if (isNotify) return undefined;
+      // L1/L2 三模式列表面（spec 2026-11-12）：routed 只回元工具（spec 允许
+      // call 名不在 list 内，客户端策略差异）；grouped 在 _meta 扩展位带分组面
+      // （严格客户端 FAIL_ON_UNKNOWN 安全——不在 result 顶层加键）；flat 不变。
+      if (EXPOSE === "routed") return { jsonrpc: "2.0", id: msg.id, result: { tools: META } };
+      if (EXPOSE === "grouped") {
+        return { jsonrpc: "2.0", id: msg.id, result: { tools: TOOLS, _meta: { "com.only-js.groups": GROUPS } } };
+      }
+      return { jsonrpc: "2.0", id: msg.id, result: { tools: TOOLS } };
+    }
     case "tools/call": {
       const r = await callTool(msg.params && msg.params.name, msg.params && msg.params.arguments);
       return isNotify ? undefined : { jsonrpc: "2.0", id: msg.id, result: r };
@@ -203,13 +274,25 @@ rl.on("line", (line) => {
 console.error("oj mcp: " + SERVER_NAME + " ready (OJ_BASE=" + BASE_URL + ", " + TOOLS.length + " tools)");
 "#;
 
+/// ExposeMode → 模板内嵌小写串（词表与 config serde lowercase 同；不依赖 Debug）。
+fn expose_str(e: &serve::mcp::ExposeMode) -> &'static str {
+    match e {
+        serve::mcp::ExposeMode::Flat => "flat",
+        serve::mcp::ExposeMode::Grouped => "grouped",
+        serve::mcp::ExposeMode::Routed => "routed",
+    }
+}
+
 /// 渲染纯函数（不碰盘，便于单测）。`tenant_header`：config 声明的租户头名
-///（非密钥）；None = 不生成租户头分支。
+///（非密钥）；None = 不生成租户头分支。`groups`：L1 grouped 的 _meta 分组面
+///（`build_groups` 产物）；`expose`：三模式列表面（模板 EXPOSE 占位）。
 pub fn render_server(
     tools: &[serve::mcp::McpTool],
     spec_hash: &str,
     base: &str,
     tenant_header: Option<&str>,
+    expose: serve::mcp::ExposeMode,
+    groups: &Value,
 ) -> String {
     let tools_json =
         serde_json::to_string(&tools.iter().map(|t| t.tool.clone()).collect::<Vec<Value>>())
@@ -227,6 +310,9 @@ pub fn render_server(
         );
     }
     let dispatch_json = serde_json::to_string(&Value::Object(dispatch)).expect("dispatch 序列化");
+    // 元工具定义逐字注入（与 serve::mcp::meta_tool_defs 单一来源——模板内联不漂移）。
+    let meta_json = serde_json::to_string(&serve::mcp::meta_tool_defs()).expect("meta defs 序列化");
+    let groups_json = serde_json::to_string(groups).expect("groups 序列化");
     let tenant_js = match tenant_header {
         Some(h) => format!(
             "const TENANT_HEADER = {};",
@@ -241,6 +327,9 @@ pub fn render_server(
         .replace("__TENANT_HEADER__", &tenant_js)
         .replace("__HASH8__", spec_hash.get(..8).unwrap_or(spec_hash))
         .replace("__HASH__", spec_hash)
+        .replace("__EXPOSE__", expose_str(&expose))
+        .replace("__GROUPS_JSON__", &groups_json)
+        .replace("__META_JSON__", &meta_json)
         .replace("__TOOLS_JSON__", &tools_json)
         .replace("__DISPATCH_JSON__", &dispatch_json)
 }
@@ -293,7 +382,24 @@ pub async fn run(a: &McpArgs) -> Result<i32, String> {
     let hash = spec_hash(&spec);
     // `oj_` 保留名 fail-fast（spec 2026-11-12）：与 serve 装配同标准，产物不静默撞名。
     serve::mcp::check_reserved_names(&tools)?;
-    let js = render_server(&tools, &hash, &base, tenant_header.as_deref());
+    // L1/L2 模式决议（spec 2026-11-12）：CLI --expose 覆盖 config server.mcp.expose，
+    // 缺省 flat（零破坏）。分组面 = 全量 tools 聚合（线路 A 静态快照无展示裁剪）。
+    let expose = a.expose.unwrap_or(
+        match cfg.server.mcp.as_ref().and_then(|m| m.expose.as_ref()) {
+            Some(only_js::config::ExposeCfg::Grouped) => serve::mcp::ExposeMode::Grouped,
+            Some(only_js::config::ExposeCfg::Routed) => serve::mcp::ExposeMode::Routed,
+            _ => serve::mcp::ExposeMode::Flat,
+        },
+    );
+    let groups = serve::mcp_http::build_groups(&tools.iter().collect::<Vec<_>>());
+    let js = render_server(
+        &tools,
+        &hash,
+        &base,
+        tenant_header.as_deref(),
+        expose,
+        &groups,
+    );
 
     let out_path: PathBuf = a
         .out
@@ -306,9 +412,10 @@ pub async fn run(a: &McpArgs) -> Result<i32, String> {
     std::fs::write(&out_path, format!("{js}\n"))
         .map_err(|e| format!("write {}: {e}", out_path.display()))?;
     eprintln!(
-        "oj mcp: wrote {} ({} tools, spec_hash {hash})",
+        "oj mcp: wrote {} ({} tools, spec_hash {hash}, expose {})",
         out_path.display(),
-        tools.len()
+        tools.len(),
+        expose_str(&expose),
     );
     Ok(0)
 }
@@ -345,7 +452,14 @@ mod tests {
             tool("a_get", "/v1/api/a/{id}", vec![]),
             tool("b_get", "/v1/api/b/{*path}", vec!["path"]),
         ];
-        let js = render_server(&tools, "0123456789abcdef", "/v1/api", None);
+        let js = render_server(
+            &tools,
+            "0123456789abcdef",
+            "/v1/api",
+            None,
+            serve::mcp::ExposeMode::Flat,
+            &json!([]),
+        );
         assert!(
             js.contains(r#""a_get":{"method":"get","path":"/v1/api/a/{id}""#),
             "{js}"
@@ -372,6 +486,8 @@ mod tests {
             "0123456789abcdef",
             "/v1/api",
             None,
+            serve::mcp::ExposeMode::Flat,
+            &json!([]),
         );
         assert!(js.contains("console.error"), "{js}");
         assert!(!js.contains("console.log"), "{js}");
@@ -386,6 +502,8 @@ mod tests {
             "0123456789abcdef",
             "/v1/api",
             None,
+            serve::mcp::ExposeMode::Flat,
+            &json!([]),
         );
         assert!(js.contains("structuredContent"), "{js}");
         assert!(js.contains("isError"), "{js}");
@@ -401,6 +519,8 @@ mod tests {
             "0123456789abcdef",
             "/v1/api",
             None,
+            serve::mcp::ExposeMode::Flat,
+            &json!([]),
         );
         assert!(js.contains(r#"redirect: "manual""#), "{js}");
         assert!(js.contains("OJ_TENANT"), "{js}");
@@ -412,6 +532,8 @@ mod tests {
             "0123456789abcdef",
             "/v1/api",
             Some("x-tenant-id"),
+            serve::mcp::ExposeMode::Flat,
+            &json!([]),
         );
         assert!(
             js.contains(r#"const TENANT_HEADER = "x-tenant-id";"#),
@@ -443,6 +565,8 @@ mod tests {
             "0123456789abcdef",
             "/v1/api",
             None,
+            serve::mcp::ExposeMode::Flat,
+            &json!([]),
         );
         for m in [
             "\"initialize\"",
@@ -460,5 +584,71 @@ mod tests {
         ] {
             assert!(js.contains(m), "缺 {m}: {js}");
         }
+    }
+
+    // Given grouped 模式渲染
+    // Then EXPOSE 行内嵌 "grouped"、GROUPS 内嵌、list 分支带 com.only-js.groups _meta
+    #[test]
+    fn render_grouped_exposes_meta_groups() {
+        let js = render_server(
+            &[tool("a_get", "/a", vec![])],
+            "0123456789abcdef",
+            "/v1/api",
+            None,
+            serve::mcp::ExposeMode::Grouped,
+            &json!([{ "name": "user", "tool_count": 1 }]),
+        );
+        assert!(js.contains(r#"const EXPOSE = "grouped";"#), "{js}");
+        assert!(js.contains(r#""com.only-js.groups""#), "{js}");
+        assert!(js.contains("const GROUPS = "), "{js}");
+        // list 分支 grouped 面在场（flat 断言于既有用例钉字节不变）
+        assert!(js.contains("_meta"), "{js}");
+    }
+
+    // Given routed 模式渲染
+    // Then list 分支只回元工具 + callTool 的 oj_ 拦截先于 DISPATCH 查找 +
+    //      本地 searchTools 在场 + 命中率日志（stderr）
+    #[test]
+    fn render_routed_lists_only_meta_tools() {
+        let js = render_server(
+            &[tool("a_get", "/a", vec![])],
+            "0123456789abcdef",
+            "/v1/api",
+            None,
+            serve::mcp::ExposeMode::Routed,
+            &json!([]),
+        );
+        assert!(js.contains(r#"const EXPOSE = "routed";"#), "{js}");
+        // 两个元工具定义在场（与 serve::mcp::meta_tool_defs 逐字对照）
+        let defs = serve::mcp::meta_tool_defs();
+        for key in [
+            "\"oj_search_tools\"",
+            "\"oj_list_groups\"",
+            "\"readOnlyHint\"",
+            "limit",
+            "group",
+        ] {
+            assert!(js.contains(key), "缺 {key}: {js}");
+        }
+        for d in &defs {
+            let name = d["name"].as_str().unwrap();
+            assert!(js.contains(name), "meta 定义缺 {name}: {js}");
+        }
+        // 本地检索函数在场（与 Rust search_tools 同钉共享向量语义）
+        assert!(js.contains("function searchTools"), "{js}");
+        // 命中率日志（stderr，stdout 纯净纪律不破）
+        assert!(js.contains("mcp search:"), "{js}");
+        assert!(js.contains("console.error"), "{js}");
+        // oj_ 拦截先于 DISPATCH 查找（索引比较钉顺序）
+        let intercept = js
+            .find("indexOf(\"oj_\")")
+            .unwrap_or_else(|| panic!("缺 oj_ 拦截: {js}"));
+        let dispatch = js
+            .find("const d = DISPATCH[name]")
+            .unwrap_or_else(|| panic!("缺 DISPATCH 查找: {js}"));
+        assert!(
+            intercept < dispatch,
+            "oj_ 拦截必须先于 DISPATCH 查找: intercept={intercept} dispatch={dispatch}"
+        );
     }
 }
