@@ -16,7 +16,7 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
-## v0.1.134（2026-11-13，未打标签）
+## v0.1.134（2026-11-13，tag v0.1.134）
 
 MCP 工具分组（L1）与检索路由（L2）落地——方案市场膨胀后的上下文压缩
 与按解决方案模块分组（设计稿 `docs/superpowers/specs/2026-11-12-mcp-tool-grouping-routing-design.md`，
