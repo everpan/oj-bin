@@ -132,6 +132,32 @@ fn tools_for(st: &AppState, prefix: &str, table: &RouteTable) -> Result<Vec<McpT
     ))
 }
 
+/// L1 grouped（spec 2026-11-12）：把**展示裁剪后**的 tool 集按模块 tag 聚合成
+/// groups 面（`{name, tool_count}` 列表，按首次出现序）。无 tag 的 tool 不进组；
+/// v1 无 description 键（serve 侧无现成通道，spec 裁决）。空组天然不出现——
+/// 输入即裁剪后集合，0 可见工具的组不会被列。调用方负责传裁剪后集合。
+pub fn build_groups(tools: &[&McpTool]) -> serde_json::Value {
+    let mut groups: Vec<serde_json::Value> = Vec::new();
+    for t in tools {
+        let Some(tag) = t
+            .tool
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_str())
+        else {
+            continue;
+        };
+        if let Some(g) = groups.iter_mut().find(|g| g["name"] == tag) {
+            let n = g["tool_count"].as_u64().unwrap_or(0) + 1;
+            g["tool_count"] = json!(n);
+        } else {
+            groups.push(json!({ "name": tag, "tool_count": 1 }));
+        }
+    }
+    serde_json::Value::Array(groups)
+}
+
 /// modules 白名单（R9 fail-closed）：Some 时仅保留 tags 与名单**有交集**的 tool，
 /// 无 tags 的路由排除；名单匹配不到任何模块 → 空列表（不得回落全集）。
 fn apply_modules_filter(tools: Vec<McpTool>, modules: Option<&Vec<String>>) -> Vec<McpTool> {
@@ -473,7 +499,22 @@ pub async fn handle(
                             .map(|m| m.act_mask_destructive)
                             .unwrap_or(false);
                         let shown = filter_tools_for_display(&tools, user.as_ref(), act_mask);
-                        json!({ "tools": shown.into_iter().map(|t| t.tool.clone()).collect::<Vec<_>>() })
+                        // L1 grouped（spec 2026-11-12）：分组面在消费 shown 之前算——
+                        // _meta 扩展位（反域名点分键）；groups 与 tools 同一裁剪后
+                        // 集合，分组信息不放大暴露面。flat/routed 不出此键。
+                        let grouped = st
+                            .pipeline
+                            .mcp
+                            .as_ref()
+                            .is_some_and(|m| m.expose == crate::mcp::ExposeMode::Grouped)
+                            .then(|| build_groups(&shown));
+                        let mut result = json!({
+                            "tools": shown.into_iter().map(|t| t.tool.clone()).collect::<Vec<_>>()
+                        });
+                        if let Some(groups) = grouped {
+                            result["_meta"] = json!({ "com.only-js.groups": groups });
+                        }
+                        result
                     })
                     .map_err(|e| ("-32603", e)),
                 _ => call_tool(&st, &headers, prefix, table, &params).await,
@@ -798,6 +839,50 @@ mod tests {
     fn fill_path_missing_arg_is_none() {
         assert!(fill_path("/v1/api/user/{id}", Some(&Map::new())).is_none());
         assert!(fill_path("/v1/api/user/{id}", None).is_none());
+    }
+
+    // ---- L1 grouped（spec 2026-11-12）：build_groups ----
+
+    // Given 带模块 tags 的 tool 集（输入即展示裁剪后集合）
+    // Then 按 tags[0] 聚合 {name, tool_count}、按首次出现序、无 tag 不进组、
+    //      v1 无 description 键
+    #[test]
+    fn build_groups_aggregates_module_tags() {
+        let mk = |name: &str, tags: Value| McpTool {
+            name: name.into(),
+            tool: json!({ "name": name, "tags": tags }),
+            dispatch: crate::mcp::ToolDispatch {
+                operation_id: name.into(),
+                method: "get".into(),
+                oa_path: format!("/{name}"),
+                catch_all: Vec::new(),
+            },
+        };
+        let owned = [
+            mk("a_get", json!(["wiki"])),
+            mk("b_get", json!(["wiki"])),
+            mk("c_get", json!(["user"])),
+            mk("d_get", json!([])), // 无 tag 不进组
+        ];
+        let refs: Vec<&McpTool> = owned.iter().collect();
+        let g = build_groups(&refs);
+        let arr = g.as_array().unwrap();
+        assert_eq!(arr.len(), 2, "两个模块组：{g}");
+        assert_eq!(arr[0]["name"], "wiki");
+        assert_eq!(arr[0]["tool_count"], 2);
+        assert_eq!(arr[1]["name"], "user");
+        assert_eq!(arr[1]["tool_count"], 1);
+        assert!(
+            arr.iter().all(|g| g.get("description").is_none()),
+            "v1 无 description 键: {g}"
+        );
+    }
+
+    // Given 裁剪后空集
+    // Then 空数组（不得落空全集——调用方负责传裁剪后集合）
+    #[test]
+    fn build_groups_empty_in_empty_out() {
+        assert_eq!(build_groups(&[]), json!([]));
     }
 
     // Given 无参数模板（e2e 抓出的回归：曾把缺省 path 对象一律判 -32602）
