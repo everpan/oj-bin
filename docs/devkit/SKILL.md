@@ -432,13 +432,20 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | MySQL 表改名语句序（v0.1.113） | 表 `previousName` 产 `ALTER TABLE old RENAME TO new`（**RENAME TO**，非 RENAME TABLE）恒首条；与列级 previousName 同 spec 时表 rename 在先、列 rename 用新表名 |
 | 直连想用 HTTP/2 但 curl/fetch 都跑成 1.1（v0.1.118） | 明文端口仅支持 **h2c prior knowledge**（无 `Upgrade: h2c`）——显式用 `curl --http2-prior-knowledge` / `node:http2`；升级式客户端静默按 1.1 完成，不是故障。**WS 必须走 HTTP/1.1**（无 RFC 8441）；浏览器 h2 由反代 ALPN 承担。见场景 70 |
 | read 档 svc token 打 `/mcp` 全 401 或全 403（v0.1.130） | 分清两道门：**守卫** 401（token 没验过/过期）与 **admit** 403（scopes 档位不符，文案 `missing scope: <tier>`）。端点级 POST 在 `/auth/obo`、`/mcp`、`/rpc` 是传输动词非业务动词——scopes **不做端点级判定**（按工具/路由以真实动词收口）；jti 门在这三个端点照常查 |
-| svc token 刚签发就 403 / 刚吊销还能用一会儿（v0.1.130） | jti 门走 30s TTL 缓存：签发后**最长 30s** 才可见、吊销后最长 30s 全网失效——测试/自动化要等窗口过（deadline 轮询，勿固定 sleep 猜）；查库失败恒 fail-closed 拒 |
+| svc token 刚吊销还能用一会儿（v0.1.130；签发即时可见为 v0.1.132 修正；伪造 jti 负缓存 v0.1.133） | jti 门走 30s TTL **正**缓存 + miss 穿透 + 2s 负缓存：吊销后最长 30s 全网失效（等窗口过——deadline 轮询，勿固定 sleep 猜）；**新签发/轮换的 jti 即时可过门**（miss 穿透重查）；伪造/未知 jti 负缓存窗内不打库直接拒（探测不放大 DB 查询）；查库失败恒 fail-closed 拒 |
 | 机器人直连工具判权限（客户端 scopes 解码）（v0.1.130） | **不要**——三档收口在服务端 admit 单点（`/mcp`、`/rpc`、直连 REST 三面同规则）；`tools/list` 裁剪只是展示面，调用面不裁（被裁 tool 直呼得 403 非 -32601）。客户端只管带 token 调，403 按 `[code=403] missing scope: <tier>` 提示换签发档位 |
 | 以为 svc 的 scopes 约束换签产物（v0.1.130） | **不约束**——scopes 收口机器人直连面；obo 换签出的受托 token 按**员工本人 roles** 生效（10min、`claims.act` 指回 svc 名）。想约束代操作面用 `server.mcp.act_mask_destructive: true`（act 会话拒 delete） |
 | `jwt.sign` 带 `claims` 后守卫读不到 / 报保留键（v0.1.130） | claims 是**平铺**进 JWT 顶层的（`http.user.claims` 读回全部）；`sub/roles/iat/exp` 是保留键不能进 `claims`（防伪造时效）。`ttl_secs` 上限 90 天，越界按上限钳不报错 |
 | obo 换签失败按 HTTP 状态分流（v0.1.130） | 四失败路径 HTTP 恒 500（code>599 钳制）——**按信封 `code` 分流**：40310 未绑定 / 40311 已吊销 / 40312 非 svc / 40313 员工停用。受托 token 401 → 重换签**一次**再试（10min 短时效设计），仍 401 告警 |
 | MCP 错误文案做等值断言（v0.1.130） | isError/message 带 `[code=<n>] ` 前缀且**文案冻结**——断言用前缀正则 `^\[code=(\d+)\] `，勿全文等值（msg 后续可能充实）。`tools/list` 结果勿跨会话缓存（scopes 裁剪因 token 而异） |
 | 给机器人开 WS 工具面（v0.1.130） | `/ws` 升级**不经** admit（scopes/jti/act_mask 均不查，只过守卫 verify）——敏感路由勿开 WS 面；线路 A 静态快照同样不经 scopes 展示裁剪（执行仍由服务端收口） |
+| 代理 handler 用 `fetch` 回环本进程转发（v0.1.131 已解） | 进程内 `fetch("http://127.0.0.1:…")` 让内层 handler 再占一个公共 actor 槽——并发 ≥ pool_size 全池互相等待**永久挂死**（看门狗熔断不了 host 侧 await）。改用 **`bridge.call({method, path, headers?, body?})`**：目标在隔离内部分发池执行，自环并发任意高不死锁。见 api-manual「bridge」节与 scenarios.md 场景 76 |
+| `bridge.call` 的目标里再 `bridge.call`（v0.1.131） | 深度限 1：dispatch 目标（内部分发池上运行的 handler）再 call → 503 `nested bridge.call is not supported`——编排链压扁成一次直达。同理**不要**用 `bridge.call` 转 SSE/长下载（体整体缓冲 64 MiB/30s，超限 502） |
+| 裸嵌入式（不经 App 自建 Bridge）里 `bridge.call` 抛 `dispatch not available`（v0.1.131） | 预期：dispatch 槽只在 `App::from_config`（`oj serve` / `oj test`）装配。**注意 `oj test` 里它真能用**——经真实管线派发、有真实副作用，测试里当集成腿用、数据自理 |
+| svc bearer 快到期就等 admin 重签（v0.1.132 R6 已解） | 用自轮换端点：临近 `expires_at` 或收到 40311 → `POST /v1/api/system/service-token/rotate`（旧 bearer 自身认证）换新回写；启动恢复用 `GET …/current`。零 admin 介入、密钥不出 oj |
+| rotate 完立刻用旧 bearer 再 rotate 报 409（v0.1.132） | 幂等护栏：同一 name 任意时刻至多一行 active，宽限内的旧 bearer 应 `GET current` 取最新，不要再换。旧 bearer 在**24h 宽限内**仍可过 jti 门（在途请求平滑），过期自动 40311——不是 bug |
+| 「先 SELECT 校验状态再 UPDATE 翻转」防并发（v0.1.133 rotate 竞态收口） | **防不住**：SELECT 与 UPDATE 之间无锁，两个并发请求都通过校验后各自 UPDATE+INSERT。并发栅栏必须做进**写语句**——条件 UPDATE（`WHERE … AND (status IS NULL OR status='active')`）按影响行数判胜负：行锁串行化后后到者命中 0 行 → 409，参考 `sample/src/system/service-token/rotate/api.ts` |
+| 给 rotate/current 端点发 scopes 豁免就当免认证（v0.1.132） | **不是**：豁免的只有 scopes 动词档位（read 档也要能自轮换）；jti 门照常——吊销的、宽限过期的旧 bearer 一律 40311 换不动（fail-closed） |
 
 ## 手册
 

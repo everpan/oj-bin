@@ -239,6 +239,10 @@ pub struct ServerCfg {
     /// 时长字符串（如 "30s"），parse_duration 解析。
     pub timeout: String,
     pub pool_size: u32,
+    /// `bridge.call` 内部分发池尺寸（v0.1.131 上游 R7）：目标 endpoint 在隔离
+    /// actor 池上执行，公共池不因 handler 自环代理耗尽。None = 与 pool_size 相同。
+    #[serde(default)]
+    pub dispatch_pool_size: Option<u32>,
     /// 上传体积上限（字节；超出 413）。axum 层再乘 2 做硬顶。
     pub max_upload_bytes: u64,
     /// blob 直传 PUT 路由（`PUT {base}/blob/{key}`，v0.1.30）的体积上限（字节，
@@ -324,6 +328,7 @@ impl Default for ServerCfg {
             static_conf: StaticConf::default(),
             timeout: "30s".into(),
             pool_size: 4,
+            dispatch_pool_size: None,
             max_upload_bytes: 10 * 1024 * 1024,
             blob_upload_max_bytes: default_blob_upload_max_bytes(),
             js_heap_limit_bytes: default_js_heap_limit_bytes(),

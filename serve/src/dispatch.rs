@@ -278,16 +278,28 @@ pub(crate) async fn admit(
     if let Some(u) = user.as_ref() {
         let claims = u.get("claims");
         // ① scopes：缺席 = 跳过（零破坏）；present-but-empty = 全拒；
-        // 未知串 = 档位不匹配拒。豁免三字面路径：/auth/obo（换签端点自身，
+        // 未知串 = 档位不匹配拒。豁免字面路径：/auth/obo（换签端点自身，
         // svc token 必达）+ /mcp、/rpc（端点级 POST 是**传输动词**而非业务动词
         // ——scopes 档位由 per-tool admit 以 tool 真实动词判，tools/list 走展示
-        // 裁剪；jti 门在端点级照常生效，吊销仍全网 ≤30s）。
+        // 裁剪；jti 门在端点级照常生效，吊销仍全网 ≤30s）+ R6
+        // /system/service-token/rotate·current（svc 凭据自轮换端点，凭 bearer
+        // 自身认证——read 档 bot 也必须能自轮换，扩 write 档反而是提权面；
+        // jti 门照常，吊销/宽限移出的旧 bearer 换不动）。
         if let Some(scopes) = claims.and_then(|c| c.get("scopes")) {
             let list: Vec<&str> = scopes
                 .as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
                 .unwrap_or_default();
-            let exempt = matches!(path_no_base, Some("/auth/obo" | "/mcp" | "/rpc"));
+            let exempt = matches!(
+                path_no_base,
+                Some(
+                    "/auth/obo"
+                        | "/mcp"
+                        | "/rpc"
+                        | "/system/service-token/rotate"
+                        | "/system/service-token/current"
+                )
+            );
             if !exempt
                 && let Some(tier) = crate::svc_gate::tier_of(verb)
                 && !list.contains(&tier)

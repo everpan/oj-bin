@@ -1078,7 +1078,7 @@ const n = await db.exec("update user set name = ? where id = ?", ["b", 1]);
   **铁律：PG 下 jsonb 存在性判断一律写 `jsonb_exists(doc, 'key')`**（PG 内建同名函数），
   不写裸 `?` 运算符——它无法与占位符区分。
 
-### 总表（35 组）
+### 总表（36 组）
 
 | 全局 | 说明 |
 |---|---|
@@ -1103,6 +1103,7 @@ const n = await db.exec("update user set name = ? where id = ?", ["b", 1]);
 | `tasks.stopping() / tasks.sleep(ms)` | 长任务上下文：停机信号 + 等待原语（见下「命名 MQ 客户端与长任务」） |
 | `log.debug / info / warn / error` | 结构化日志 |
 | `fetch(url, options?)` | WHATWG fetch（deno 官方实现，v0.1.8；真 `Response`/`Headers`，https 无需额外配置） |
+| `bridge.call({method, path, headers?, body?})` | **进程内 dispatch**（v0.1.131）：调用本进程另一 endpoint（业务路由/`{base}/mcp`/`{base}/rpc`/`{base}/health`/`{base}/plugins`）并返回标准 `Response`；目标 handler 在**隔离的内部分发池**上执行，不占公共 actor 槽——代理/编排 handler 的进程内转发**用它而不是 `fetch` 回环**（后者并发 ≥ pool_size 全池挂死），见下「bridge」 |
 | `ws.send / close` | WebSocket 帧控制（HTTP 路径下 no-op） |
 | `sess.id / sess.state` | WS 连接 id 与会话状态（仅 ws.ts 钩子内；state 须可 JSON 序列化） |
 | `new WebSocket(url)` | WHATWG 出站 WS 客户端（任务与 handler 均可用，见下「WebSocket —— 出站客户端」） |
@@ -1993,6 +1994,64 @@ if (r.ok) {
   json.ok(await r.json());
 }
 ```
+
+### bridge —— 进程内 dispatch（v0.1.131，代理/编排 handler 必读）
+
+`bridge.call` 把一次「虚拟 HTTP 请求」派发给**本进程**的另一 endpoint，返回标准
+WHATWG `Response`。语义与外部 HTTP 完全一致（准入/租户头/超时/`.schema` 契约/
+MCP 协议处理走同一管线），但目标 handler 在**独立内部分发池**（单独一组
+JsActor 线程，`server.dispatch_pool_size` 配置，缺省 = `pool_size`）上执行，
+**不占公共 actor 槽**。
+
+**为什么存在**：handler 作为代理/编排层在进程内转发（典型：bot 代理完成 obo
+换签后把 `tools/call` 转给 `POST {base}/mcp`）时，若用 `fetch` 回环本进程，
+内层 handler 还要占一个公共槽——并发 ≥ pool_size 时全池互相等待、永久挂死
+（看门狗熔断不了 host 侧 await）。`bridge.call` 内层不占公共槽，自环并发任意
+高也不死锁。
+
+| API | 签名 | 说明 |
+|---|---|---|
+| `bridge.call` | `call(req: { method: string; path: string; headers?: Record<string, string>; body?: string \| Uint8Array }): Promise<Response>` | 进程内派发。`path` 以 `/` 开头、可带 `?query`（走本进程路由表，不支持绝对 URL）。返回真 `Response`：`status / headers.get() / json() / text() / arrayBuffer()` |
+
+```ts
+// 代理 handler：obo 换签后进程内转发 tools/call（完整可照抄场景见 scenarios.md）
+export default {
+  post: async () => {
+    const obo = /* ...换签得员工 token... */;
+    const body = await http.bodyBytes();
+    const r = await bridge.call({
+      method: "POST",
+      path: "/v1/api/mcp",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, application/json-seq",
+        authorization: `Bearer ${obo.accessToken}`,
+      },
+      body,
+    });
+    const text = await r.text(); // 原样透传（含 content-type）
+    json.header("content-type", r.headers.get("content-type") ?? "application/json");
+    json.ok(JSON.parse(text));   // 或按状态码分支处理
+  },
+};
+```
+
+限制与报错（fail-closed，均点名）：
+
+- **可用形态**：`oj serve` 与 **`oj test` 均可用**——后者同样经 `App::from_config`
+  装配 dispatch hook，测试里 `bridge.call` 走真实管线（与测试 SDK `client.*`
+  同哲学；有真实副作用，测试数据自理）。裸嵌入式（不经 App 自建
+  `Bridge`）槽空，调用抛
+  `dispatch not available (not running under an App — oj serve / oj test)`。
+- **二级嵌套 503**：已在内部分发池上运行的 handler（即 `bridge.call` 的目标）
+  再 `bridge.call` → 目标侧 503 `nested bridge.call is not supported`。
+  编排链请压扁为深度 1：代理一次 `bridge.call` 直达最终端点。
+- **非流式**：响应体整体缓冲（上限 64 MiB、缓冲等待 30s），SSE / 长下载类
+  端点不适合经它转发（超限/超时收敛 502
+  `dispatch response is streamed or exceeds the body cap`）。
+- body 经 base64 载体过 op 边界：大 body 有内存放大（约 4/3），超大上报类
+  转发请走 `fetch` 出进程或 blob 中转。
+- 非法 method / 非 `/` 起始路径 → 400 信封（不抛）。
 
 ### ws —— WebSocket 帧控制
 
@@ -2989,6 +3048,7 @@ mounts:
 | `timeout` | `"30s"` | 单请求执行超时（超时熔断 → 408）；单位支持 `s/sec/secs/ms/m/min/h/d`。路由级覆盖见 `route_timeouts` |
 | `route_timeouts` | `[]` | （v0.1.30）路由级超时覆盖：`[{pattern: "/v1/api/convert/**", timeout: "5m"}]`；pattern 段语义同匿名路径（字面 / `*` 一段 / `**` 跨段），按声明序首个命中，匹配**含 base 全路径**；超时语义同全局（408）。pattern 空/时长非法 → 启动 fail-fast。（v0.1.102）装配期校验 fail-fast：pattern **匹配不到任何已注册路由** → 拒启动并点名（保留路径 `/health`、`/plugins` 与 WS 挂载不经此机制、不受约束）；pattern 含 `{param}` 段 → 拒（匹配的是真实请求路径，请用 `*`/`**`）；热更后悬空同样拒绝该次 reload。**粒度**：看门狗 25ms 轮询，短于 ~25ms 的 timeout 不保证精确（验收探针 ≥100ms）。**边界**：管得住 JS 忙循环；已下推到数据库的慢语句**跑完后**才回 408——慢 SQL 护栏须等语句级真取消（上游 REQ-05） |
 | `pool_size` | `4` | JS 执行线程数 = 并行请求上限 |
+| `dispatch_pool_size` | 无（= `pool_size`） | （v0.1.131）`bridge.call` 内部分发池线程数：进程内 dispatch 的目标 handler 在该独立池上执行，不占公共槽；显式配置时最小生效 1 |
 | `max_upload_bytes` | `10485760`（10MB） | handler 面（multipart 进 `http.file`）上传体积上限；超限 413。axum 层对非 blob 路径再乘 2 做硬顶（双闸，见第 13 章）。**不经 handler 的直传不受它管**——见 `blob_upload_max_bytes` |
 | `blob_upload_max_bytes` | `1073741824`（1 GiB） | （v0.1.30）直传路由 `PUT {base}/blob/{key}` 的体积上限（过鉴权守卫、不经 JsActor/30s）；超限 413 信封 |
 | `response_headers` | `{}` | （v0.1.30）全局自定义响应头 `{name: value}`，施加动态信封/静态站点/blob 响应面；**框架自有头永远优先**（只补缺，Content-Type/Location 等不可覆盖）；默认空 = 行为不变 |
@@ -3930,6 +3990,8 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 
 | 限制 | 说明 / 绕行 |
 |---|---|
+| `bridge.call`（v0.1.131）非流式 + 深度 1 + `oj test` 同样可用 | 进程内 dispatch 整体缓冲（64 MiB / 30s，超限 502）；嵌套（dispatch 目标再 call）503；`oj test` 走 `App::from_config` 真管线可用（有真副作用）；只有裸嵌入式 Bridge 才抛 `dispatch not available`。SSE/长下载转发走 `fetch` 出进程；编排链压扁成一次直达 |
+| svc 凭据自动轮换（R6，v0.1.132；评审收口 v0.1.133）边界 | 宽限 24h 固定（无配置项）；服务端主动续签（`rotates_at`/`rotation_policy`）未做——消费方惰性 rotate 已覆盖诉求；「永不过期」另立 R 项；新 jti 过 SvcGate **即时可见**（miss 穿透重查——否则轮换后新 bearer 要等满 30s TTL，"无感知续期"不成立）；伪造/未知 jti 记 2s 负缓存（窗内不打库直接拒，探测不放大查询）；吊销/宽限移出仍 ≤30s 生效；并发 rotate 由条件 UPDATE 栅栏收口（行锁串行化，后到者 0 行 → 409，不产生两行 active）；明文 token 落库后暴露面 = create 响应 + svc 自认证 `current`（admin list 永不回显）——**整表即凭据，库导出/备份按凭据物料管控** |
 | ~~相对 `require("./x")` 不支持~~（v0.1.30 已支持） | 相对 require / JSON 模块 / 循环 require 均可用；`exports`/`conditions` 与 pnpm 布局完整支持。残留限制：`exports` 的 `types`/`browser` 条件不命中；CJS `module.exports` 替换函数式写法启发式识别 |
 | blob multipart 预签名（v0.1.30） | `blob.uploadUrl` 的 multipart 形态暂返回 Err（object_store 无 multipart presign API）；单发 PUT 预签名 + `PUT {base}/blob/{key}` 直传路由（≤1 GiB）已覆盖大文件场景，>100MB 分片需求出现再补 |
 | build 剥 `.route` 仅识别语句起始的标准赋值写法 | `fn.route = "…"` 顶层标准写法可用；花式写法可能漏剥 |
@@ -4044,8 +4106,8 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | `db.access.revoke` 回落 config，非删 config（v0.1.93） | 撤销的是运行期表项，别名回到 config 兜底；对纯 config 兜底项 `revoke` 显式报错（不静默），防越权/DoS 撤销他人静态授权 |
 | 改 `db_access` / `db_client` 段须重启（v0.1.93） | 两段纳入热更 diff 的 `restart_pending`（不再误标 `applied` 静默盲区）；运行期零重启改授权请用 `db.access.grant/revoke` |
 | `db.epoch` 仅优化 JS 缓存新鲜度，正确性不依赖它（v0.1.93） | 查询 op 始终按名从 host registry 重解析 accessor；即便 JS 覆写缓存 epoch 跳过失效，也拿不到已删连接（host 直接报未登记） |
-| svc scopes 三档与 POST 档位（v0.1.130） | `claims.scopes` 三档按**动词**映射：get→read、post/put/patch→**write**（含按 POST 发查询的业务路由——POST 一律 write 档）、delete/del→destructive；缺席=全量随 roles（旧 token 零破坏）、`[]`=全拒、未知档=拒（`missing scope: <tier>`，MCP/RPC 面 `[code=403] ` 前缀）。绕行：查询路由改 GET+query，或签发时纳入 write。三面对 `/mcp`、`/rpc`、直连 REST 同规则（tools/list 只是展示裁剪，调用面不裁——被裁 tool 直呼得 403 非 -32601）；`/ws` 升级与线路 A 静态快照不经 scopes 门 |
-| `jwt.sign` 的 `ttl_secs` 上限 90 天（v0.1.130） | `claims` 平铺进 JWT 顶层（保留键 `{sub,roles,iat,exp}` 报错）；`ttl_secs` 越界按 90d 上限钳（不报错）——长时效凭据要可控吊销用 admin service-token（jti 在册核销，30s TTL 生效滞后双向成立） |
+| svc scopes 三档与 POST 档位（v0.1.130；R6 豁免 v0.1.132） | `claims.scopes` 三档按**动词**映射：get→read、post/put/patch→**write**（含按 POST 发查询的业务路由——POST 一律 write 档）、delete/del→destructive；缺席=全量随 roles（旧 token 零破坏）、`[]`=全拒、未知档=拒（`missing scope: <tier>`，MCP/RPC 面 `[code=403] ` 前缀）。绕行：查询路由改 GET+query，或签发时纳入 write。三面对 `/mcp`、`/rpc`、直连 REST 同规则（tools/list 只是展示裁剪，调用面不裁——被裁 tool 直呼得 403 非 -32601）；`/ws` 升级与线路 A 静态快照不经 scopes 门。**v0.1.132 豁免**：`/system/service-token/rotate`·`/current`（svc 自轮换端点，凭 bearer 自身认证；jti 门照常） |
+| `jwt.sign` 的 `ttl_secs` 上限 90 天（v0.1.130） | `claims` 平铺进 JWT 顶层（保留键 `{sub,roles,iat,exp}` 报错）；`ttl_secs` 越界按 90d 上限钳（不报错）——长时效凭据要可控吊销用 admin service-token（jti 在册核销，吊销 ≤30s 生效滞后；新签发 jti 即时可见——miss 穿透重查） |
 | obo 换签错误码是信封 `code` 契约（v0.1.130） | 40310 未绑定 / 40311 jti 已吊销 / 40312 非 svc / 40313 员工停用；HTTP 状态恒 500（code>599 钳制）——**勿按 HTTP 状态分流**，按 code 分流。svc 的 scopes 不约束换签面：受托 token 按**员工本人 roles** 生效（10min、带 `claims.act`） |
 | `/mcp` isError 与 `/rpc` error 的 `[code=<n>] <msg>` 前缀已冻结（v0.1.130） | 业务信封错误与非 2xx 信封体统一前缀（非信封体原样）——agent 按正则 `^\[code=(\d+)\] ` 解析，**勿做文案等值断言**；`tools/list` 结果勿跨会话缓存（scopes 裁剪因 token 而异，展示面每请求实时算） |
 
@@ -4203,15 +4265,42 @@ REST 三面同规则，服务端单点判定——客户端侧不判权限）：
 `/ws`（WebSocket 升级）**不经** scopes/jti/act_mask 门（升级面只过守卫 verify）。
 
 **svc 凭据与 jti 吊销**：`claims.svc` 存在的凭据逐请求查 `oj_svc_token` 表核销
-（30s TTL 缓存——签发后**最长 30s** 才可过门；吊销后最长 30s 全网失效；查库
-失败/无行 fail-closed 恒拒）。运营走 admin 端点：
-`POST /v1/api/admin/service-token/`（`{name, scopes}` → `{token, jti}`，**明文
-token 仅此一次**，落库只存 jti）、`GET /v1/api/admin/service-token/`（列表，
-无明文）、`DELETE /v1/api/admin/service-token/{jti}`（吊销）、`bot-binding`
-（provider+external_sub ↔ 员工 id 绑定 CRUD + CSV）、`obo-audit`（换签审计
-分页 + CSV）。`svc` 的 scopes **不约束换签面**——scopes 收口的是机器人直连
-工具/路由的动词档位；换签产物（受托 token）按**员工本人 roles** 生效
-（"够用，最终以员工本身的权限为准"）。
+（30s TTL 正缓存 + miss 穿透 v0.1.132、2s 负缓存 v0.1.133——吊销/宽限移出后最长 30s
+全网失效；**新签发/轮换的 jti 即时可过门**，miss 穿透重查；穿透仍 miss 的
+伪造/未知 jti 记 2s 负缓存，窗内不打库直接 fail-closed——探测不放大 DB 查询；
+查库失败/无行 fail-closed 恒拒）。行有效判定（v0.1.132）：无 `status`（存量行）/
+`active` 恒有效；`superseded` 仅在 `grace_until`（epoch 秒）未过时有效——宽限
+过期**自动移出有效集**（= 吊销，40311 同路径，无需删行）。运营走 admin 端点：
+`POST /v1/api/admin/service-token/`（`{name, scopes}` → `{token, jti, expires_at}`，
+v0.1.132 起明文落库——暴露面不变：admin list 永不回显 token，明文只在 create
+响应与 svc 自认证的 `current`）、`GET /v1/api/admin/service-token/`（列表含
+status/grace_until/expires_at，无明文）、`DELETE /v1/api/admin/service-token/{jti}`
+（吊销=删行，立即生效）、`bot-binding`（provider+external_sub ↔ 员工 id 绑定
+CRUD + CSV）、`obo-audit`（换签审计分页 + CSV）。`svc` 的 scopes **不约束换签
+面**——scopes 收口的是机器人直连工具/路由的动词档位；换签产物（受托 token）
+按**员工本人 roles** 生效（"够用，最终以员工本身的权限为准"）。
+
+**svc 凭据自动轮换（R6，v0.1.132）**：90d 定长凭据的到期续签**不需要 admin 重
+配**——由「当前有效 svc bearer 自身」认证的两个端点完成（新 token 仍由
+`jwt.sign` 同一 secret 签发，密钥不出 oj；消费方零 admin 介入、零密钥暴露）：
+
+| 端点 | 认证 | 行为 |
+|---|---|---|
+| `POST /v1/api/system/service-token/rotate` | 该 name **active** 的 svc bearer（守卫验签 + jti 门 + claims.svc/jti） | 旧行置 `superseded` + **24h 宽限**（宽限内旧 bearer 在途仍放行，过期自动 40311）→ 同 name/scopes 签新 token（新 jti，exp 重新计 90d）落库 → 返回 `{token, jti, expires_at}`。**幂等护栏**：宽限内的旧 bearer 再 rotate → 409；**并发栅栏**：两个并发 rotate 持同一 active bearer 时，条件 UPDATE（仅 active/存量 NULL 行可翻转，按影响行数判胜负）经行锁串行化——后到者命中 0 行 → 同一 409，不产生两行 active |
+| `GET /v1/api/system/service-token/current` | 该 name 有效（active 或宽限内）的 svc bearer | 返回该 name 最新 active bearer `{token, jti, expires_at, scopes}`——消费方**跨重启恢复**最新令牌，避免重新人工配置 |
+
+两端点 **scopes 豁免**（read 档 bot 也必须能自轮换——强制 write 档反而是提权
+面；同 `/auth/obo` 先例），但 **jti 门照常**：吊销/宽限移出的旧 bearer 换不动。
+可见性语义：新签发/轮换的 jti **即时**可过门（SvcGate miss 穿透重查，v0.1.132——
+否则轮换后新 bearer 要等满 30s 缓存 TTL，"无感知续期"不成立）；吊销与宽限
+移出仍 ≤30s 全网生效；穿透仍 miss 的伪造/未知 jti 记 **2s 负缓存**（窗内直接
+fail-closed 不打库，探测不放大 DB 查询；shortcut：窗内新签发 jti 最长拖 2s 才
+可见——128bit 随机 jti 先探后签的概率可忽略）；查库失败恒 fail-closed 拒。
+消费接法（惰性自愈轮换）：启动时 `GET current` 载入内存 → 临近 `expires_at`
+或收到 40311 时 `POST rotate` 换新回写。参考实现
+`sample/src/system/service-token/`（rotate/current）+ 集成测试
+`sample/tests/svc-rotation.test.ts`。范围外：服务端主动续签
+（`rotates_at`/`rotation_policy`）与「永不过期」另立 R 项。
 
 **obo 换签**：`POST /v1/api/auth/obo`（Bearer svc token + `{provider,
 external_sub}`）→ 员工受托 token（10 分钟，`claims.act.sub` 指回 svc 名——

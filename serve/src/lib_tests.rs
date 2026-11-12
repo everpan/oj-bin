@@ -2830,3 +2830,257 @@ async fn admit_act_mask_destructive() {
         .await
         .unwrap_or_else(|_| panic!("default off: no masking"));
 }
+
+// ---------- bridge.call（v0.1.131，上游 R7）：进程内 dispatch，隔离 actor 池 ----------
+
+/// bridge.call 夹具：公共池 1 线程 + 内部分发池 1 线程（最苛刻死锁条件），
+/// hook 经 app_with_exec 装配进共享槽。返回 (监听地址, 目录守卫)。
+async fn spawn_dispatch_server(
+    files: &[(&str, &str)],
+    mcp: bool,
+) -> (std::net::SocketAddr, TempRoutes) {
+    let t = routes(files);
+    let dir = t.0.clone();
+    let table = build_table(&dir, true, "/v1/api");
+    let slot: Arc<only_js::bridge::dispatch_bridge::DispatchSlot> =
+        Arc::new(std::sync::OnceLock::new());
+    let make = {
+        let root = dir.clone();
+        let slot = slot.clone();
+        move || {
+            Bridge::with_dbs_and_loader(
+                HashMap::new(),
+                Arc::new(InMemoryKV::new()),
+                SchemaRegistry::new(),
+                false,
+                Some(Arc::new(LoaderShared {
+                    project_root: root.clone(),
+                    ts: true,
+                })),
+                Extras {
+                    dispatch: Some(slot.clone()),
+                    ..Default::default()
+                },
+            )
+        }
+    };
+    let actor = JsActor::pool(1, make.clone());
+    let d_actor = JsActor::pool(1, crate::internal::mark_internal(make));
+    let mut pipeline = Pipeline::default();
+    if mcp {
+        pipeline.mcp = Some(McpConfig {
+            modules: None,
+            allow_anonymous: true,
+            act_mask_destructive: false,
+            server_version: "test".into(),
+        });
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mounts = vec![RuntimeMount::Api {
+        prefix: "/v1/api".to_string(),
+        table,
+        fallback: Some(Routes::new("/v1/api", dir, true)),
+        web: None,
+    }];
+    let router = app_with_exec(
+        mounts,
+        actor,
+        Some(std::time::Duration::from_secs(30)),
+        StaticOpts::default(),
+        pipeline,
+        Arc::new(RwLock::new(CertificateStatus::Valid)),
+        Arc::new(RwLock::new(None)),
+        Arc::default(),
+        None,
+        None,
+        Some((d_actor, slot)),
+        None,
+    );
+    tokio::spawn(serve_router(listener, router, std::future::pending()));
+    (addr, t)
+}
+
+async fn post_json(addr: std::net::SocketAddr, path: &str, body: &str) -> String {
+    raw_http(
+        addr,
+        &format!(
+            "POST {path} HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+    .await
+}
+
+const PROXY_SRC: &str = r#"
+export default {
+  post: async () => {
+    const r = await bridge.call({
+      method: "POST",
+      path: "/v1/api/echo",
+      headers: { "content-type": "application/json" },
+      body: await http.bodyBytes(),
+    });
+    const d = await r.json();
+    json.ok({ status: r.status, pong: d.data.pong });
+  },
+};
+"#;
+
+const ECHO_SRC: &str = r#"
+export default {
+  post: async () => {
+    const b = JSON.parse(new TextDecoder().decode(await http.bodyBytes()));
+    json.ok({ pong: b.ping * 2 });
+  },
+};
+"#;
+
+/// 死锁回归（验收口径）：公共池 = 1 时，handler 自环代理 bridge.call 并发 N > pool_size，
+/// 全部 200、无永久挂死；连续第二批后进程仍可用。旧行为（fetch 回环）在此条件下
+/// 必然全挂——本用例即「进程内自环也 200」的升级判定。
+#[tokio::test]
+async fn bridge_call_self_loop_no_deadlock_when_concurrency_exceeds_pool() {
+    let (addr, _keep) = spawn_dispatch_server(
+        &[("proxy/api.ts", PROXY_SRC), ("echo/api.ts", ECHO_SRC)],
+        false,
+    )
+    .await;
+    let run_batch = move |n: usize| async move {
+        let mut tasks = Vec::new();
+        for i in 0..n {
+            tasks.push(tokio::spawn(async move {
+                post_json(addr, "/v1/api/proxy/", &format!(r#"{{"ping":{i}}}"#)).await
+            }));
+        }
+        let mut out = Vec::new();
+        for t in tasks {
+            out.push(t.await.unwrap());
+        }
+        out
+    };
+    // 并发 4 × 公共池 1 + 内部分发池 1：外层代理各占 1 公共槽等内层，内层在内部分发池跑。
+    let batch = tokio::time::timeout(std::time::Duration::from_secs(60), run_batch(4))
+        .await
+        .expect("first batch deadlocked (bridge.call self-loop hang)");
+    for (i, r) in batch.iter().enumerate() {
+        assert!(
+            r.starts_with("HTTP/1.1 200") && r.contains(&format!("\"pong\":{}", i * 2)),
+            "request {i}: {r}"
+        );
+    }
+    // 第二批：进程仍可用、无累积挂起。
+    let batch2 = tokio::time::timeout(std::time::Duration::from_secs(30), run_batch(2))
+        .await
+        .expect("second batch deadlocked (actor leak after first batch)");
+    for (i, r) in batch2.iter().enumerate() {
+        assert!(
+            r.starts_with("HTTP/1.1 200") && r.contains(&format!("\"pong\":{}", i * 2)),
+            "second batch request {i}: {r}"
+        );
+    }
+}
+
+/// MCP 验收路径：代理 handler 进程内 bridge.call POST /v1/api/mcp 的 tools/call
+/// （initialize/tools/list 不占 actor，tools/call 落到 JS handler——死锁严格绑定
+/// 此 method）。公共池 1、并发 3，全部 200 且 isError=false。
+#[tokio::test]
+async fn bridge_call_mcp_tools_call_no_deadlock() {
+    let mcp_proxy = r#"
+export default {
+  post: async () => {
+    const call = (body) =>
+      bridge.call({
+        method: "POST",
+        path: "/v1/api/mcp",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify(body),
+      });
+    const list = await (await call({ jsonrpc: "2.0", id: 1, method: "tools/list" })).json();
+    const tool = list.result.tools.find((t) => t.name.includes("echo"));
+    const resp = await call({
+      jsonrpc: "2.0", id: 2, method: "tools/call",
+      params: { name: tool.name, arguments: { body: { ping: 21 } } },
+    });
+    const r = await resp.json();
+    json.ok({ status: resp.status, isError: !!r.result?.isError,
+              text: r.result?.content?.[0]?.text ?? "" });
+  },
+};
+"#;
+    let (addr, _keep) = spawn_dispatch_server(
+        &[("mcp-proxy/api.ts", mcp_proxy), ("echo/api.ts", ECHO_SRC)],
+        true,
+    )
+    .await;
+    let mut tasks = Vec::new();
+    for _ in 0..3 {
+        tasks.push(tokio::spawn(async move {
+            post_json(addr, "/v1/api/mcp-proxy/", "{}").await
+        }));
+    }
+    let batch = tokio::time::timeout(std::time::Duration::from_secs(60), async move {
+        let mut out = Vec::new();
+        for t in tasks {
+            out.push(t.await.unwrap());
+        }
+        out
+    })
+    .await
+    .expect("MCP tools/call self-loop deadlocked");
+    for (i, r) in batch.iter().enumerate() {
+        assert!(r.starts_with("HTTP/1.1 200"), "request {i}: {r}");
+        assert!(r.contains("\"isError\":false"), "request {i}: {r}");
+        assert!(r.contains("42"), "request {i}: {r}");
+    }
+}
+
+/// 二级嵌套护栏：已在内部分发池上运行的 handler（dispatch 目标）再 bridge.call
+/// → 503 信封（放开会让等待环在池内重现，与公共池自环死锁同构）。
+/// 链路：外部 → proxy2（公共池）→ bridge.call nested（内部分发池）→
+/// nested 再 bridge.call echo → 护栏在内部分发池线程上触发，返回 503。
+#[tokio::test]
+async fn bridge_call_nested_from_internal_pool_is_503() {
+    let nested = r#"
+export default {
+  post: async () => {
+    const r = await bridge.call({ method: "POST", path: "/v1/api/echo", body: "{}" });
+    json.ok({ status: r.status, body: await r.text() });
+  },
+};
+"#;
+    let proxy2 = r#"
+export default {
+  post: async () => {
+    const r = await bridge.call({
+      method: "POST",
+      path: "/v1/api/nested",
+      headers: { "content-type": "application/json" },
+      body: await http.bodyBytes(),
+    });
+    const d = await r.json();
+    json.ok({ outer: r.status, inner: d.data });
+  },
+};
+"#;
+    let (addr, _keep) = spawn_dispatch_server(
+        &[
+            ("proxy2/api.ts", proxy2),
+            ("nested/api.ts", nested),
+            ("echo/api.ts", ECHO_SRC),
+        ],
+        false,
+    )
+    .await;
+    let r = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        post_json(addr, "/v1/api/proxy2/", r#"{"ping":1}"#),
+    )
+    .await
+    .expect("nested dispatch hung");
+    assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+    assert!(r.contains("\"outer\":200"), "{r}");
+    assert!(r.contains("\"status\":503"), "{r}");
+    assert!(r.contains("nested bridge.call is not supported"), "{r}");
+}

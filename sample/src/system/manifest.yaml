@@ -1,0 +1,7 @@
+name: "system"
+desc: "平台自助面：svc 凭据自轮换（rotate/current，凭据自身认证，R6 v0.1.132）"
+version: "0.1.0"
+deps:
+  admin: "^0.1.0"   # oj_svc_token 表属主（schema.yaml 注册在 admin 模块）——
+                    # rotate/current 经 db.table() 读写该表，须声明依赖（ownership
+                    # guard；与 auth 模块 obo.ts 同口径）

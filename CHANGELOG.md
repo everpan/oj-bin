@@ -16,6 +16,98 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.133（2026-11-12，未打标签）
+
+R6 评审发现收口（外部 review 三条，详见 `docs/upstream-proposals.md` R6
+「评审发现收口」段）：并发 rotate 竞态栅栏、SvcGate 伪造 jti 负缓存、
+devkit 明文落库口径纠正。
+
+- **fix（sample：rotate 并发竞态，评审发现收口）**：旧实现「SELECT 校验 +
+  无条件 UPDATE」非原子，两个并发 rotate 持同一 active bearer 可各插一行
+  active（409 护栏只兜宽限重试）。改**条件 UPDATE 栅栏**（`WHERE jti=? AND
+  (status IS NULL OR status='active')` 按影响行数判胜负）——行锁串行化后到者
+  命中 0 行 → 同一 409，「同一 name 至多一行 active」不再依赖时序；
+  `current` 的 created_at 同秒平局补 jti 字典序 tie-break，排序确定性。
+- **fix（serve：SvcGate 负缓存，评审发现收口）**：miss 穿透对「查无结果」同样
+  触发重查——伪造 svc bearer 可每请求真查一次全表。穿透仍 miss 的 jti 记
+  **2s 负缓存**，窗内直接 fail-closed 不打库；正缓存 TTL 与「新签发即时可见」
+  语义不变（shortcut：窗内新签发 jti 最长拖 2s，128bit 随机 jti 先探后签的
+  概率可忽略）。
+- **docs（devkit：mcp-bot-guide 明文落库口径纠正，评审发现收口）**：3.2 节
+  「落库只存 jti」是 R6 前陈旧表述——v0.1.132 起 `oj_svc_token.token` 落明文
+  （current 跨重启恢复面），整表即凭据、库导出/备份须按凭据物料管控；同期
+  3.4 节补原生 rotate 指针、jti 核销段补负缓存语义。
+
+## v0.1.132（2026-11-12，未打标签）
+
+上游需求 R6：Service Credential 原生自动轮换。svc bearer（90d 定长 JWT）到期后
+原路径是人工 SOP 重签重配；R6 让 svc bearer **自轮换**——由「当前有效 svc bearer
+自身」认证的两个端点（密钥不出 oj，新 token 仍由 `jwt.sign` 同一 secret 签发），
+消费方零 admin 介入、零密钥暴露、跨重启可恢复。
+
+- **feat（serve：SvcGate 轮换宽限语义）**：`oj_svc_token` 行过滤从「行存在即有效」
+  改为 Rust 侧判定（v0.1.131 教训：`?` 占位符跨方言不可靠）——无 `status`（存量行）
+  /`status='active'` 恒有效；`status='superseded'` 仅在 `grace_until`（epoch 秒）
+  未过时有效，**过期自动移出有效集**（= 吊销，40311 同路径，无需删行）；
+  未知 status fail-closed 拒。`grace_until` 宽容解析 i64/文本列（pg 驱动差异）。
+- **feat（serve：admit scopes 豁免 R6 自轮换端点）**：
+  `/system/service-token/rotate`·`/current` 加入字面豁免表（同 `/auth/obo` 先例）——
+  read 档 bot 也必须能自轮换，强制 write 档反而是提权面；**jti 门照常**
+  （吊销/宽限移出的旧 bearer 换不动）。
+- **feat（sample：`system/service-token` 模块）**：`POST …/rotate`（旧行置
+  superseded + 24h 宽限 → 同 name/scopes 签新 token 落库 → 返回新 bearer）+
+  `GET …/current`（取该 name 最新 active bearer，跨重启恢复面）。幂等护栏：
+  宽限内的旧 bearer 再 rotate → 409（同一 name 任意时刻至多一行 active）。
+  认证 = 守卫验签 + SvcGate jti 门（fail-closed）+ `claims.svc/jti` 取身份。
+- **feat（sample：admin 签发端点与迁移 0003）**：`oj_svc_token` 增列
+  `status`/`grace_until`/`token`/`expires_at`（三方言）；签发响应带
+  `expires_at`，明文 token 落库——**暴露面不变**：admin list 永不选择 token 列，
+  明文只出现在 create 响应与 svc 自认证的 `current`（同主体）。存量行无 status
+  视为 active（零破坏）。
+- 未做（R6 范围声明）：`rotates_at`/`rotation_policy` 服务端主动续签（消费方
+  惰性 rotate 已覆盖诉求，yagni）；「永不过期」另立 R 项；obo 受托 token 维持
+  到期即废。验收口径：旧 token 宽限过期后 40311（SvcGate fail-closed）。
+- **fix（serve：SvcGate miss 穿透，v0.1.132 验证期修正）**：`admits` 缓存未命中
+  时穿透重查一次再判——**新签发/轮换的 jti 即时可过门**（否则轮换后新 bearer
+  要等满 30s TTL，"无感知续期"验收不成立）；正缓存语义不变（吊销/宽限移出
+  仍 ≤30s 生效），查库失败/无行恒拒（fail-closed）。
+- **fix（oj：SvcGate 装配跟随 db 重定向）**：`oj test` 走 `db.test` 时 JS 侧
+  经 `db_override` 写测试库，SvcGate 却读物理 default——jti 门查无行 fail-closed，
+  测试库下 svc 凭据一律 403。装配键改取 `profiles.db`（与迁移/seed 同口径）。
+- **fix（sample：current 端点 select 漏 status 列）**：过滤条件读 `r.status`
+  却未选择该列，存量行全部被当 active，同秒 created_at 平局时会取到 superseded
+  旧行——`select` 补 `status`。
+
+## v0.1.131（2026-11-12，未打标签）
+
+上游能力需求 R7：同运行时**进程内 dispatch 原语**——handler 作为代理/编排层
+（典型：bot 代理 obo 换签后转发 `tools/call` 到 `POST /api/mcp`）时，进程内
+`fetch` 回环要占第二个公共 actor 槽，并发 ≥ pool_size 全池互相等待永久挂死。
+采用 R7-B 方案：`bridge.call` 把目标 endpoint 派发到**隔离的内部 actor 池**，
+公共池不再被自环耗尽。纯增量原语，/mcp/obo/admit/tenant 链路语义零变化。
+
+- **feat（bridge：`bridge.call` 进程内 dispatch，v0.1.131）**：JS 侧
+  `await bridge.call({ method, path, headers?, body? })` → 标准 WHATWG
+  `Response`（`status / headers / json() / text() / arrayBuffer()`）。目标
+  endpoint（业务路由、`{base}/mcp`、`{base}/rpc`、`{base}/health`、
+  `{base}/plugins`）经既有 handle/mcp_http 管线执行——准入/租户/超时/契约
+  语义与外部 HTTP 完全一致，但目标 handler 在**内部分发池**（独立 JsActor
+  池，`server.dispatch_pool_size` 配置，缺省 = `pool_size`）上运行，不占公共
+  槽。验收：公共池 = 内部分发池 = 1（最苛刻条件），自环代理并发 4 + 连续
+  第二批全 200 无挂死；`/api/mcp` tools/call 经 bridge.call 转发并发 3 全
+  200 且 isError=false。
+  - 注入走槽位后填（`StableState.dispatch` OnceLock，`app_with_exec` 装配期
+    set；照搬 `reload_bridge` 惯例）：`oj serve` 与 `oj test` 均经
+    `App::from_config` 装配可用（后者走真实管线、有真实副作用）；裸嵌入式
+    （不经 App 自建 Bridge）槽空 → 点名报错
+    `dispatch not available (not running under an App — oj serve / oj test)`（fail-closed）。
+  - 二级嵌套护栏：已在内部分发池上运行的 handler 再 `bridge.call` → 503
+    `nested bridge.call is not supported`（放开会让等待环在池内重现）。
+  - 响应体整体缓冲（非流式）：上限 64 MiB、缓冲等待 30s，超限/超时收敛 502
+    `dispatch response is streamed or exceeds the body cap`——SSE/长下载类
+    端点不适合经 bridge.call 转发。
+  - 热更每代重建自己的槽与 hook（各代 `from_config` 独立接线），无跨代串号。
+
 ## v0.1.130（2026-11-11，tag `v0.1.130`）
 
 MCP/机器人三痛点（spec 2026-11-11）：**模型看不懂接口**（description 透传）、

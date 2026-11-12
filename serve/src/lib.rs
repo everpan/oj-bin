@@ -10,6 +10,8 @@ pub mod certificate;
 pub mod certificate_watcher;
 /// API dispatch 层（admit/执行/响应映射，自 lib.rs R2 分层拆出）。
 pub mod dispatch;
+/// `bridge.call()` 进程内派发接线（隔离内部 actor 池，v0.1.131 上游 R7）。
+pub mod internal;
 pub mod logging;
 /// OpenAPI spec → MCP tool 列表（纯函数；MCP 双线路共享核心 R3/R4）。
 pub mod mcp;
@@ -313,6 +315,7 @@ pub fn app(
         plugins,
         None,
         None,
+        None,
         cors,
     )
 }
@@ -332,6 +335,10 @@ pub fn app_with_exec(
     exec_registry: Option<Arc<only_js::bridge::db_exec::ExecRegistry>>,
     // svc 凭据 jti 吊销门（spec 2026-11-11 P3）：default db 缺席 → None（fail-closed）。
     svc_gate: Option<Arc<crate::svc_gate::SvcGate>>,
+    // bridge.call 内部分发（v0.1.131 上游 R7）：Some = 装配 hook（actor 换绑隔离
+    // 内部池的 AppState 克隆）进共享槽；None = 不装配（bridge.call 报
+    // dispatch not available，测试/嵌入式形态）。
+    dispatch: Option<(JsActor, Arc<only_js::bridge::dispatch_bridge::DispatchSlot>)>,
     cors: Option<CorsCfg>,
 ) -> Router {
     let mut router = Router::new();
@@ -391,7 +398,7 @@ pub fn app_with_exec(
     if let Some(cfg) = cors {
         router = router.layer(build_cors_layer(&cfg));
     }
-    router.with_state(AppState {
+    let st = AppState {
         mounts: sorted_mounts(mounts),
         actor,
         timeout,
@@ -402,7 +409,14 @@ pub fn app_with_exec(
         plugins,
         exec_registry,
         svc_gate,
-    })
+    };
+    // bridge.call 内部分发 hook 装配（v0.1.131）：持 actor 换绑隔离内部池的
+    // AppState 克隆 set 进共享槽（槽位后填，照搬 reload 解环惯例）。须先于
+    // with_state 移到 state——hook 只持克隆，与 router 无环。
+    if let Some((d_actor, d_slot)) = &dispatch {
+        crate::internal::install_dispatch_hook(&st, d_actor.clone(), d_slot);
+    }
+    router.with_state(st)
 }
 
 /// 由 `CorsCfg` 构造 `CorsLayer`（v0.1.35）。

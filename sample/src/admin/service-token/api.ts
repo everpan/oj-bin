@@ -1,6 +1,8 @@
 // 服务凭据运营端点（spec 2026-11-11 P2）：create / list / revoke。
-// 明文 token 只在 create 响应出现一次（不落库不回显）；revoke = 删登记行
-// （行即吊销真相源——admit SvcGate 与 obo 换签都以「行存在」为准，fail-closed）。
+// R6（v0.1.132）起明文 token 落库（token 列）——跨重启恢复面 GET current（svc 自
+// 认证）依赖它；admin list 永不选择该列，明文暴露面 = create 响应 + current（同主体）。
+// revoke = 删登记行（行即吊销真相源——admit SvcGate 与 obo 换签都以「行存在」为准，
+// fail-closed）；R6 起轮换走 superseded + grace_until（旧 jti 宽限 24h 后自动移出）。
 import { nowSecs } from "../../auth/_shared/session";
 import { isAdmin, denyNonAdmin } from "../_shared/guard";
 
@@ -15,7 +17,8 @@ export const schema = {
 async function get(): Promise<void> {
   if (!isAdmin()) return denyNonAdmin();
   const rows: any[] = await db.table("oj_svc_token")
-    .select(["jti", "name", "scopes", "created_by", "created_at"])
+    .select(["jti", "name", "scopes", "created_by", "created_at",
+      "status", "grace_until", "expires_at"]) // 永不选择 token 列（明文面不扩）
     .orderBy([{ field: "created_at", dir: "desc" }])
     .all();
   json.ok(rows.map((r) => {
@@ -35,6 +38,7 @@ async function post(): Promise<void> {
   if (bad.length) { json.fail(400, "scopes must be a subset of: " + SCOPES.join("/")); return; }
   if (!scopes.length) { json.fail(400, "scopes must not be empty"); return; }
   const jti = crypto.randomHex(16);
+  const expiresAt = nowSecs() + SVC_TTL_SECS;
   const token = await jwt.sign({
     sub: "svc:" + name,
     roles: ["bot"],
@@ -44,8 +48,9 @@ async function post(): Promise<void> {
   await db.table("oj_svc_token").insert({
     jti, name, scopes: JSON.stringify(scopes),
     created_by: String(http.user!.id), created_at: nowSecs(),
+    status: "active", token, expires_at: expiresAt, // R6：落库供 current 恢复
   }).run();
-  json.ok({ token, jti }); // 明文仅此一次
+  json.ok({ token, jti, expires_at: expiresAt });
 }
 
 async function del(): Promise<void> {

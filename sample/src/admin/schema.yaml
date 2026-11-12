@@ -47,7 +47,8 @@ tables:
       message: { type: text }
       title: { type: text, null: false }
   # MCP 服务凭据三表（spec 2026-11-11 P2）：svc-token / 机器人绑定 / 换签审计。
-  # Rust SvcGate（dispatch.rs）静态 SQL 直查 oj_svc_token.jti——列名即契约。
+  # Rust SvcGate（dispatch.rs）静态 SQL 直查 oj_svc_token.jti——列名即契约
+  # （R6 v0.1.132 起直查 jti, status, grace_until 三列，两侧须同步）。
   oj_svc_token:
     pk: jti
     columns:
@@ -56,6 +57,10 @@ tables:
       scopes: { type: text, null: false }          # JSON 数组串 ["read","write","destructive"]
       created_by: { type: text, null: false }
       created_at: { type: bigint, null: false }
+      status: { type: text, null: true }           # R6：NULL/active=有效；superseded=已轮换（宽限见 grace_until）
+      grace_until: { type: bigint, null: true }    # R6：superseded 的宽限截止（epoch 秒），过期 SvcGate 自动移出
+      token: { type: text, null: true }            # R6：明文 bearer（跨重启恢复面；admin list 永不选择该列）
+      expires_at: { type: bigint, null: true }     # R6：签发时写死的 exp（epoch 秒）
   oj_bot_binding:
     pk: [provider, external_sub]
     columns:

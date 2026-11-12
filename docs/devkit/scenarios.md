@@ -4903,3 +4903,114 @@ curl -s -X POST {base}/v1/api/admin/bot-binding/ -H "authorization: Bearer <admi
 | tools/list 结果存进机器人会话上下文复用 | 展示面按 token 的 scopes 裁剪——换人/换档后名单不同，**勿跨会话缓存**；每次对话实时拉或按需直呼 |
 | 机器人执行删除类操作 | `act_mask_destructive: true` 部署下 act 会话恒拒 delete（含 tools/list 不可见）——破坏面只留给人；确需自动清理用服务端 tasks 池（无 act，走系统身份+审计） |
 | 回调处理超 5s 被企微判超时重推 | MsgId 去重兜得住重推，但体验差——重活搬 `tasks` 池异步，回调只 ack +「已受理」回执 |
+
+## 场景 76：进程内代理转发——`bridge.call` 直达 `/api/mcp`（v0.1.131，R7）
+
+> 何时抄我：handler 要做代理/编排（bot 代理完成 obo 换签后把 `tools/call` 转给
+> `POST {base}/mcp`、BFF 聚合多个本进程端点），且不想为一次进程内转发付出
+> `fetch` 回环的**死锁税**——并发 ≥ pool_size 时公共池全池等待永久挂死。
+> `api-manual.md`「bridge」节、`SKILL.md` 陷阱速查 v0.1.131 三行。
+
+代理 handler 全文（`/bot/mcp-proxy/api.ts`）：
+
+```ts
+export default {
+  post: async () => {
+    // ① obo 换签（场景 75 第 3 步同法；四失败码按信封 code 分流）
+    const svc = vars.get("WECOM_SVC_TOKEN"); // 部署期常量，勿硬编码
+    const oboResp = await fetch(`${vars.get("BASE")}/v1/api/auth/obo`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${svc}`,
+      },
+      body: JSON.stringify({ provider: "wecom", external_sub: http.body.userId }),
+    });
+    const obo = await oboResp.json();
+    if (obo.code !== 0) json.fail(obo.code, obo.msg);
+
+    // ② 进程内转发 tools/call：bridge.call 不占公共 actor 槽（fetch 回环会）
+    const r = await bridge.call({
+      method: "POST",
+      path: "/v1/api/mcp",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, application/json-seq",
+        authorization: `Bearer ${obo.data.accessToken}`,
+      },
+      body: JSON.stringify(http.body.mcpCall), // 原样 JSON-RPC 帧
+    });
+    const text = await r.text();
+    json.header("content-type", r.headers.get("content-type") ?? "application/json");
+    json.raw(JSON.parse(text)); // 原样透传（含 result.isError）
+  },
+};
+```
+
+并发口径（验收实测）：公共池 = 内部分发池 = 1（最苛刻条件）时，N=4 并发自环
+全部 200 无挂死、连续第二批仍可用——旧 `fetch` 回环实现同条件 7/7 挂死。
+
+| 坑 | 解 |
+|---|---|
+| 目标里再 `bridge.call` | 深度限 1：dispatch 目标再 call → 503 `nested bridge.call is not supported`。聚合编排压扁成「代理一次 call 直达最终端点」，勿 A→B→C 链式 |
+| 想转发 SSE/大下载 | `bridge.call` 体整体缓冲（64 MiB / 30s，超限 502）——流式端点走 `fetch` 出进程或 blob 中转 |
+| `oj test` 里测代理 handler 抛 `dispatch not available` | 不会——`oj test` 经 `App::from_config` 同样装配 dispatch hook，`bridge.call` **真派发**（真实管线、真实副作用，与 `client.*` 同哲学）。当集成腿用、测试数据自理；裸嵌入式（不经 App）才抛该错 |
+| 大 body（>几 MB）转发 | body 经 base64 过 op 边界有约 4/3 内存放大——超大上报走 `fetch` 出进程或先落 blob 再传 key |
+
+## 场景 77：svc bearer 自动轮换——零 admin 续命 90d 凭据（v0.1.132，R6）
+
+> 何时抄我：机器人/服务持有的 svc bearer（90d 定长 JWT）临近到期或已被吊销
+> （40311），要**无感续期**且不把签发密钥交给消费方。新 token 仍由 oj 同一
+> secret 签发（`jwt.sign`），消费方零 admin 介入、零密钥暴露、跨重启可恢复。
+> `api-manual.md` §14「svc 凭据自动轮换」、`SKILL.md` v0.1.132 三行、参考实现
+> `sample/src/system/service-token/` + `sample/tests/svc-rotation.test.ts`。
+
+消费方 handler 的惰性自愈轮换（wecom-bot 接法）：
+
+```ts
+// 启动恢复：拿内存/vars 里的旧 bearer 取最新（旧 bearer 宽限内仍有效即可当门票）
+async function loadSvcBearer(): Promise<string> {
+  const cached = await kv.get("bot:svc:bearer");
+  const old = cached ?? process.env.BOOTSTRAP_SVC; // 首次部署的门票 bearer（admin 签发）
+  if (!old) throw new Error("no bootstrap svc bearer");
+  const r = await fetch(`${vars.get("BASE")}/v1/api/system/service-token/current`, {
+    headers: { authorization: `Bearer ${old}` },
+  });
+  const body = await r.json();
+  if (body.code !== 0) throw new Error(`svc current failed: ${body.code} ${body.msg}`);
+  await kv.set("bot:svc:bearer", body.data.token);
+  await kv.set("bot:svc:expires_at", String(body.data.expires_at));
+  return body.data.token;
+}
+
+// 用前检查：临期（7d 窗口）或收到 40311 → rotate 换新
+async function ensureFreshSvcBearer(): Promise<string> {
+  const exp = Number(await kv.get("bot:svc:expires_at") ?? 0);
+  const bearer = await kv.get("bot:svc:bearer") ?? "";
+  if (exp - Math.floor(Date.now() / 1000) > 7 * 86400) return bearer; // 窗口外不打扰
+  const r = await fetch(`${vars.get("BASE")}/v1/api/system/service-token/rotate`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${bearer}`, "content-type": "application/json" },
+    body: "{}",
+  });
+  const body = await r.json();
+  if (body.code === 409) return loadSvcBearer(); // 已被别人换过 → 取最新
+  if (body.code !== 0) throw new Error(`svc rotate failed: ${body.code} ${body.msg}`);
+  await kv.set("bot:svc:bearer", body.data.token);
+  await kv.set("bot:svc:expires_at", String(body.data.expires_at));
+  return body.data.token;
+}
+```
+
+验证口径（与 `sample/tests/svc-rotation.test.ts` 同序）：admin 签发（响应带
+`expires_at`）→ svc bearer `rotate` 得新 jti → 旧 bearer `current` 取回新 token
+→ 旧 bearer 再 `rotate` 得 409 → 新 bearer 可链式续换 → admin list 可见
+status 且**永不回显明文**。
+
+| 坑 | 解 |
+|---|---|
+| rotate 后旧 bearer 立刻 403 | 不会——旧 jti 有 **24h 宽限**（在途请求平滑），过期才自动 40311。收到 40311 说明宽限已过，走 `current` 恢复（需任一有效旧 bearer 当门票；全丢则 admin 重签一次） |
+| 用员工 token 调 rotate/current | 403——只认 svc bearer（claims.svc）；守卫验签 + jti 门 + claims 取身份三层 |
+| read 档 bot 能不能自轮换 | 能——两端点 scopes 豁免（强制 write 档反而提权）；jti 门照常，吊销的 bearer 换不动 |
+| 新签/轮换后立刻用新 bearer 40311 | 不该发生——SvcGate miss 穿透重查，新 jti 即时可见（v0.1.132）；真遇到先查行是否落库、jti 是否抄错 |
+| 想服务端到点自动预签（rotates_at/rotation_policy） | R6 未做（消费方惰性 rotate 已覆盖）；「永不过期」另立 R 项 |

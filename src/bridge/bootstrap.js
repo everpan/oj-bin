@@ -171,6 +171,7 @@ import {
   op_yaml_parse,
   op_yaml_stringify,
   op_server_reload_config,
+  op_dispatch,
 } from "ext:core/ops";
 
 // Outbound WHATWG WebSocket client (deno_websocket ext). Registered by
@@ -217,6 +218,8 @@ const { DOMException: ojDOMException } = core.loadExtScript(
 globalThis.DOMException = ojDOMException;
 const { fetch: ojFetch } = core.loadExtScript("ext:deno_fetch/26_fetch.js");
 globalThis.fetch = ojFetch;
+// Response comes from 23_response.js (26_fetch.js only returns {fetch, ...}).
+const { Response: ojResponse } = core.loadExtScript("ext:deno_fetch/23_response.js");
 const { AbortController: ojAbortController } = core.loadExtScript(
   "ext:deno_web/03_abort_signal.js",
 );
@@ -344,6 +347,80 @@ globalThis.exec = {
     return op_exec_run(argv, opts === undefined ? null : opts);
   },
   spawn: (argv, opts) => spawnExec(argv, opts),
+};
+
+// ----- bridge.call: in-process endpoint dispatch (v0.1.131, upstream R7) -----
+// Handler-to-handler orchestration without leaving the process: bridge.call
+// runs the target endpoint on an ISOLATED internal actor pool, so a proxy
+// handler awaiting the call never competes with the inner handler for a
+// public pool slot (the fetch-loopback self-deadlock at concurrency >=
+// pool_size). Typical use: a bot proxy does the obo token exchange, then
+// forwards tools/call to POST /api/mcp in-process.
+//   const resp = await bridge.call({ method, path, headers?, body? });
+// req: method/path like HTTP; headers is a plain object; body is a string or
+// bytes (Uint8Array/ArrayBuffer, forwarded un-reserialized). The result is a
+// WHATWG Response (status/headers/body); statuses a Response cannot represent
+// (1xx / 204 / 304-with-body / >599) fall back to a plain
+// { status, headers, body } object. Limits: streamed (SSE) responses are
+// buffered, not streamed through; a handler running ON the internal pool
+// (i.e. already a dispatch target) calling bridge.call again is rejected
+// with 503 (nested dispatch would re-create the waiting ring). Available under
+// `oj serve` AND `oj test` (both wire the hook via App::from_config; oj test
+// dispatches for real through the live pipeline); only bare embedded Bridges
+// (no App) throw "dispatch not available".
+const ojB64ToBytes = (b64) => {
+  const s = atob(b64);
+  const u = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i);
+  return u;
+};
+// chunked btoa: String.fromCharCode on the whole array hits the arg-count limit
+// for large bodies; 0x8000-char chunks keep it safe.
+const ojBytesToB64 = (u8) => {
+  let out = "";
+  for (let i = 0; i < u8.length; i += 0x8000) {
+    out += btoa(String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000)));
+  }
+  return out;
+};
+globalThis.bridge = {
+  call: async (req) => {
+    const o = req === undefined || req === null ? {} : req;
+    let body = o.body;
+    if (typeof body === "string") body = new TextEncoder().encode(body);
+    else if (body instanceof ArrayBuffer) body = new Uint8Array(body);
+    else if (body === undefined || body === null) body = new Uint8Array(0);
+    const headers = [];
+    if (o.headers && typeof o.headers === "object") {
+      for (const k of Object.keys(o.headers)) headers.push([String(k), String(o.headers[k])]);
+    }
+    const r = await op_dispatch(
+      String(o.method === undefined ? "GET" : o.method).toUpperCase(),
+      String(o.path === undefined ? "/" : o.path),
+      headers,
+      ojBytesToB64(body),
+    );
+    const bytes = ojB64ToBytes(r.body_b64);
+    try {
+      return new ojResponse(bytes, { status: r.status, headers: r.headers });
+    } catch (_) {
+      // 1xx / 204 / 304-with-body / >599: Response constructor rejects these.
+      // Fall back to a plain object with the same read surface; `headers` stays
+      // the raw [name, value][] pair list (no .get() on this branch only).
+      const pairs = r.headers;
+      return {
+        status: r.status,
+        ok: r.status >= 200 && r.status < 300,
+        statusText: "",
+        headers: pairs,
+        body: bytes,
+        text: async () => new TextDecoder().decode(bytes),
+        json: async () => JSON.parse(new TextDecoder().decode(bytes)),
+        arrayBuffer: async () => bytes,
+        clone() { return this; },
+      };
+    }
+  },
 };
 
 // ----- yaml: bounded parse / stringify (ojm batch) -----

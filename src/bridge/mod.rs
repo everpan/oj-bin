@@ -48,6 +48,7 @@ pub mod db_session;
 mod db_stream;
 mod db_tx;
 pub mod dialect_caps;
+pub mod dispatch_bridge;
 mod embedded_js;
 mod envelope;
 mod es;
@@ -330,6 +331,10 @@ pub struct StableState {
     /// 槽指针构造期冻结、内容后填（不触 `Arc::get_mut` 红线）；桥池多实例
     /// 共享同一槽（同一 `Arc<OnceLock>`），每代热更重建桥后依旧有效。
     pub reload: Arc<reload_bridge::ReloadSlot>,
+    /// `bridge.call()` 派发槽（v0.1.131）：serve 装配期后填 hook；槽空 =
+    /// 裸嵌入式（不经 App 的 Bridge）→ op 报 `dispatch not available`。
+    /// `oj test` 经 `App::from_config` 同样装配，可用。同 reload 的解环惯例。
+    pub dispatch: Arc<dispatch_bridge::DispatchSlot>,
     /// 泛型轴注册表（插件自报的非类型化轴；bootstrap `axis(name)` 的数据源）。
     /// 空表 = 无泛型轴，`axis(name).op()` 报 unknown axis 并列可用轴名。
     pub generic_axes: generic_axis::GenericAxisRegistry,
@@ -443,6 +448,10 @@ pub struct Extras {
     /// 即 fail-closed）。`oj serve` 装配层传入共享槽 Arc 并在 ReloadState
     /// 就绪后 `set`（槽位后填，照搬 `ReloadState::set_executor` 解环惯例）。
     pub reload: Arc<reload_bridge::ReloadSlot>,
+    /// `bridge.call()` 派发槽（v0.1.131）：缺省空槽 = op 报
+    /// `dispatch not available`。`oj serve` / `oj test` 装配层（`App::from_config`
+    /// → `app_with_exec`）传入共享槽并 set hook；裸嵌入式维持空槽（fail-closed）。
+    pub dispatch: Option<Arc<dispatch_bridge::DispatchSlot>>,
     /// 泛型轴注册表（None = 空 registry，`axis(name)` 一律报 unknown axis——与
     /// vars 同哲学：未注入 = 空表而非 None）。
     pub generic_axes: Option<generic_axis::GenericAxisRegistry>,
@@ -709,6 +718,7 @@ deno_core::extension!(
         yaml::op_yaml_parse,
         yaml::op_yaml_stringify,
         reload_bridge::op_server_reload_config,
+        dispatch_bridge::op_dispatch,
     ],
     esm_entry_point = "ext:bridge_ext/bootstrap.js",
     options = { stable: Arc<StableState> },
@@ -1117,6 +1127,9 @@ impl Bridge {
             platform: extras.platform,
             exec: extras.exec,
             reload: extras.reload,
+            dispatch: extras
+                .dispatch
+                .unwrap_or_else(|| Arc::new(dispatch_bridge::DispatchSlot::new())),
             generic_axes: extras.generic_axes.unwrap_or_default(),
             oj_info: extras
                 .oj_info

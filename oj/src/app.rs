@@ -1643,6 +1643,10 @@ pub async fn assemble_backend(
     // reload not available，fail-closed）。解析成 owned Arc——工厂闭包 Extras 与
     // StableState 注入同一 Arc，槽指针构造期冻结、内容由装配层后填。
     let reload_slot = reload_slot.unwrap_or_else(|| Arc::new(std::sync::OnceLock::new()));
+    // bridge.call 派发槽（v0.1.131 上游 R7）：同 reload 的槽位惯例——Extras 与
+    // StableState 注入同一 Arc，内容（hook）由 serve::app_with_exec 装配期后填。
+    let dispatch_slot: Arc<only_js::bridge::dispatch_bridge::DispatchSlot> =
+        Arc::new(std::sync::OnceLock::new());
     // 单实例换代槽（v0.1.122 D3）：registry/modules/tenant 旗标打包单指针，
     // make_bridge_of 与 Backend 共享同一 Arc —— 热更 swap 后全 Bridge 同步可见。
     let assembly_slot: AssemblySlot = Arc::new(std::sync::RwLock::new(Arc::new(PerGenAssembly {
@@ -1711,6 +1715,8 @@ pub async fn assemble_backend(
         let module_index = module_index.clone();
         // 热更触发槽（ojm PR-3）：闭包带走副本，与 StableState.reload 同一 Arc。
         let reload_slot = reload_slot.clone();
+        // bridge.call 派发槽（v0.1.131）：闭包带走副本，与 StableState.dispatch 同一 Arc。
+        let dispatch_slot = dispatch_slot.clone();
         // 影子绑定：同 vars —— 闭包带走的是这里的副本（外层 oj_info 仍供 StableState 使用）。
         let oj_info = oj_info.clone();
         move |tasks_flag: Option<Arc<std::sync::atomic::AtomicBool>>| {
@@ -1781,6 +1787,8 @@ pub async fn assemble_backend(
                     exec: exec_grant.clone(),
                     // 热更触发槽（ojm PR-3）：与 StableState.reload 同一 Arc（槽位后填）。
                     reload: reload_slot.clone(),
+                    // bridge.call 派发槽（v0.1.131）：与 StableState.dispatch 同一 Arc。
+                    dispatch: Some(dispatch_slot.clone()),
                     // 泛型轴注册表：与 StableState.generic_axes 同一 Arc。
                     generic_axes: Some(generic_axes.clone()),
                     // ojInfo() 数据源：与 StableState.oj_info 同一 Arc（`oj info` CLI 同源）。
@@ -1847,6 +1855,8 @@ pub async fn assemble_backend(
         // 热更触发槽（ojm PR-3）：与 make_bridge 的 Extras.reload 同一 Arc
         // （槽指针构造期冻结；oj serve 装配层在 ReloadState 就绪后 set）。
         reload: reload_slot,
+        // bridge.call 派发槽（v0.1.131）：与 make_bridge 的 Extras.dispatch 同一 Arc。
+        dispatch: dispatch_slot.clone(),
         generic_axes, // 与 make_bridge 的 Extras.generic_axes 同一 Arc。
         oj_info,      // 与 make_bridge 的 Extras.oj_info 同一 Arc（ojInfo() 数据源）。
     });
@@ -2260,6 +2270,16 @@ impl App {
         let timeout = config::parse_duration(&cfg.server.timeout).ok();
         // actor 池：bridges 与 WS 连接共享同一 Bus 与 Extras。
         let actor = JsActor::pool(n, make_bridge.clone());
+        // bridge.call 内部分发隔离池（v0.1.131 上游 R7）：目标 endpoint 在独立
+        // actor 池上执行——handler 自环代理（fetch 回环）不再与公共池竞争槽位，
+        // 并发 ≥ pool_size 不再死锁。尺寸缺省跟随 pool_size；线程置位
+        // ON_INTERNAL_POOL 作为二级嵌套护栏（内部分发的 handler 再 call → 503）。
+        let dn = cfg
+            .server
+            .dispatch_pool_size
+            .map(|v| v.max(1) as usize)
+            .unwrap_or(n);
+        let dispatch_actor = JsActor::pool(dn, serve::internal::mark_internal(make_bridge.clone()));
         // 证书必配（门禁已确保两路径齐备）→ 加载并校验，证书失效即拒绝启动。
         // 运行中过期由热加载切换到 Grace/Expired → GET 限制（handle 内），服务不中断。
         let (cert_status, cert_valid_until) = load_cert_with_watcher(&cfg, config_dir)?;
@@ -2280,9 +2300,12 @@ impl App {
             }
         }
         // R9 scopes 线：SvcGate——svc token 的 jti 吊销面（查 oj_svc_token，30s TTL）。
-        // 无 default 库时缺位：dispatch 端 jti 门 fail-closed，svc 标记的 token 一律拒；
+        // 库选择跟随 db 重定向（oj test 的 --db/db.test）：JS 侧经 db_override 写测试库，
+        // 这里若仍读物理 default，jti 门会因查无行 fail-closed（R6 svc-rotation L1 事故）。
+        // 无该库时缺位：dispatch 端 jti 门 fail-closed，svc 标记的 token 一律拒；
         // auth 关闭时无 token 可验，不告警。
-        let svc_gate = match stable.dbs.get("default") {
+        let svc_db_key = profiles.db.as_deref().unwrap_or("default");
+        let svc_gate = match stable.dbs.get(svc_db_key) {
             Some(acc) => Some(Arc::new(serve::svc_gate::SvcGate::new(acc.clone()))),
             None => {
                 if auth.is_some() {
@@ -2466,6 +2489,9 @@ impl App {
             Some(stable.exec_sessions.clone()),
             // R9 scopes 线：jti 吊销门（fail-closed 缺位即拒 svc 标记 token）。
             svc_gate,
+            // bridge.call 内部分发（v0.1.131）：app_with_exec 装配 hook 进共享槽
+            // （槽 = StableState.dispatch，与全部 Bridge 的 Extras 同一 Arc）。
+            Some((dispatch_actor, stable.dispatch.clone())),
             cfg.server.cors.clone(),
         )
         .merge(ws_router);
