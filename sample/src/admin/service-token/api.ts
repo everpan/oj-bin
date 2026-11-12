@@ -5,10 +5,12 @@
 // fail-closed）；R6 起轮换走 superseded + grace_until（旧 jti 宽限 24h 后自动移出）。
 import { nowSecs } from "../../auth/_shared/session";
 import { isAdmin, denyNonAdmin } from "../_shared/guard";
+// SVC_TTL_SECS 唯一源在 system/service-token/_shared（rotate/current 与签发共用，
+// 评审修复：原两处各自硬编码 90d，靠注释互指，改动必漂移）。
+import { SVC_TTL_SECS } from "../../system/service-token/_shared";
 
 // 档位白名单（与 serve 侧 tier_of 同词表：read/write/destructive）。
 const SCOPES = ["read", "write", "destructive"];
-const SVC_TTL_SECS = 90 * 86400; // 90d 上限（bridge JWT_TTL_CAP_SECS 同值）
 
 export const schema = {
   description: "服务凭据（svc token）签发 / 列表 / 吊销",

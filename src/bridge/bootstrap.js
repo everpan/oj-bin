@@ -172,6 +172,7 @@ import {
   op_yaml_stringify,
   op_server_reload_config,
   op_dispatch,
+  op_dispatch_on_internal,
 } from "ext:core/ops";
 
 // Outbound WHATWG WebSocket client (deno_websocket ext). Registered by
@@ -218,6 +219,30 @@ const { DOMException: ojDOMException } = core.loadExtScript(
 globalThis.DOMException = ojDOMException;
 const { fetch: ojFetch } = core.loadExtScript("ext:deno_fetch/26_fetch.js");
 globalThis.fetch = ojFetch;
+// fetch loopback guard (internal dispatch pool): a handler already running ON
+// the internal dispatch pool must not fetch this process's public endpoints --
+// the waiting ring the public-pool self-loop fix removed would re-form (outer
+// public slot waits on the internal handler, which occupies a public slot).
+// The runtime does not know its own listen address, so every loopback target
+// shares the block; use bridge.call for in-process endpoints. Other pools and
+// non-loopback URLs pass through untouched.
+const ojOrigFetch = globalThis.fetch;
+globalThis.fetch = function (input, init) {
+  if (op_dispatch_on_internal()) {
+    try {
+      const u = new URL(typeof input === "string" ? input : input.url, "http://oj.local");
+      const h = u.hostname.toLowerCase();
+      if (h === "localhost" || h === "::1" || h === "0.0.0.0" || h.indexOf("127.") === 0) {
+        return Promise.reject(new TypeError(
+          "fetch to loopback is not supported on the internal dispatch pool (use bridge.call for in-process endpoints)"
+        ));
+      }
+    } catch (_) {
+      // unparseable URL: let the real fetch raise its own error
+    }
+  }
+  return ojOrigFetch.call(this, input, init);
+};
 // Response comes from 23_response.js (26_fetch.js only returns {fetch, ...}).
 const { Response: ojResponse } = core.loadExtScript("ext:deno_fetch/23_response.js");
 const { AbortController: ojAbortController } = core.loadExtScript(

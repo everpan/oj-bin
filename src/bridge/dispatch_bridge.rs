@@ -53,6 +53,29 @@ pub type DispatchHook = Arc<
 /// 内容后填（`slot.set` 一次，照搬 `reload_bridge` 解环惯例）。
 pub type DispatchSlot = std::sync::OnceLock<DispatchHook>;
 
+// 内部派发池线程标记：`oj serve` 的 `mark_internal` 在内部池 actor 线程的
+// Bridge 工厂内置位；`dispatch_virtual` 的二级嵌套护栏与 bootstrap.js 的
+// fetch 回环护栏读它（见 `op_dispatch_on_internal`）。
+thread_local! {
+    static ON_INTERNAL_POOL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 标记当前线程为内部派发池 actor 线程（仅 serve 装配期调用）。
+pub fn set_internal_pool() {
+    ON_INTERNAL_POOL.with(|c| c.set(true));
+}
+
+/// 当前线程是否内部派发池 actor 线程。
+pub fn on_internal_pool() -> bool {
+    ON_INTERNAL_POOL.with(std::cell::Cell::get)
+}
+
+/// bootstrap.js 的 fetch 包装层用：本 runtime 是否运行在内部派发池线程上。
+#[op2(fast)]
+pub fn op_dispatch_on_internal() -> bool {
+    on_internal_pool()
+}
+
 /// `bridge.call(req)`：进程内派发一个 HTTP 请求到本进程 endpoint。
 ///
 /// ① 槽空（裸嵌入式，不经 App）→ 点名报错（fail-closed，同 reloadConfig）；
@@ -129,6 +152,47 @@ mod tests {
         assert_eq!(v["data"]["threw"], serde_json::json!(true));
         let msg = v["data"]["msg"].as_str().unwrap();
         assert!(msg.contains("dispatch not available"), "{msg}");
+    }
+
+    /// 回归（评审 #4）：内部派发池线程上 fetch loopback URL → 包装层在发真实
+    /// 请求前拒绝（提示用 bridge.call）；非内部池线程 → 不被本护栏拦截（错误
+    /// 来自真实网络层，消息不含护栏文案）。两案同线程跑：op 与标记都是 thread_local。
+    #[tokio::test(flavor = "current_thread")]
+    async fn loopback_fetch_guarded_on_internal_pool_only() {
+        let b = crate::bridge::Bridge::new(
+            std::sync::Arc::new(crate::bridge::InMemoryAccessor::new()),
+            std::sync::Arc::new(crate::bridge::InMemoryKV::new()),
+        );
+        let js = r#"(async () => {
+          try {
+            await fetch("http://127.0.0.1:1/x");
+            json.ok({ threw: false, msg: "" });
+          } catch (e) {
+            json.ok({ threw: true, msg: String((e && e.message) || e) });
+          }
+        })();"#;
+        // 内部池线程：护栏拒绝（不发真实请求，端口 1 仅为占位）。
+        set_internal_pool();
+        let cap = b.run_with(js, Default::default()).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{}", v["msg"]);
+        assert_eq!(v["data"]["threw"], serde_json::json!(true));
+        let msg = v["data"]["msg"].as_str().unwrap();
+        assert!(
+            msg.contains("internal dispatch pool"),
+            "内部池 loopback fetch 必须被护栏拒绝: {msg}"
+        );
+        // 同线程复位标记后：护栏不再拦截（连接被拒是网络层的错）。
+        ON_INTERNAL_POOL.with(|c| c.set(false));
+        let cap = b.run_with(js, Default::default()).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{}", v["msg"]);
+        assert_eq!(v["data"]["threw"], serde_json::json!(true));
+        let msg = v["data"]["msg"].as_str().unwrap();
+        assert!(
+            !msg.contains("internal dispatch pool"),
+            "非内部池线程不得触发本护栏: {msg}"
+        );
     }
 
     /// 假 hook：请求投影（method/path/headers/body）完整到达、响应映射为

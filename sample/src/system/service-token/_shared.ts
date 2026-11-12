@@ -4,7 +4,7 @@
 // secret 签发（消费方零 admin 介入、零密钥暴露）。
 import { nowSecs } from "../../auth/_shared/session";
 
-export const SVC_TTL_SECS = 90 * 86400; // 90d 上限（与 admin 签发端点同值）
+export const SVC_TTL_SECS = 90 * 86400; // 90d 上限（bridge JWT_TTL_CAP_SECS 同值；唯一源——admin 签发端从本模块导入）
 export const GRACE_SECS = 24 * 3600; // 旧 jti 宽限窗（在途请求平滑过渡）
 
 export interface SvcSelf {

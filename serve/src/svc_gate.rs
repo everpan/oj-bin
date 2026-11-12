@@ -2,14 +2,16 @@
 //! 查询面走 default db 的 `DataAccessor`（静态 SQL `SELECT jti, status, grace_until
 //! FROM oj_svc_token`——非 JS 来源，沿 `_oj_migrations` 先例豁免 SchemaRegistry）；
 //! 30s TTL 正缓存挡热路径（吊销 ≤30s 全网生效）；miss 穿透重查一次（新签发 jti
-//! 立即可用——R6 轮换无感知续期的前提）；穿透仍 miss 的 jti 记 2s 负缓存（伪造
-//! bearer 探测不再每请求真查库）；查询 Err 一律 fail-closed（视同吊销）。
+//! 立即可用——R6 轮换无感知续期的前提）；穿透仍 miss 开 2s **全局**负缓存窗——
+//! 窗内一切未知 jti 直接 fail-closed 不打库：伪造/探测 bearer 的 DB 命中与
+//! 伪造量解耦（≤1 次/NEG_TTL），且负缓存状态 O(1) 内存（按 jti 逐条负缓存会
+//! 被随机 jti 洪泛打穿并单调膨胀）；查询 Err 一律 fail-closed（视同吊销）。
 //!
 //! R6 轮换宽限（v0.1.132）：行过滤在 Rust 侧做（`?` 占位符跨方言不可靠，见
 //! accessor_sqlx 直通 sqlx::Any）——行有效 ⇔ 无 status（存量行）/active，或
 //! status='superseded' 且 grace_until 未过（旧 jti 宽限内仍放行，过期自动移出）。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -18,15 +20,19 @@ use tokio::sync::RwLock;
 
 /// 缺省缓存 TTL。
 const DEFAULT_TTL: Duration = Duration::from_secs(30);
-/// 负缓存 TTL：穿透重查仍 miss 的 jti 记此短窗，窗内直接 fail-closed 不打库——
-/// 伪造/探测性 svc bearer 不再每请求真查一次全表（量无上限）。
+/// 负缓存 TTL：穿透重查仍 miss 后开此全局短窗，窗内未知 jti 一律 fail-closed
+/// 不打库——随机 jti 洪泛的 DB 命中被钳到 ≤1 次/NEG_TTL（原按 jti 逐条负缓存
+/// 对每个新伪造 jti 都穿透一次全表 SELECT，查询量与伪造量成正比）。
 const NEG_TTL: Duration = Duration::from_secs(2);
 
 pub struct SvcGate {
     accessor: Arc<dyn DataAccessor>,
     cache: RwLock<Option<(Instant, HashSet<String>)>>,
-    neg: RwLock<HashMap<String, Instant>>,
+    /// 全局负缓存窗起点：最近一次「穿透重查仍 miss」的时刻。窗内所有未命中
+    /// 正缓存的 jti 直接 fail-closed，无需 per-jti 条目——O(1) 内存、无淘汰负担。
+    neg_since: RwLock<Option<Instant>>,
     ttl: Duration,
+    neg_ttl: Duration,
 }
 
 impl SvcGate {
@@ -36,11 +42,17 @@ impl SvcGate {
 
     /// 测试注入短 TTL（生产构造走 `new`；30s 缓存在用例里等不起）。
     pub fn with_ttl(accessor: Arc<dyn DataAccessor>, ttl: Duration) -> Self {
+        Self::with_ttls(accessor, ttl, NEG_TTL)
+    }
+
+    /// 测试注入短正/负 TTL（负缓存窗用例里等不起 2s）。
+    pub fn with_ttls(accessor: Arc<dyn DataAccessor>, ttl: Duration, neg_ttl: Duration) -> Self {
         Self {
             accessor,
             cache: RwLock::new(None),
-            neg: RwLock::new(HashMap::new()),
+            neg_since: RwLock::new(None),
             ttl,
+            neg_ttl,
         }
     }
 
@@ -70,12 +82,12 @@ impl SvcGate {
         Ok(set)
     }
 
-    /// 门禁判定：命中缓存且含 jti → true（热路径不打库）；miss → 负缓存窗内
-    /// 直接 false（穿透重查已判过 absent，2s 内不重查）；出窗 → 穿透重查一次
-    /// （R6 轮换后新 bearer 立即可用，否则要等满 TTL，"无感知续期"不成立），
-    /// 仍 miss 记入负缓存 → false；查询 Err → false（fail-closed）。吊销语义不变：
-    /// 已准入的 jti 在正缓存过期（≤30s）前仍放行。
-    /// shortcut: 负缓存窗内新签发的 jti 会被拖最长 2s 才可见——jti 是 128bit
+    /// 门禁判定：命中缓存且含 jti → true（热路径不打库）；miss 且全局负缓存窗
+    /// 未过 → false（窗内一切未知 jti 不重查，洪泛被钳到 ≤1 次真查/窗）；
+    /// 出窗 → 穿透重查一次（R6 轮换后新 bearer 立即可用，否则要等满 TTL，
+    /// "无感知续期"不成立），仍 miss 开窗 → false；查询 Err → false（fail-closed）。
+    /// 吊销语义不变：已准入的 jti 在正缓存过期（≤30s）前仍放行。
+    /// shortcut: 负缓存窗内新签发的 jti 会被拖最长 NEG_TTL 才可见——jti 是 128bit
     /// 随机值，窗口期内被先探测后签发的概率可忽略；正缓存路径不受影响。
     pub async fn admits(&self, jti: &str) -> bool {
         if let Some((at, set)) = self.cache.read().await.as_ref()
@@ -84,8 +96,11 @@ impl SvcGate {
         {
             return true;
         }
-        if let Some(at) = self.neg.read().await.get(jti)
-            && at.elapsed() < NEG_TTL
+        if self
+            .neg_since
+            .read()
+            .await
+            .is_some_and(|at| at.elapsed() < self.neg_ttl)
         {
             return false;
         }
@@ -94,10 +109,7 @@ impl SvcGate {
                 if set.contains(jti) {
                     true
                 } else {
-                    self.neg
-                        .write()
-                        .await
-                        .insert(jti.to_string(), Instant::now());
+                    *self.neg_since.write().await = Some(Instant::now());
                     false
                 }
             }
@@ -281,6 +293,56 @@ mod tests {
         let after_hit = acc.n.load(std::sync::atomic::Ordering::SeqCst);
         assert!(g.admits("jt-a").await);
         assert_eq!(acc.n.load(std::sync::atomic::Ordering::SeqCst), after_hit);
+    }
+
+    // 回归（评审 #2）：N 个**互不相同**的伪造 jti 在窗内洪泛——按 jti 逐条负缓存
+    // 的旧实现会对每个新 jti 穿透一次全表 SELECT（查询量与伪造量成正比）；
+    // 全局负缓存窗把整窗 DB 命中钳到 1 次。
+    #[tokio::test]
+    async fn admits_global_neg_window_caps_distinct_forged_flood() {
+        let inner = InMemoryAccessor::new();
+        inner.seed([json!({ "jti": "jt-a", "status": "active" })]);
+        let acc = Arc::new(CountingAcc {
+            inner,
+            n: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let g = SvcGate::with_ttl(acc.clone(), Duration::from_secs(30));
+        assert!(g.admits("jt-a").await);
+        let base = acc.n.load(std::sync::atomic::Ordering::SeqCst);
+        for i in 0..10 {
+            assert!(!g.admits(&format!("jt-forged-{i}")).await);
+        }
+        assert_eq!(
+            acc.n.load(std::sync::atomic::Ordering::SeqCst),
+            base + 1,
+            "10 个不同伪造 jti 窗内只允许 1 次真查（全局窗），不得按 jti 逐条穿透"
+        );
+        assert!(g.admits("jt-a").await, "正缓存命中不受负缓存窗影响");
+    }
+
+    // 回归（评审 #2/#3）：负缓存窗过期后穿透恢复——新落库 jti 立即可见；
+    // 且负缓存状态为 O(1)（单个窗起点，无 per-jti 条目堆积）。
+    #[tokio::test]
+    async fn neg_window_expiry_resumes_passthrough() {
+        let acc = Arc::new(InMemoryAccessor::new());
+        acc.seed([json!({ "jti": "jt-a", "status": "active" })]);
+        // 负缓存窗 30ms：伪造 jti 开窗后，窗内打库计数不增；出窗后新 jti 穿透成功。
+        let g = SvcGate::with_ttls(
+            acc.clone(),
+            Duration::from_secs(30),
+            Duration::from_millis(30),
+        );
+        assert!(!g.admits("jt-forged").await, "首次穿透判 absent → false");
+        acc.seed([json!({ "jti": "jt-b", "status": "active" })]);
+        assert!(
+            !g.admits("jt-b").await,
+            "窗内未知 jti 不打库直接 fail-closed"
+        );
+        let dl = Instant::now() + Duration::from_secs(2);
+        while !g.admits("jt-b").await {
+            assert!(Instant::now() < dl, "出窗后必须恢复穿透，新 jti 可见");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     // R6 轮换宽限：active/无 status 恒有效；superseded 在 grace_until 内有效、

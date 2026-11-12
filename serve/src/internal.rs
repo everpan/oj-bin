@@ -11,30 +11,27 @@
 //! `handle()`/`mcp_http` 管线（准入/租户/超时/契约语义零分叉）。热更每代重建自己的
 //! 槽与 hook（各代 `from_config` 独立接线），不存在跨代串号。
 
-use std::cell::Cell;
 use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Uri};
 use axum::response::Response;
-use only_js::bridge::dispatch_bridge::{DispatchHook, DispatchReq, DispatchResp, DispatchSlot};
+use only_js::bridge::dispatch_bridge::{
+    DispatchHook, DispatchReq, DispatchResp, DispatchSlot, on_internal_pool, set_internal_pool,
+};
 use serde_json::Value;
 
 use crate::{AppState, RuntimeMount};
 
-// 内部池 actor 线程标记：为 true 时，本线程上运行的 handler 已是 dispatch 目标。
-thread_local! {
-    static ON_INTERNAL_POOL: Cell<bool> = const { Cell::new(false) };
-}
-
-/// 包装 Bridge 工厂：在内部池 actor 线程上置位 `ON_INTERNAL_POOL`（工厂在 actor
-/// 线程内被调用，见 `JsActor::pool`）。二级嵌套护栏 `dispatch_virtual` 读它。
+/// 包装 Bridge 工厂：在内部池 actor 线程上置位共享的「内部池」线程标记
+///（工厂在 actor 线程内被调用，见 `JsActor::pool`）。二级嵌套护栏
+/// `dispatch_virtual` 与 bootstrap.js 的 fetch 回环护栏共用该标记。
 pub fn mark_internal(
     make: impl Fn() -> only_js::bridge::Bridge + Send + Sync + 'static,
 ) -> impl Fn() -> only_js::bridge::Bridge + Send + Sync + 'static {
     move || {
-        ON_INTERNAL_POOL.with(|f| f.set(true));
+        set_internal_pool();
         make()
     }
 }
@@ -67,7 +64,8 @@ pub(crate) fn install_dispatch_hook(
 pub(crate) async fn dispatch_virtual(st: AppState, req: DispatchReq) -> DispatchResp {
     // 二级嵌套护栏：内部分发池上运行的 handler 再 call → 503。放开会让等待环
     // 在池内重现（与公共池自环死锁同构）；深度 1 覆盖代理/编排的全部既定场景。
-    if ON_INTERNAL_POOL.with(Cell::get) {
+    // （fetch 回环同构面已由 bootstrap.js 的 loopback 护栏在 JS 层拦下。）
+    if on_internal_pool() {
         return DispatchResp {
             status: 503,
             headers: vec![("content-type".to_string(), "application/json".to_string())],

@@ -719,6 +719,7 @@ deno_core::extension!(
         yaml::op_yaml_stringify,
         reload_bridge::op_server_reload_config,
         dispatch_bridge::op_dispatch,
+        dispatch_bridge::op_dispatch_on_internal,
     ],
     esm_entry_point = "ext:bridge_ext/bootstrap.js",
     options = { stable: Arc<StableState> },

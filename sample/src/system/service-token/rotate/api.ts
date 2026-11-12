@@ -5,6 +5,9 @@
 // 幂等护栏：宽限内的旧 bearer 再来 rotate → 409（SELECT 早退）；并发 rotate 由
 // 条件 update 栅栏兜住（后到者 UPDATE 命中 0 行 → 同一 409）——任意时刻同一
 // name 至多一行 active。
+// 原子性（db.tx，评审修复）：supersede + insert 同事务——insert 失败回滚翻转，
+// 旧 bearer 仍 active，宽限窗内重试恢复的承诺成立（非原子实现下 insert 失败
+// 会使该 name 永久无 active 行：重试撞 409、GET current 404，svc 账号卡死）。
 import { requireSvc, SVC_TTL_SECS, GRACE_SECS, nowSecs } from "../_shared";
 
 export const schema = {
@@ -28,36 +31,43 @@ async function post(): Promise<void> {
   const now = nowSecs();
   const jti = crypto.randomHex(16);
   const expiresAt = now + SVC_TTL_SECS;
+  // 事务外签发（不触库）；jwt.sign 失败无副作用。
   const token = await jwt.sign({
     sub: "svc:" + row.name,
     roles: ["bot"],
     claims: { svc: row.name, jti, scopes },
     ttl_secs: SVC_TTL_SECS,
   });
-  // 并发栅栏：条件 update（仅 active/存量 NULL 行可翻转），凭影响行数判胜负。
-  // 两个并发 rotate 持同一旧 bearer 时，行锁串行化两次 UPDATE——后到者重评估时
-  // status 已被前者翻成 superseded，命中 0 行 → 409，从根上排除「两行 active」
-  // （比 SELECT 校验可靠：SELECT 与 UPDATE 之间无锁，栅栏必须在写语句里）。
-  // 无须 db.tx：insert 只跟随成功的翻转，其唯一现实故障（jti 撞 128bit 随机）
-  // 可忽略；宽限窗保证旧 bearer 期内可重试恢复。
-  const n = await db.table("oj_svc_token").update({
-    status: "superseded",
-    grace_until: now + GRACE_SECS,
-  }).where({ and: [
-    { field: "jti", op: "eq", value: self.jti },
-    { or: [
-      { field: "status", op: "isnull" },
-      { field: "status", op: "eq", value: "active" },
-    ] },
-  ] }).run();
-  if (!n) {
-    json.fail(409, "bearer superseded — fetch the latest via GET current"); return;
+  // 并发栅栏在事务内：条件 update（仅 active/存量 NULL 行可翻转），凭影响行数
+  // 判胜负——两个并发 rotate 持同一旧 bearer 时行锁串行化，后到者 UPDATE 命中
+  // 0 行 → 409，从根上排除「两行 active」。insert 与翻转同事务：任一失败整事务
+  // 回滚（insert 唯一现实故障 jti 撞 128bit 随机也不再留下 superseded 残行）。
+  let flipped = true;
+  try {
+    await db.tx(async (tx: any) => {
+      const n = await tx.table("oj_svc_token").update({
+        status: "superseded",
+        grace_until: now + GRACE_SECS,
+      }).where({ and: [
+        { field: "jti", op: "eq", value: self.jti },
+        { or: [
+          { field: "status", op: "isnull" },
+          { field: "status", op: "eq", value: "active" },
+        ] },
+      ] }).run();
+      if (!n) { flipped = false; throw new Error("bearer superseded"); }
+      await tx.table("oj_svc_token").insert({
+        jti, name: row.name, scopes: JSON.stringify(scopes),
+        created_by: String(http.user!.id), created_at: now,
+        status: "active", token, expires_at: expiresAt,
+      }).run();
+    });
+  } catch (e) {
+    if (!flipped) {
+      json.fail(409, "bearer superseded — fetch the latest via GET current"); return;
+    }
+    throw e; // 真故障：事务已回滚，旧 bearer 仍 active，宽限窗内可重试
   }
-  await db.table("oj_svc_token").insert({
-    jti, name: row.name, scopes: JSON.stringify(scopes),
-    created_by: String(http.user!.id), created_at: now,
-    status: "active", token, expires_at: expiresAt,
-  }).run();
   json.ok({ token, jti, expires_at: expiresAt });
 }
 
