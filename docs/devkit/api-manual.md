@@ -834,14 +834,20 @@ get.schema = { query: { type: "object" } }; // 现在只放入参
 3. `required` 里的项**可能不在 `properties` 中**（JSON Schema 允许「只声明必填、不约束
    类型」），codegen 取值前先判存在。
 
-#### `.schema` 顶层只允许四个通道（v0.1.70，行为收紧）
+#### `.schema` 顶层通道白名单（v0.1.70 收紧；v0.1.130 起含 `description`）
 
-顶层键白名单 = `params` / `query` / `body` / `response`；其余键（`param` / `bodys` /
+顶层键白名单 = `params` / `query` / `body` / `response` / `description`（v0.1.130 起，string-only 组级说明，见下）；其余键（`param` / `bodys` /
 `responce` / `title` / `$schema` …）**装配期硬失败**（报错带 method / pattern /
 handler 链 / 文件）。以前这类键被**静默忽略**——拼错的通道意味着接口一直在裸奔，
 而「声明了但没生效」是本项目最重的缺陷类。报 `unsupported channel` 就改名或删除。
 （v0.1.72 的平级 `.response` 不在此列：它在 `.schema` 之外，胜出者会被写回
 `schema.response` 通道，同样过这道审计。）
+
+`description`（spec 2026-11-11 P1，v0.1.130+）：**组级说明，string-only**（写成对象/
+数组即 `description must be a string` 拒装），声明后由 `oj openapi` 透传为
+`operation.description`，并经 `spec_to_tools` 成为 MCP 工具 description（未声明则
+回落合成 summary）——想让工具目录带可读说明，就在 `.schema` 顶层写它。误删它会让
+MCP 工具失去描述；已有业务工程因此误删 197 条后恢复（2026-11-13）。
 
 ### ws.ts（WebSocket 生命周期钩子）
 

@@ -462,7 +462,7 @@ v0.1.70 新增 `.schema` 的**响应通道 `response`**（入参与出参同一�
 产生，校验失败时无所去处），它只作文档与生成真源，不得当脱敏/裁剪边界；`json.raw` /
 `json.stream` / `json.sse` 端点无信封，不要声明。产物另新增：operation 级与根级
 **`tags: [<module>]`**（下游按它分模块生成 client）、`x-oj-file` 改相对路径（不带本机绝对
-路径）。**行为收紧**：`.schema` 顶层键白名单只有 `params`/`query`/`body`/`response`，其余
+路径）。**行为收紧**：`.schema` 顶层键白名单 `params`/`query`/`body`/`response`（v0.1.130 起增 `description`，string-only，透传 openapi/MCP），其余
 （拼错的 `param`/`bodys`/`responce`）装配期硬失败——这类键以前被静默忽略，接口一直在裸奔；
 且该审计**不受 `schema_validation: false` 影响**（那开关只关运行期校验，不要拿它绕启动
 报错）。`oj openapi` 另加两道 fail-fast：生成前审计全部 `.schema`（非法契约不再原样进
