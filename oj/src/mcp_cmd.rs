@@ -39,6 +39,9 @@ const DISPATCH = __DISPATCH_JSON__;
 const EXPOSE = "__EXPOSE__";
 const GROUPS = __GROUPS_JSON__;
 const META = __META_JSON__;
+// 元工具名以 META 为单一来源（注入自 serve::mcp::meta_tool_defs）：拦截与分发
+// 按名单派生——新增元工具只需改 Rust 侧 defs 并在此补实现分支，不得另写名单。
+function isMetaName(name) { return META.some(function (t) { return t.name === name; }); }
 __TENANT_HEADER__
 
 const BASE_URL = process.env.OJ_BASE;
@@ -123,19 +126,31 @@ function searchTools(query, group, limit) {
 }
 
 // 元工具执行（L2 routed）：命中日志与 serve search_log_line 同字段（命中率分析），
-// 诊断走 stderr 不破 stdout 纯净纪律。
+// 诊断走 stderr 不破 stdout 纯净纪律。query/limit 口径与 serve run_meta_tool 逐字对齐：
+// 空 query 拒（-32602 载体为 isError；空串是任意串子串，不拦则 routed 一次 call
+// 拉平全目录——review S1）；limit 仅 JSON 整数参与钳制（3.5/"5" → 缺省 10），
+// 先钳 0..50（searchTools 下限钳 1），日志记钳后值；group 日志为 Rust Debug 形
+// Some("x")/None。
 function callMeta(name, args) {
+  if (!isMetaName(name)) {
+    return { isError: true, content: [{ type: "text", text: "unknown tool: " + name }] };
+  }
   if (name === "oj_search_tools") {
     if (!args || typeof args.query !== "string") {
       return { isError: true, content: [{ type: "text", text: "params.arguments.query must be a string" }] };
     }
+    if (args.query.length === 0) {
+      return { isError: true, content: [{ type: "text", text: "params.arguments.query must be a non-empty string" }] };
+    }
     const started = Date.now();
     // 非字符串 group 与 serve 同口径：忽略过滤（serve 侧 as_str → None）。
     const grp = typeof args.group === "string" ? args.group : null;
-    const result = searchTools(args.query, grp, args.limit);
+    const raw = args.limit;
+    const lim = (typeof raw === "number" && Number.isInteger(raw)) ? Math.min(Math.max(raw, 0), 50) : 10;
+    const result = searchTools(args.query, grp, lim);
     console.error("mcp search: query=" + JSON.stringify(args.query) +
-      " group=" + (grp == null ? "None" : JSON.stringify(grp)) +
-      " limit=" + (args.limit == null ? 10 : args.limit) +
+      " group=" + (grp == null ? "None" : "Some(" + JSON.stringify(grp) + ")") +
+      " limit=" + lim +
       " returned=" + result.matches.length +
       " zero=" + (result.matches.length === 0) +
       " elapsed_ms=" + (Date.now() - started));
@@ -145,12 +160,13 @@ function callMeta(name, args) {
     const result = { groups: GROUPS };
     return { content: [{ type: "text", text: JSON.stringify(result) }], structuredContent: result };
   }
-  return { isError: true, content: [{ type: "text", text: "unknown tool: " + name }] };
+  return { isError: true, content: [{ type: "text", text: "meta tool not implemented: " + name }] };
 }
 
 async function callTool(name, args) {
-  // oj_* 保留前缀在 DISPATCH 查找**之前**拦截（同 serve call_tool 短路序）。
-  if (typeof name === "string" && name.indexOf("oj_") === 0) return callMeta(name, args);
+  // 元工具名在 DISPATCH 查找**之前**短路（同 serve call_tool 短路序；名单来自
+  // META 单源派生）——业务 tool（含 oj_market_* 等 oj_ 前缀名）不得被劫持。
+  if (isMetaName(name)) return callMeta(name, args);
   const d = DISPATCH[name];
   if (!d) return { isError: true, content: [{ type: "text", text: "unknown tool: " + name }] };
   let path;
@@ -365,7 +381,15 @@ pub async fn run(a: &McpArgs) -> Result<i32, String> {
     let table =
         crate::openapi_cmd::discover_routes(&dir, &config_dir, ts, &base, module_index.as_deref())?;
     let spec = crate::openapi_cmd::generate(&table, &base)?;
-    let mut tools = serve::mcp::spec_to_tools(&spec)?;
+    let tools = serve::mcp::spec_to_tools(&spec)?;
+    // modules 白名单两线对齐（review #3/#7，v0.1.135）：codegen 与 serve 请求期
+    // tools_for / 装配期保留名扫描共用同一份 apply_modules_filter——产物只含白名单
+    // 模块（配置的暴露限制在 stdio 产物里不被静默放大）；保留名检查也在裁剪后
+    // 集合上跑，被排除模块不参与校验（与 oj serve 同口径，不得一边放行一边拒）。
+    let mut tools = serve::mcp::apply_modules_filter(
+        tools,
+        cfg.server.mcp.as_ref().and_then(|m| m.modules.as_ref()),
+    );
     // 回补 catch-all 参数名（spec 已收敛 `{x}`，须按路由表 raw pattern 判定）。
     for t in &mut tools {
         if let Some(raw) =
@@ -382,7 +406,8 @@ pub async fn run(a: &McpArgs) -> Result<i32, String> {
     let tenant_header = (cfg.tenant.enable && !cfg.tenant.header_key.is_empty())
         .then(|| cfg.tenant.header_key.clone());
     let hash = spec_hash(&spec);
-    // `oj_` 保留名 fail-fast（spec 2026-11-12）：与 serve 装配同标准，产物不静默撞名。
+    // 元工具保留名 fail-fast（spec 2026-11-12；v0.1.135 收窄为精确名判定且在
+    // modules 白名单裁剪后集合上跑）：与 serve 装配同标准，产物不静默撞名。
     serve::mcp::check_reserved_names(&tools)?;
     // L1/L2 模式决议（spec 2026-11-12）：CLI --expose 覆盖 config server.mcp.expose，
     // 缺省 flat（零破坏）。分组面 = 全量 tools 聚合（线路 A 静态快照无展示裁剪）。
@@ -442,6 +467,33 @@ mod tests {
                 catch_all: catch_all.iter().map(|s| s.to_string()).collect(),
             },
         }
+    }
+
+    // Given 带 tags 的 tool（name 恰为元工具保留名的 oj 模块 + 普通 user 模块）
+    // When apply_modules_filter + check_reserved_names（codegen 与 serve 同一份共享实现）
+    // Then 无白名单时精确撞名仍拒；白名单排除撞名模块时放行且只留白名单工具——
+    //      两线不得一边放行一边拒（review #7）；oj_ 前缀非保留名天然合法。
+    #[test]
+    fn codegen_whitelist_aligns_with_serve_scan() {
+        let mk = |name: &str, tag: &str| {
+            let mut t = tool(name, "/v1/api/x", vec![]);
+            t.tool
+                .as_object_mut()
+                .unwrap()
+                .insert("tags".into(), json!([tag]));
+            t
+        };
+        let tools = || vec![mk("oj_search_tools", "oj"), mk("user_list_get", "user")];
+        // 全集：精确撞名 → 拒（fail-fast 意图不随白名单放宽而丢）。
+        let err = serve::mcp::check_reserved_names(&tools()).unwrap_err();
+        assert!(err.contains("oj_search_tools"), "{err}");
+        // 白名单排除撞名模块：放行，且裁剪后集合只剩白名单工具（review #3/#7）。
+        let out = serve::mcp::apply_modules_filter(tools(), Some(&vec!["user".to_string()]));
+        assert_eq!(out.len(), 1);
+        assert!(serve::mcp::check_reserved_names(&out).is_ok());
+        // oj_ 前缀非保留名：无论是否过滤都合法。
+        let prefixed = vec![mk("oj_market_install_post", "oj-market")];
+        assert!(serve::mcp::check_reserved_names(&prefixed).is_ok());
     }
 
     // Given 两个 tool（其一 catch-all）
@@ -608,8 +660,8 @@ mod tests {
     }
 
     // Given routed 模式渲染
-    // Then list 分支只回元工具 + callTool 的 oj_ 拦截先于 DISPATCH 查找 +
-    //      本地 searchTools 在场 + 命中率日志（stderr）
+    // Then list 分支只回元工具 + callTool 的元工具拦截（isMetaName，META 单源派生）
+    //      先于 DISPATCH 查找 + 本地 searchTools 在场 + 命中率日志（stderr）
     #[test]
     fn render_routed_lists_only_meta_tools() {
         let js = render_server(
@@ -643,16 +695,31 @@ mod tests {
         // 命中率日志（stderr，stdout 纯净纪律不破）
         assert!(js.contains("mcp search:"), "{js}");
         assert!(js.contains("console.error"), "{js}");
-        // oj_ 拦截先于 DISPATCH 查找（索引比较钉顺序）
+        // 元工具拦截先于 DISPATCH 查找（索引比较钉顺序；名单经 isMetaName 从 META
+        // 单源派生——review #14：不得另写硬编码名单，新增元工具只改 Rust 侧 defs）。
         let intercept = js
-            .find("indexOf(\"oj_\")")
-            .unwrap_or_else(|| panic!("缺 oj_ 拦截: {js}"));
+            .find("if (isMetaName(name)) return callMeta(name, args);")
+            .unwrap_or_else(|| panic!("缺元工具拦截: {js}"));
         let dispatch = js
             .find("const d = DISPATCH[name]")
             .unwrap_or_else(|| panic!("缺 DISPATCH 查找: {js}"));
         assert!(
             intercept < dispatch,
-            "oj_ 拦截必须先于 DISPATCH 查找: intercept={intercept} dispatch={dispatch}"
+            "元工具拦截必须先于 DISPATCH 查找: intercept={intercept} dispatch={dispatch}"
+        );
+        // 空 query 护栏在场（review S1）：空串是任意串子串，不拦则 routed 一次
+        // call 拉平全目录——与 serve run_meta_tool 同口径 -32602/isError。
+        assert!(
+            js.contains("params.arguments.query must be a non-empty string"),
+            "{js}"
+        );
+        // limit 两线对齐（review #8）：仅 JSON 整数参与钳制（3.5/"5" → 缺省 10）。
+        assert!(js.contains("Number.isInteger(raw)"), "{js}");
+        // 命中日志 group 字段为 Rust Debug 形 Some("x")/None（review #15，离线聚合
+        // 单一解析器）。
+        assert!(
+            js.contains("\"Some(\" + JSON.stringify(grp) + \")\""),
+            "{js}"
         );
     }
 }

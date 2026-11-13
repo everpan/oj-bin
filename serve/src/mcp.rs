@@ -61,9 +61,39 @@ pub fn fnv1a64(bytes: &[u8]) -> u64 {
     h
 }
 
-/// 元工具保留名前缀（spec 2026-11-12）：业务 tool 名（**净化后**）以 `oj_` 开头
-/// 即与元工具撞名——serve 装配期与 `oj mcp` codegen 各跑一次 fail-fast。
-pub const META_PREFIX: &str = "oj_";
+/// 元工具保留名（spec 2026-11-12 定名，2026-11-13 由前缀收窄为精确名，上游需求
+/// docs/migration/oj-requirement-mcp-reserved-prefix.md §5 方案 A）：业务 tool 名
+/// （**净化后**）恰好等于元工具名才拒——前缀判定等价误伤「模块名以 oj 开头」的
+/// 合法命名（如 oj-market → oj_market_*）。serve 装配期与 `oj mcp` codegen
+/// 各跑一次 fail-fast；call 面元工具分发亦按此名单精确短路。
+pub const RESERVED_TOOL_NAMES: [&str; 2] = ["oj_search_tools", "oj_list_groups"];
+
+/// name 是否为元工具保留名（call 面分发短路与装配期校验同一份名单）。
+pub fn is_reserved_name(name: &str) -> bool {
+    RESERVED_TOOL_NAMES.contains(&name)
+}
+
+/// modules 白名单（R9 fail-closed）：Some 时仅保留 tags 与名单**有交集**的 tool，
+/// 无 tags 的路由排除；名单匹配不到任何模块 → 空列表（不得回落全集）。
+/// 位于共享核心：serve 端点（tools_for）与装配期保留名扫描（oj/src/app.rs）
+/// 必须用同一份实现（方案 B：被白名单裁掉的工具不参与保留名校验）。
+pub fn apply_modules_filter(tools: Vec<McpTool>, modules: Option<&Vec<String>>) -> Vec<McpTool> {
+    let Some(mods) = modules else {
+        return tools;
+    };
+    tools
+        .into_iter()
+        .filter(|t| {
+            t.tool
+                .get("tags")
+                .and_then(|v| v.as_array())
+                .is_some_and(|tags| {
+                    tags.iter()
+                        .any(|tg| tg.as_str().is_some_and(|s| mods.iter().any(|m| m == s)))
+                })
+        })
+        .collect()
+}
 
 /// `server.mcp.expose` 三态（L1 grouped / L2 routed，spec 2026-11-12）：
 /// 缺省 Flat = 现行为零破坏；serde lowercase 与 config 词表一致。
@@ -76,15 +106,20 @@ pub enum ExposeMode {
     Routed,
 }
 
-/// 装配期 fail-fast：业务 tool 名（净化后）占用 `oj_` 保留前缀 → Err（点名肇事
-/// 净化后名 + operationId + 路径，报错可定位到 route）。
+/// 装配期 fail-fast：业务 tool 名（净化后）恰好等于元工具保留名 → Err（点名肇事
+/// 净化后名 + operationId + 路径，报错可定位到 route）。精确名判定（2026-11-13
+/// 上游需求）：`oj_` 前缀本身不再有特殊含义，模块名以 oj 开头（oj-market 等）合法。
 pub fn check_reserved_names(tools: &[McpTool]) -> Result<(), String> {
     for t in tools {
-        if t.name.starts_with(META_PREFIX) {
+        if is_reserved_name(&t.name) {
             return Err(format!(
-                "MCP tool name `{}` (operationId `{}`, {} {}) uses reserved prefix \
-                 `{META_PREFIX}` (oj_search_tools / oj_list_groups) — rename the route",
-                t.name, t.dispatch.operation_id, t.dispatch.method, t.dispatch.oa_path
+                "MCP tool name `{}` (operationId `{}`, {} {}) collides with reserved \
+                 meta tool name ({}) — rename the route",
+                t.name,
+                t.dispatch.operation_id,
+                t.dispatch.method,
+                t.dispatch.oa_path,
+                RESERVED_TOOL_NAMES.join(" / ")
             ));
         }
     }
@@ -599,20 +634,32 @@ mod tests {
 
     // ---------- expose 三态（L1/L2 基座，2026-11-12 spec） ----------
 
-    // Given 无 oj_ 前缀工具 / 净化后与元工具撞名的 operationId
-    // When check_reserved_names
-    // Then 前者 Ok；后者 Err 且文案含净化后名与原始 operationId
+    // ---------- 保留名精确判定（2026-11-13 上游需求，方案 A） ----------
+
+    // Given 无 oj_ 前缀工具 / oj_ 开头但非保留名的 operationId / 净化后恰为元工具名的 operationId
+    // Then 前两者 Ok（前缀不再有特殊含义）；后者 Err 且文案含净化后名与原始 operationId
     #[test]
-    fn reserved_prefix_rejects_sanitized_collisions() {
+    fn reserved_names_reject_exact_meta_collisions_only() {
         let ok = spec(&[("/a", "get", op("user_list", json!({})))]);
         assert!(check_reserved_names(&spec_to_tools(&ok).unwrap()).is_ok());
-        // "oj.search-tools" 净化后 = "oj_search_tools"，与元工具撞名
-        let bad = spec(&[("/a", "get", op("oj.search-tools", json!({})))]);
+        // oj-market 场景（上游实测阻塞）：oj_ 前缀 ≠ 保留名，必须放行。
+        let oj_market = spec(&[(
+            "/oj-market/install",
+            "post",
+            op("oj_market_install_post", json!({})),
+        )]);
+        assert!(check_reserved_names(&spec_to_tools(&oj_market).unwrap()).is_ok());
+        // operationId 恰为 "oj_search_tools"（模块真叫这名，或 "oj search tools"
+        // 净化同形）→ 与元工具撞名——仍拒。
+        let bad = spec(&[("/a", "get", op("oj_search_tools", json!({})))]);
         let err = check_reserved_names(&spec_to_tools(&bad).unwrap()).unwrap_err();
         assert!(
-            err.contains("oj_search_tools") && err.contains("oj.search-tools"),
+            err.contains("oj_search_tools") && err.contains("/a"),
             "{err}"
         );
+        // "oj search tools" 净化（空格→_）后同为保留名——拒。
+        let bad2 = spec(&[("/a", "get", op("oj search tools", json!({})))]);
+        assert!(check_reserved_names(&spec_to_tools(&bad2).unwrap()).is_err());
     }
 
     // Given meta_tool_defs

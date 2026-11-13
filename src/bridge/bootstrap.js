@@ -230,9 +230,28 @@ const ojOrigFetch = globalThis.fetch;
 globalThis.fetch = function (input, init) {
   if (op_dispatch_on_internal()) {
     try {
-      const u = new URL(typeof input === "string" ? input : input.url, "http://oj.local");
-      const h = u.hostname.toLowerCase();
-      if (h === "localhost" || h === "::1" || h === "0.0.0.0" || h.indexOf("127.") === 0) {
+      // input may be string / URL / Request: URL objects have no .url field
+      // (review #2 -- old code parsed `undefined` against the base and got
+      // hostname 'oj.local', failing open); Request exposes .url. Take href
+      // via String() for URL instances. WHATWG URL.hostname keeps brackets
+      // for IPv6 ("[::1]") -- strip them before comparing, else ::1 spellings
+      // (and v4-mapped ::ffff:127.0.0.1) slip past the guard.
+      const raw =
+        typeof input === "string"
+          ? input
+          : input && typeof input.url === "string"
+            ? input.url
+            : String(input);
+      const u = new URL(raw, "http://oj.local");
+      const h = u.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+      if (
+        h === "localhost" ||
+        h === "::1" ||
+        h === "0:0:0:0:0:0:0:1" ||
+        h === "::ffff:127.0.0.1" ||
+        h === "0.0.0.0" ||
+        h.indexOf("127.") === 0
+      ) {
         return Promise.reject(new TypeError(
           "fetch to loopback is not supported on the internal dispatch pool (use bridge.call for in-process endpoints)"
         ));
@@ -441,7 +460,11 @@ globalThis.bridge = {
         body: bytes,
         text: async () => new TextDecoder().decode(bytes),
         json: async () => JSON.parse(new TextDecoder().decode(bytes)),
-        arrayBuffer: async () => bytes,
+        // arrayBuffer() must return a real ArrayBuffer (review #9: `bytes` is a
+        // Uint8Array; DataView and friends would throw TypeError) -- slice out
+        // a fresh ArrayBuffer copy.
+        arrayBuffer: async () =>
+          bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
         clone() { return this; },
       };
     }

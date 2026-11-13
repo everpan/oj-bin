@@ -9,6 +9,8 @@
 // 旧 bearer 仍 active，宽限窗内重试恢复的承诺成立（非原子实现下 insert 失败
 // 会使该 name 永久无 active 行：重试撞 409、GET current 404，svc 账号卡死）。
 import { requireSvc, SVC_TTL_SECS, GRACE_SECS, nowSecs } from "../_shared";
+// 40311 唯一源在 auth/_shared/obo（评审清理项：裸字面量两处写必漂移）。
+import { OBO } from "../../../auth/_shared/obo";
 
 export const schema = {
   description: "svc 凭据自轮换（需该 name 当前 active 的 svc bearer）",
@@ -22,7 +24,7 @@ async function post(): Promise<void> {
     .where({ field: "jti", op: "eq", value: self.jti })
     .all();
   const row = rows[0];
-  if (!row) { json.fail(40311, "jti revoked or unknown"); return; } // fail-closed
+  if (!row) { json.fail(OBO.REVOKED, "jti revoked or unknown"); return; } // fail-closed
   if (row.status && row.status !== "active") {
     json.fail(409, "bearer superseded — fetch the latest via GET current"); return;
   }

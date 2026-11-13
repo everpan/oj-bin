@@ -1031,12 +1031,16 @@ fn static_opts_of_validates_and_three_state_dir() {
     );
 }
 
-/// MCP `oj_` 保留名扫描（评审 Important 收口）：catalog 生成失败的挂载**不得**
-/// 扩大爆炸半径——v0.1.134 前这类挂载 REST 照常、仅 /mcp 请求期 -32603；扫描
-/// 只把「保留名碰撞」升级为拒启（fail-fast 意图不变），生成缺陷维持既有行为
-/// （warn 留痕 + 请求期 -32603）。
+/// MCP 元工具保留名扫描（评审 Important 收口 + 2026-11-13 上游需求收窄）：
+/// catalog 生成失败的挂载**不得**扩大爆炸半径——v0.1.134 前这类挂载 REST 照常、
+/// 仅 /mcp 请求期 -32603；扫描只把「保留名碰撞」升级为拒启（fail-fast 意图不变），
+/// 生成缺陷维持既有行为（warn 留痕 + 请求期 -32603）。
+/// v0.1.135：前缀判定收窄为**精确名**判定（oj-requirement-mcp-reserved-prefix.md
+/// §5 A）——`oj_` 前缀不再有特殊含义，模块名以 oj 开头（oj-market 场景）合法放行；
+/// 派生 operationId 恒带 `_<method>` 后缀，精确撞名仅可能来自未来的 operationId
+/// 覆盖能力（方案 C），此处以 serve 层单测钉判定本身。
 #[test]
-fn mcp_reserved_scan_skips_broken_catalog_but_rejects_oj_prefix() {
+fn mcp_reserved_scan_skips_broken_catalog_and_accepts_oj_prefix_modules() {
     let dir = std::env::temp_dir().join(format!("oj-mcpscan-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -1065,15 +1069,17 @@ fn mcp_reserved_scan_skips_broken_catalog_but_rejects_oj_prefix() {
     // 仅生成失败的表 → 扫描放行（不拒启）。
     let only_broken = vec![("/v1/api".to_string(), broken.clone())];
     assert!(
-        scan_reserved_tool_names(&only_broken).is_ok(),
+        scan_reserved_tool_names(&only_broken, None).is_ok(),
         "生成缺陷不得升级为整机拒启（维持请求期 -32603 既有行为）"
     );
-    // 含 oj_ 前缀碰撞的表（模块名 oj）→ 拒启，报错点名保留前缀。
-    let colliding = mk(&[("/v1/api/oj/search", "get")]);
-    let tables = vec![("/v1/api".to_string(), colliding)];
-    let err = scan_reserved_tool_names(&tables).unwrap_err();
-    assert!(err.contains("oj_"), "{err}");
-    // 健康表 → 通过。
+    // oj_ 前缀模块（上游 oj-market 实测阻塞场景）→ 精确名判定下合法放行。
+    let oj_market = mk(&[("/v1/api/oj-market/install", "post")]);
+    let tables = vec![("/v1/api".to_string(), oj_market)];
+    assert!(
+        scan_reserved_tool_names(&tables, None).is_ok(),
+        "oj_ 前缀 ≠ 保留名：模块名以 oj 开头不得拒启"
+    );
+    // modules 白名单收窄（方案 B）：名单内无撞名模块时不影响结论（裁剪后集合校验）。
     let healthy = mk(&[("/v1/api/user/account", "get")]);
-    assert!(scan_reserved_tool_names(&[("/v1/api".to_string(), healthy)]).is_ok());
+    assert!(scan_reserved_tool_names(&[("/v1/api".to_string(), healthy)], None).is_ok());
 }

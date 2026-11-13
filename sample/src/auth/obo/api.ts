@@ -36,18 +36,13 @@ export default {
       json.fail(OBO.NOT_SVC, OBO_MSG[OBO.NOT_SVC]);
       return;
     }
-    // 40311 已吊销：登记表查无此 jti（fail-closed；缺 jti claim 同判）。
+    // 40311 已吊销：**不在本 handler 重查登记表**（评审 #10）——dispatch 的 ②
+    // jti 门（svc 标记 token 全动词覆盖，/auth/obo 无豁免）已按 SvcGate 的
+    // status/grace 真相源 fail-closed，先于 handler 执行；此处再查「行存在」是
+    // 第二真相源（行永不删，过期 superseded 行也会被当成有效），且一旦未来出现
+    // 绕过 admit 的通路（in-process 调用等）即失效。jti claim 缺失同判（验签层
+    // 不可能发生，纵深防御保留）。
     if (typeof jti !== "string" || !jti) {
-      await audit("", false, "revoked");
-      json.fail(OBO.REVOKED, OBO_MSG[OBO.REVOKED]);
-      return;
-    }
-    const tok = await db
-      .table("oj_svc_token")
-      .select(["jti"])
-      .where({ field: "jti", op: "eq", value: jti })
-      .all();
-    if (!tok.length) {
       await audit("", false, "revoked");
       json.fail(OBO.REVOKED, OBO_MSG[OBO.REVOKED]);
       return;

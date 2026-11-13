@@ -6,10 +6,11 @@
 //! 执行（`mark_internal` 池），公共池不再被自环耗尽。
 //!
 //! 结构：根 crate 的 op（`dispatch_bridge::op_dispatch`）读共享槽拿 hook；hook 在
-//! `app_with_exec` 装配期 set 进槽（槽位后填，照搬 `reload_bridge` 惯例），持一份
+//! `app_with_exec` 装配期 install 进槽（槽位后填，照搬 `reload_bridge` 惯例），持一份
 //! `actor` 换绑为内部分发池的 `AppState` 克隆，虚拟请求原样走既有
-//! `handle()`/`mcp_http` 管线（准入/租户/超时/契约语义零分叉）。热更每代重建自己的
-//! 槽与 hook（各代 `from_config` 独立接线），不存在跨代串号。
+//! `handle()`/`mcp_http` 管线（准入/租户/超时/契约语义零分叉）。槽为**可换代**
+//! 结构（`DispatchSlot::install` 覆盖，评审 #1）：backend 复用热更路径下每代
+//! `app_with_exec` 重新 install——bridge.call 永随当前代路由表，不存在跨代串号。
 
 use std::sync::Arc;
 
@@ -41,8 +42,9 @@ pub fn mark_internal(
 const DISPATCH_BODY_CAP: usize = 64 * 1024 * 1024;
 const DISPATCH_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// 装配 hook 并 set 进共享槽（`app_with_exec` 每代调用一次；OnceLock 重复 set
-/// 忽略——每代持有自己的槽，重复 set 仅防御性容错）。
+/// 装配 hook 并 install 进共享槽（`app_with_exec` **每代**调用一次：换代覆盖
+/// install——评审 #1，OnceLock `let _ = set` 曾丢弃 gen-2 hook、桥永绑 gen-1
+/// 路由表；覆盖后 bridge.call 始终命中当前代）。
 pub(crate) fn install_dispatch_hook(
     st: &AppState,
     d_actor: crate::actor::JsActor,
@@ -56,7 +58,7 @@ pub(crate) fn install_dispatch_hook(
         let st = inner.clone();
         Box::pin(async move { dispatch_virtual(st, req).await })
     });
-    let _ = slot.set(hook);
+    slot.install(hook);
 }
 
 /// 虚拟请求派发：保留路由（与 `app_with_exec` 注册循环同表，改动须两侧同步）
@@ -90,44 +92,75 @@ pub(crate) async fn dispatch_virtual(st: AppState, req: DispatchReq) -> Dispatch
         }
     }
     // 保留基础设施端点（与 app_with_exec 的注册循环同表；/blob 下载/直传与
-    // 业务路由都在 catch-all handle() 内，无需在此点名）。
+    // 业务路由都在 catch-all handle() 内，无需在此点名）。method 不匹配先记
+    // Allow（末尾统一 405 + Allow，对齐 axum 路由语义，评审 #12）；HEAD 归一
+    // 到 GET（axum get() 自动服务 HEAD——dispatch 与真实 HTTP 同语义），且
+    // HEAD 响应体按协议清空。
     let path = uri.path();
-    let verb = method.as_str();
+    let verb = if method == Method::HEAD {
+        "get"
+    } else {
+        method.as_str()
+    };
+    let mut allow: Vec<&'static str> = Vec::new();
+    let mut hit: Option<Response> = None;
     for m in &st.mounts {
         let RuntimeMount::Api { prefix, .. } = m else {
             continue;
         };
         let p = prefix.trim_end_matches('/');
-        let hit = match (verb, path) {
-            ("GET", x) if x == format!("{p}/health") => {
-                Some(crate::health_handler(State(st.clone())).await)
+        let table: [(&str, &str, bool); 4] = [
+            ("GET", "health", true),
+            ("GET", "plugins", true),
+            ("POST", "mcp", st.pipeline.mcp.is_some()),
+            ("POST", "rpc", st.pipeline.rpc),
+        ];
+        for (v, suffix, on) in table {
+            if !on || path != format!("{p}/{suffix}") {
+                continue;
             }
-            ("GET", x) if x == format!("{p}/plugins") => {
-                Some(crate::plugins_handler(State(st.clone())).await)
+            allow.push(v);
+            if v.eq_ignore_ascii_case(verb) && hit.is_none() {
+                hit = Some(match suffix {
+                    "health" => crate::health_handler(State(st.clone())).await,
+                    "plugins" => crate::plugins_handler(State(st.clone())).await,
+                    "mcp" => {
+                        crate::mcp_http::handle(
+                            State(st.clone()),
+                            uri.clone(),
+                            headers.clone(),
+                            Body::from(req.body.clone()),
+                        )
+                        .await
+                    }
+                    _ => {
+                        crate::mcp_http::rpc_handle(
+                            State(st.clone()),
+                            uri.clone(),
+                            headers.clone(),
+                            Body::from(req.body.clone()),
+                        )
+                        .await
+                    }
+                });
             }
-            ("POST", x) if x == format!("{p}/mcp") && st.pipeline.mcp.is_some() => Some(
-                crate::mcp_http::handle(
-                    State(st.clone()),
-                    uri.clone(),
-                    headers.clone(),
-                    Body::from(req.body.clone()),
-                )
-                .await,
-            ),
-            ("POST", x) if x == format!("{p}/rpc") && st.pipeline.rpc => Some(
-                crate::mcp_http::rpc_handle(
-                    State(st.clone()),
-                    uri.clone(),
-                    headers.clone(),
-                    Body::from(req.body.clone()),
-                )
-                .await,
-            ),
-            _ => None,
-        };
-        if let Some(resp) = hit {
-            return resp_to_dispatch(resp).await;
         }
+    }
+    if let Some(mut resp) = hit {
+        if method == Method::HEAD {
+            *resp.body_mut() = Body::empty();
+        }
+        return resp_to_dispatch(resp).await;
+    }
+    if !allow.is_empty() {
+        return DispatchResp {
+            status: 405,
+            headers: vec![
+                ("content-type".to_string(), "application/json".to_string()),
+                ("allow".to_string(), allow.join(", ")),
+            ],
+            body: only_js::bridge::fail(405, "method not allowed", &Value::Null).0,
+        };
     }
     // 业务路由 / blob / dev 兜底 / 配对 web：catch-all 管线（AppState 的 actor
     // 已换绑内部分发池，目标 handler 不占公共槽）。
@@ -146,10 +179,17 @@ pub(crate) async fn dispatch_virtual(st: AppState, req: DispatchReq) -> Dispatch
 /// Response → DispatchResp（体整体缓冲；流式/超限/超时按 502 收敛）。
 async fn resp_to_dispatch(resp: Response) -> DispatchResp {
     let status = resp.status().as_u16();
+    // 头值保真（评审 S3）：非 UTF-8 字节经 lossy 保留（原 to_str().ok()? 整体
+    // 丢弃——如 content-disposition 里的 UTF-8 文件名在代理链上静默消失）。
     let headers: Vec<(String, String)> = resp
         .headers()
         .iter()
-        .filter_map(|(k, v)| Some((k.to_string(), v.to_str().ok()?.to_string())))
+        .map(|(k, v)| {
+            (
+                k.to_string(),
+                String::from_utf8_lossy(v.as_bytes()).into_owned(),
+            )
+        })
         .collect();
     let body = match tokio::time::timeout(
         DISPATCH_BODY_TIMEOUT,

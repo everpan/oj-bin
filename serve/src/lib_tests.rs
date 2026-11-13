@@ -2843,7 +2843,7 @@ async fn spawn_dispatch_server(
     let dir = t.0.clone();
     let table = build_table(&dir, true, "/v1/api");
     let slot: Arc<only_js::bridge::dispatch_bridge::DispatchSlot> =
-        Arc::new(std::sync::OnceLock::new());
+        Arc::new(only_js::bridge::dispatch_bridge::DispatchSlot::new());
     let make = {
         let root = dir.clone();
         let slot = slot.clone();
@@ -3084,4 +3084,37 @@ export default {
     assert!(r.contains("\"outer\":200"), "{r}");
     assert!(r.contains("\"status\":503"), "{r}");
     assert!(r.contains("nested bridge.call is not supported"), "{r}");
+}
+
+/// 保留端点的 method 语义（评审 #12）：dispatch 与真实 axum 路由对齐——
+/// verb 不匹配给 405 + Allow（原实现落入 catch-all 成 404）；HEAD 归一到
+/// GET（axum get() 自动服务 HEAD）且响应体按协议清空。
+#[tokio::test]
+async fn bridge_call_reserved_endpoint_405_allow_and_head_parity() {
+    let probe = r#"
+export default {
+  post: async () => {
+    const r1 = await bridge.call({ method: "GET", path: "/v1/api/mcp" });
+    const r2 = await bridge.call({ method: "HEAD", path: "/v1/api/health" });
+    json.ok({
+      get_mcp: r1.status,
+      allow: r1.headers.get("allow"),
+      head_health: r2.status,
+      head_body: (await r2.text()).length,
+    });
+  },
+};
+"#;
+    let (addr, _keep) = spawn_dispatch_server(&[("probe/api.ts", probe)], true).await;
+    let r = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        post_json(addr, "/v1/api/probe/", r#"{"x":1}"#),
+    )
+    .await
+    .expect("reserved-endpoint probe hung");
+    assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+    assert!(r.contains("\"get_mcp\":405"), "{r}");
+    assert!(r.contains("\"allow\":\"POST\""), "{r}");
+    assert!(r.contains("\"head_health\":200"), "{r}");
+    assert!(r.contains("\"head_body\":0"), "{r}");
 }

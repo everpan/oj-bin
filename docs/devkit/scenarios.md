@@ -4969,7 +4969,8 @@ export default {
 消费方 handler 的惰性自愈轮换（wecom-bot 接法）：
 
 ```ts
-// 启动恢复：拿内存/vars 里的旧 bearer 取最新（旧 bearer 宽限内仍有效即可当门票）
+// 启动恢复：用共享存储里 rotator 回写的最新 bearer 调 current（它就该是 active；
+// v0.1.136 起 /current 只认当前 active bearer——宽限中的旧 bearer 也是 40311）
 async function loadSvcBearer(): Promise<string> {
   const cached = await kv.get("bot:svc:bearer");
   const old = cached ?? process.env.BOOTSTRAP_SVC; // 首次部署的门票 bearer（admin 签发）
@@ -4995,7 +4996,12 @@ async function ensureFreshSvcBearer(): Promise<string> {
     body: "{}",
   });
   const body = await r.json();
-  if (body.code === 409) return loadSvcBearer(); // 已被别人换过 → 取最新
+  // 已被别人换过 → 对方已把新 token 回写共享存储，重读即可（旧票刷 current 是 40311）
+  if (body.code === 409) {
+    const fresh = await kv.get("bot:svc:bearer");
+    if (fresh && fresh !== bearer) return fresh;
+    return loadSvcBearer();
+  }
   if (body.code !== 0) throw new Error(`svc rotate failed: ${body.code} ${body.msg}`);
   await kv.set("bot:svc:bearer", body.data.token);
   await kv.set("bot:svc:expires_at", String(body.data.expires_at));
@@ -5004,13 +5010,14 @@ async function ensureFreshSvcBearer(): Promise<string> {
 ```
 
 验证口径（与 `sample/tests/svc-rotation.test.ts` 同序）：admin 签发（响应带
-`expires_at`）→ svc bearer `rotate` 得新 jti → 旧 bearer `current` 取回新 token
-→ 旧 bearer 再 `rotate` 得 409 → 新 bearer 可链式续换 → admin list 可见
-status 且**永不回显明文**。
+`expires_at`）→ svc bearer `rotate` 得新 jti → 新 bearer `current` 200 / 旧宽限
+bearer `current` 40311（v0.1.136，只认 active）→ 旧 bearer 再 `rotate` 得 409 →
+新 bearer 可链式续换 → admin list 可见 status 且**永不回显明文** → admin 同名
+再 POST 驱旧生效、恰一行 active（v0.1.136）。
 
 | 坑 | 解 |
 |---|---|
-| rotate 后旧 bearer 立刻 403 | 不会——旧 jti 有 **24h 宽限**（在途请求平滑），过期才自动 40311。收到 40311 说明宽限已过，走 `current` 恢复（需任一有效旧 bearer 当门票；全丢则 admin 重签一次） |
+| rotate 后旧 bearer 立刻 403 | 调用面不会——旧 jti 有 **24h 宽限**（在途请求平滑），过期才自动 40311。但 `current` 只认**当前 active** bearer（v0.1.136）：宽限中的旧 bearer 当门票刷 current 也 40311，被轮换凭据无权读出新令牌——恢复靠共享存储里 rotator 回写的最新 token；全丢则 admin 重签一次 |
 | 用员工 token 调 rotate/current | 403——只认 svc bearer（claims.svc）；守卫验签 + jti 门 + claims 取身份三层 |
 | read 档 bot 能不能自轮换 | 能——两端点 scopes 豁免（强制 write 档反而提权）；jti 门照常，吊销的 bearer 换不动 |
 | 新签/轮换后立刻用新 bearer 40311 | 不该发生——SvcGate miss 穿透重查，新 jti 即时可见（v0.1.132）；真遇到先查行是否落库、jti 是否抄错 |
@@ -5065,6 +5072,7 @@ routed（list 恰好 `oj_search_tools`/`oj_list_groups`；search 的 match 带
 |---|---|
 | client 报「list 只有 2 个工具」 | routed 是设计——spec 允许 call 名不在 list 内（warden/Codex 先例）；先 `oj_search_tools` 再直呼。只认 list 白名单的 client 用 `grouped`/`flat`（调用面三模式一致） |
 | search 返回空数组但工具明明存在 | 大概率被 scopes/act_mask 裁了（检索与 list 同一**展示裁剪后**集合，无权≡不存在同形状防探测）——拿被裁 name 直呼会得 403 而非 -32601；换高档位 token 再查 |
-| 检索效果差（查不到想要的） | 子串非语义：搜模块名/动词/路径片段；`group` 参数是精确过滤；`limit` 缺省 10 钳 50。命中率看 serve 日志 `mcp search: … zero=… elapsed_ms=…`（线路 A 在产物 stderr） |
-| 业务 tool 名撞 `oj_` 前缀启动报错 | v0.1.134 保留前缀 fail-fast（装配与 `oj mcp` 双路扫描）——按报错里的 operationId/method/oa_path 改路由名 |
+| 检索效果差（查不到想要的） | 子串非语义：搜模块名/动词/路径片段；`group` 参数是精确过滤；`limit` 缺省 10 钳 50、仅 JSON 整数参与（`3.5`/`"5"` 按缺省 10，两线一致）。命中率看 serve 日志 `mcp search: … zero=… elapsed_ms=…`（线路 A 在产物 stderr，同字段） |
+| 空 query 报 `-32602 … non-empty` | v0.1.135 护栏：空串是任意串子串，不拦则 routed 模式一次 call 拉平全目录（routed 不枚举的设计形同虚设）；两线同拒，给非空关键词即可 |
+| 业务 tool 名恰为 `oj_search_tools`/`oj_list_groups` 启动报错 | v0.1.135 起仅**精确名**才 fail-fast（装配与 `oj mcp` 双路扫描）——按报错里的 operationId/method/oa_path 改路由名；`oj_` 前缀（如 `oj_market_*`）合法不叫撞名；被 `server.mcp.modules` 白名单排除的模块不参与校验 |
 | 线路 A 分组/检索可见被 scopes 裁的工具 | 已知分歧：静态快照无 per-request user，聚合全量（仅名称/计数级；执行仍由服务端 admit 拦） |

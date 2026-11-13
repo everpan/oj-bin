@@ -15,17 +15,28 @@ async function get(): Promise<void> {
     .select(["jti", "status", "scopes", "token", "created_at", "expires_at"])
     .where({ field: "name", op: "eq", value: self.name })
     .all();
-  // 任意时刻至多一行 active（rotate 条件 update 栅栏保证）；存量行 status 为 NULL
-  // 视为 active。created_at 同秒平局时按 jti 字典序取定——排序确定性，不随引擎
-  // 返回序漂移（存量多 active 行的保守行为，rotate 路径本身不产生平局）。
+  // 任意时刻至多一行 active（rotate/admin 签发的驱旧栅栏保证；存量行 status 为
+  // NULL 视为 active）。created_at 同秒平局时按 jti **字节序**取定（评审 S5：
+  // localeCompare 是 ICU 区域相关排序，跨运行环境结果可漂移；字节序与引擎/地域
+  // 无关）——排序确定性，不随引擎返回序漂移。
   const actives = rows
     .filter((r: any) => !r.status || r.status === "active")
-    .sort((a: any, b: any) =>
-      Number(b.created_at) - Number(a.created_at) ||
-      String(a.jti).localeCompare(String(b.jti)));
+    .sort((a: any, b: any) => {
+      const aj = String(a.jti), bj = String(b.jti);
+      return Number(b.created_at) - Number(a.created_at) ||
+        (aj < bj ? -1 : aj > bj ? 1 : 0);
+    });
   const row = actives[0];
   if (!row || !row.token) {
     json.fail(404, "no active token for this svc name"); return;
+  }
+  // 明文面只回**当前 active 行持有者**（评审 #4）：SvcGate 放行宽限内旧 jti 是
+  // 为在途请求平滑，不是恢复通道——泄漏的旧 bearer 若可 current 取回新明文，即可
+  // 经 current→rotate 链式续换，轮换=吊销被架空（只有 grace 过期/admin DELETE
+  // 才真吊销）。宽限 bearer 取明文 → 40311（与吊销同码，admin 重签才是正路）。
+  if (String(row.jti) !== self.jti) {
+    json.fail(40311, "bearer superseded — only the current active bearer can read the token");
+    return;
   }
   let scopes: string[] = [];
   try { scopes = JSON.parse(String(row.scopes || "[]")); } catch { scopes = []; }

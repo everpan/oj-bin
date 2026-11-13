@@ -812,7 +812,7 @@ async fn oj_require_cjs_interop_end_to_end() {
         platform: None,
         exec: None,
         reload: Arc::new(std::sync::OnceLock::new()),
-        dispatch: Arc::new(std::sync::OnceLock::new()),
+        dispatch: Arc::new(crate::bridge::dispatch_bridge::DispatchSlot::new()),
         generic_axes: Arc::new(HashMap::new()),
         oj_info: Arc::new(serde_json::json!({})),
     });

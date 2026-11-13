@@ -3488,6 +3488,23 @@ async fn mcp_e2e_routed_meta_tools_and_call_face() {
     .await;
     assert_eq!(s, 200);
     assert_eq!(v["error"]["code"], -32601, "{v}");
+    // 空 query 护栏（review S1，v0.1.135）：空串是任意串子串——不拦则一次 call
+    // 拉平整个目录（routed 不枚举的设计形同虚设）；-32602，两线同口径。
+    let (s, v) = rpc_req(
+        addr,
+        "/v1/api/mcp",
+        r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"oj_search_tools","arguments":{"query":""}}}"#,
+    )
+    .await;
+    assert_eq!(s, 200);
+    assert_eq!(v["error"]["code"], -32602, "{v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("non-empty"),
+        "{v}"
+    );
 }
 
 /// R9 fail-closed × routed（spec 2026-11-12）：modules 白名单落空 → 业务集空，

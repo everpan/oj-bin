@@ -872,11 +872,16 @@ pub(crate) fn static_opts_of(
     ))
 }
 
-/// MCP `oj_` 保留名扫描（spec 2026-11-12）：逐挂载 generate → spec_to_tools →
-/// check_reserved_names；**生成/spec 缺陷不升级为拒启**——warn 留痕并跳过该挂载
-/// （其 /mcp 请求期 -32603 的既有行为不变，REST 不受影响）；只有「生成成功且
-/// 净化名撞 `oj_` 前缀」才拒启（fail-fast 意图收窄到保留名本身）。
-fn scan_reserved_tool_names(tables: &[(String, routes::RouteTable)]) -> Result<(), String> {
+/// MCP 元工具保留名扫描（spec 2026-11-12；2026-11-13 上游需求收窄）：逐挂载
+/// generate → spec_to_tools → **modules 白名单裁剪（与请求期 tools_for 同一份
+/// 共享实现）** → check_reserved_names；**生成/spec 缺陷不升级为拒启**——warn
+/// 留痕并跳过该挂载（其 /mcp 请求期 -32603 的既有行为不变，REST 不受影响）；
+/// 只有「裁剪后的实际暴露集里净化名恰为元工具保留名」才拒启（fail-fast 意图
+/// 收窄到保留名本身：被白名单排除的模块不参与校验——不暴露就不该阻断启动）。
+fn scan_reserved_tool_names(
+    tables: &[(String, routes::RouteTable)],
+    modules: Option<&Vec<String>>,
+) -> Result<(), String> {
     for (prefix, table) in tables {
         let spec = match serve::openapi::generate(table, prefix) {
             Ok(s) => s,
@@ -897,7 +902,7 @@ fn scan_reserved_tool_names(tables: &[(String, routes::RouteTable)]) -> Result<(
                 continue;
             }
         };
-        serve::mcp::check_reserved_names(&tools)?;
+        serve::mcp::check_reserved_names(&serve::mcp::apply_modules_filter(tools, modules))?;
     }
     Ok(())
 }
@@ -1674,9 +1679,10 @@ pub async fn assemble_backend(
     // StableState 注入同一 Arc，槽指针构造期冻结、内容由装配层后填。
     let reload_slot = reload_slot.unwrap_or_else(|| Arc::new(std::sync::OnceLock::new()));
     // bridge.call 派发槽（v0.1.131 上游 R7）：同 reload 的槽位惯例——Extras 与
-    // StableState 注入同一 Arc，内容（hook）由 serve::app_with_exec 装配期后填。
+    // StableState 注入同一 Arc；槽**可换代**（评审 #1），hook 由 serve::app_with_exec
+    // 每代 install 覆盖，bridge.call 永随当前代。
     let dispatch_slot: Arc<only_js::bridge::dispatch_bridge::DispatchSlot> =
-        Arc::new(std::sync::OnceLock::new());
+        Arc::new(only_js::bridge::dispatch_bridge::DispatchSlot::new());
     // 单实例换代槽（v0.1.122 D3）：registry/modules/tenant 旗标打包单指针，
     // make_bridge_of 与 Backend 共享同一 Arc —— 热更 swap 后全 Bridge 同步可见。
     let assembly_slot: AssemblySlot = Arc::new(std::sync::RwLock::new(Arc::new(PerGenAssembly {
@@ -2335,8 +2341,18 @@ impl App {
         // 无该库时缺位：dispatch 端 jti 门 fail-closed，svc 标记的 token 一律拒；
         // auth 关闭时无 token 可验，不告警。
         let svc_db_key = profiles.db.as_deref().unwrap_or("default");
+        // 点查占位符按方言注入（评审 #5）：sqlx::Any 层 postgres 须 `$1`，
+        // 其余 `?`（对齐 accessor_sqlx 的方言表）；未知/缺席回落 `?`（sqlite 系）。
+        let svc_ph: &'static str = cfg
+            .db
+            .get(svc_db_key)
+            .map(|d| if d.starts_with("postgres") { "$1" } else { "?" })
+            .unwrap_or("?");
         let svc_gate = match stable.dbs.get(svc_db_key) {
-            Some(acc) => Some(Arc::new(serve::svc_gate::SvcGate::new(acc.clone()))),
+            Some(acc) => Some(Arc::new(serve::svc_gate::SvcGate::with_placeholder(
+                acc.clone(),
+                svc_ph,
+            ))),
             None => {
                 if auth.is_some() {
                     tracing::warn!(
@@ -2460,12 +2476,17 @@ impl App {
         // 的谎话）。多 api 挂载：按 handler 前缀定表。
         validate_html_meta_handler(&cfg, &tables)?;
         // MCP `oj_` 保留名 fail-fast（spec 2026-11-12 L1/L2 基座）：每个挂载的
-        // 净化后 tool 名撞元工具前缀（oj_search_tools/oj_list_groups）→ 拒启，
-        // 报错点名肇事 route。覆盖所有 mount；dev 热重载新增 oj_* 不在此列（已知限制）。
+        // 净化后 tool 名恰为元工具保留名（oj_search_tools/oj_list_groups）→ 拒启，
+        // 报错点名肇事 route。覆盖所有 mount；dev 热重载新增撞名不在此列（已知限制）。
         // 评审 Important 收口：catalog 生成失败的挂载**不扩大爆炸半径**（v0.1.134
         // 前这类部署 REST 照常、仅 /mcp 请求期 -32603）——扫描只升级保留名碰撞。
+        // v0.1.135 上游需求收窄（oj-requirement-mcp-reserved-prefix.md §5 A+B）：
+        // 前缀判定 → 精确名判定；且先经 modules 白名单裁剪——被排除的模块不参与校验。
         if cfg.server.mcp.as_ref().is_some_and(|m| m.enabled) {
-            scan_reserved_tool_names(&tables)?;
+            scan_reserved_tool_names(
+                &tables,
+                cfg.server.mcp.as_ref().and_then(|m| m.modules.as_ref()),
+            )?;
         }
         // server.cors（v0.1.35）：credentials 需显式 origins——否则 tower-http 运行期
         // panic（Any 源 + credentials 不被允许）。装配期 fail-fast 比请求期崩溃更友好。

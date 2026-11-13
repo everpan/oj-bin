@@ -16,6 +16,87 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.136（2026-11-13，tag v0.1.136）
+
+code review（v0.1.132 起）确认发现全量收口——MCP 两线一致簇已于 v0.1.135
+落地，本版修完其余全部：dispatch 换代、svc 门、sample 凭据面、bridge 护栏。
+
+- **fix（dispatch 槽可换代，#1）**：`DispatchSlot` 由 `OnceLock` 改为
+  `RwLock<Option<DispatchHook>>`（install 覆盖语义）——backend 复用路径
+  （热更每代重新 `app_with_exec`）此前 `let _ = set` 丢弃 gen-2 的 hook，
+  bridge.call 永绑 gen-1 路由表/管线；换代 install 后即刻命中当前代，
+  裸嵌入式不装配仍 fail-closed（`dispatch not available`）。
+- **fix（dispatch 请求体上限，S2）**：`bridge.call` 请求体 64 MiB 封顶
+  （超限抛 `bridge.call: request body exceeds the 64 MiB dispatch cap`）——
+  进程内 dispatch 是 HTTP/插件之外的第三条入站通路，不得成为绕开入站
+  413 的无限大旁路（响应侧本就有 64 MiB 缓冲上限）。
+- **fix（dispatch 虚拟端点方法协商，#12/S3）**：bridge.call 打保留端点
+  （`{base}/health`/`plugins`/`mcp`/`rpc`）方法不匹配回 **405 + `Allow`
+  头**（此前 404，客户端无法区分「无此路由」与「方法错了」）；HEAD 按
+  GET 语义派发、响应体清空（与 HTTP 面一致）。
+- **fix（SvcGate 负窗不打全表，#5）**：伪造/未知 jti 的 2s 全局负缓存窗
+  从「窗内一律拒不打库」细化为「窗内抑**全量扫描**、miss 走 **PK 点查**
+  （`WHERE jti = ?`/`$1`，方言感知占位符装配期注入，Rust 侧再核 jti 等值）」
+  ——探测流量不再放大全表扫，窗内新签发 jti 即时可见（消 v0.1.132 起
+  「新 bearer 最长拖 2s」的 shortcut）；并发 miss 经 `refresh_lock` 双检
+  单飞（全窗至多一次全表扫）。
+- **fix（routed tools/list 元工具直答，#13）**：serve 的 `tools/list` 在
+  routed 模式下不再先算全量业务目录再裁剪——检测 ExposeMode::Routed 直接
+  返回两个元工具定义；元工具检索的可见集计算抽 `shown_tools` 单点。
+- **fix（bootstrap fetch 回环护栏完备，#2/#9）**：内部派发池线程的
+  loopback fetch 拦截：input 归一化支持 `URL` 对象/`Request`（此前只认
+  字符串，传对象即漏拦）；主机名匹配补 IPv6 本机全形（`::1`、
+  `0:0:0:0:0:0:0:1`、`::ffff:127.0.0.1`）；`Response.arrayBuffer()`
+  fallback 按 `byteOffset/byteLength` 切片（此前共享底层 buffer 导致
+  前导字节污染）。
+- **fix（sample svc 凭据面，#4/#6/#10/S4/S5）**：① `/system/service-token/current`
+  只认**当前 active** bearer（jti 字节级比对，宽限中的旧 bearer 也 40311
+  `bearer superseded`）——被轮换掉的凭据无权读出新令牌（防泄漏旧凭据
+  换新票）；恢复路径 = 共享存储里 rotator 回写的最新 token；② admin 签发
+  `POST /admin/service-token/` 同名再签改为「插新 active + 条件驱旧」同事务
+  （此前 supersedes-then-insert，并发双 POST 可落两行 active）——顺序双
+  POST 收敛恰一行 active，语义等价手动 rotate（24h 宽限照常）；③
+  `/auth/obo` 删除与 dispatch 门重复的行存在性预检（jti 门是唯一事实源，
+  双查会把宽限语义切成两段）；④ admin list 的 `grace_until`/`expires_at`
+  按 Number 强转且保留 NULL（此前字符串直出，比较语义漂移）。
+- **docs（devkit 同步）**：api-manual §14 svc 表/可见性段、§13
+  bridge.call/svc 边界行、scenarios 场景 77 恢复接法、SKILL.md 陷阱三行
+  （/current 只认 active bearer、409 后重读共享存储、负窗点查化）、README
+  索引逐条对齐。
+
+## v0.1.135（2026-11-13，未打标签）
+
+MCP 元工具保留名由**前缀判定收窄为精确名判定**（上游需求
+`docs/migration/oj-requirement-mcp-reserved-prefix.md` §5 方案 A+B）——解
+v0.1.134 上「模块名以 oj 开头（如 `oj-market`）的站点启用 MCP 即整站拒启」的
+阻塞（模板工程默认 `mcp.enabled: true` + 内建 `oj-market` 开箱即拒启）。
+
+- **fix（MCP 保留名精确化）**：启动 fail-fast 与 `oj mcp` codegen 扫描只拦
+  净化名**恰好等于** `oj_search_tools` / `oj_list_groups` 的 tool；`oj_` 前缀
+  本身不再有特殊含义。call 面元工具分发短路（serve `call_tool` 与线路 A shim）
+  同步收窄为精确名——`oj_market_*` 等业务 tool 直呼不再被元工具分发劫持
+  （此前即使放行也无法调用，会被 -32601）。安全性不变：元工具是两个固定名字，
+  精确匹配已完全阻止仿冒劫持；派生 operationId 恒带 `_<method>` 后缀，精确撞名
+  仅可能来自未来的 operationId 覆盖能力。
+- **fix（校验收窄到实际暴露集，方案 B）**：装配期保留名扫描先经
+  `server.mcp.modules` 白名单裁剪（与请求期 `tools_for` 同一份共享实现
+  `serve::mcp::apply_modules_filter`，由 mcp_http 上移至共享核心）——被白名单
+  排除的模块不参与校验（不暴露就不该阻断启动；v0.1.134 上 `modules: [home]`
+  不豁免的实测反例即此修复）。
+- **fix（MCP 两线一致簇，code review 收口）**：`oj mcp` codegen 与 serve 的
+  分裂逐条对齐——① codegen 生成期应用 `server.mcp.modules` 白名单（此前产物
+  DISPATCH 含全量模块，配置的暴露限制被静默放大），保留名检查也在裁剪后集合
+  上跑（与装配扫描同口径，不得一边放行一边拒）；② `oj_search_tools` 空 query
+  两线同拒 -32602（空串是任意串子串，不拦则 routed 模式一次 call 拉平全目录、
+  不枚举设计形同虚设）；③ limit 解析对齐：仅 JSON 整数参与钳制（`3.5`/`"5"`
+  按缺省 10，此前 shim `Math.trunc`/`+"5"` 与 serve `as_i64` 行为漂移）；
+  ④ 命中日志 group 字段对齐 Rust Debug 形 `Some("x")`/`None`、limit 记钳后值
+  （离线聚合单一解析器）；⑤ 元工具名单单源化：shim 拦截/分发经 `isMetaName`
+  从注入的 `META` 派生（与 serve `meta_tool_defs` 同源），新增元工具不再要求
+  模板同步改三处硬编码名。
+- **docs（devkit 同步）**：api-manual §14 保留名条目、scenarios 坑表、SKILL.md
+  陷阱速查（新增「卡在 0.1.134」一行）、README 版本索引逐条对齐。
+
 ## v0.1.134（2026-11-13，tag v0.1.134）
 
 MCP 工具分组（L1）与检索路由（L2）落地——方案市场膨胀后的上下文压缩

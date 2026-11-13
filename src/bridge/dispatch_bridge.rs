@@ -7,10 +7,10 @@
 //!
 //! 注入走槽位后填（照搬 `reload_bridge` 惯例）：[`StableState::dispatch`] 是共享
 //! 可填充槽，槽指针构造期冻结（Extras→StableState 注入同一 Arc，桥池多实例共享），
-//! 内容后填（`app_with_exec` 装配期 `slot.set`）。可用形态 = 经 `App::from_config`
+//! 内容后填（`app_with_exec` 装配期 `slot.install`）。可用形态 = 经 `App::from_config`
 //! 的 `oj serve` 与 `oj test`（后者同样装配 hook，经真实管线派发）；裸嵌入式
-//! （不经 App 自建 Bridge）不填槽 → op 报 `dispatch not available`。热更每代重建
-//! 自己的槽与 hook（各代 `from_config` 独立接线），不存在跨代串号。
+//! （不经 App 自建 Bridge）不填槽 → op 报 `dispatch not available`。热更每代
+//! `app_with_exec` 重新 install 覆盖——bridge.call 永随当前代，不存在跨代串号。
 
 use std::cell::RefCell;
 use std::pin::Pin;
@@ -49,9 +49,29 @@ pub type DispatchHook = Arc<
         + Sync,
 >;
 
-/// 共享可填充槽（[`StableState::dispatch`] 的元素类型）：槽指针构造期冻结、
-/// 内容后填（`slot.set` 一次，照搬 `reload_bridge` 解环惯例）。
-pub type DispatchSlot = std::sync::OnceLock<DispatchHook>;
+/// 共享派发槽（[`StableState::dispatch`] 的元素类型）：槽指针构造期冻结、内容
+/// **可换代**——热更每代的 `app_with_exec` 都重新 `install`（覆盖上一代 hook），
+/// bridge.call 始终分发到当前代的路由表/管线（评审 #1：OnceLock 在 backend 复用
+/// 路径丢弃 gen-2 的 hook、桥永绑 gen-1 路由表）。RwLock：op_dispatch 每次派发
+/// 读锁克隆一次 Arc，写（换代）每代一次。
+#[derive(Default)]
+pub struct DispatchSlot(std::sync::RwLock<Option<DispatchHook>>);
+
+impl DispatchSlot {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 装配/换代安装：覆盖旧 hook（每代一次；裸嵌入式不调用 = 槽空，fail-closed）。
+    pub fn install(&self, hook: DispatchHook) {
+        *self.0.write().unwrap_or_else(|p| p.into_inner()) = Some(hook);
+    }
+
+    /// 当前代 hook（None = 裸嵌入式未装配，op 报 `dispatch not available`）。
+    pub fn hook(&self) -> Option<DispatchHook> {
+        self.0.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+}
 
 // 内部派发池线程标记：`oj serve` 的 `mark_internal` 在内部池 actor 线程的
 // Bridge 工厂内置位；`dispatch_virtual` 的二级嵌套护栏与 bootstrap.js 的
@@ -95,10 +115,7 @@ pub async fn op_dispatch(
     use base64::Engine;
     let hook = {
         let st = state.borrow();
-        st.borrow::<Arc<super::StableState>>()
-            .dispatch
-            .get()
-            .cloned()
+        st.borrow::<Arc<super::StableState>>().dispatch.hook()
     }
     .ok_or_else(|| {
         JsErrorBox::generic(
@@ -108,6 +125,15 @@ pub async fn op_dispatch(
     let body = base64::engine::general_purpose::STANDARD
         .decode(&body_b64)
         .map_err(|e| JsErrorBox::generic(format!("bridge.call: invalid body base64: {e}")))?;
+    // 请求体上限（评审 S2）：响应侧有 64 MiB 缓冲上限、入站 HTTP 有
+    // max_upload_bytes——进程内 dispatch 是第三条入站通路，不得成为无限大的旁路
+    // （OOM 风险；等价 HTTP 路径此刻会 413）。
+    const DISPATCH_REQ_BODY_CAP: usize = 64 * 1024 * 1024;
+    if body.len() > DISPATCH_REQ_BODY_CAP {
+        return Err(JsErrorBox::generic(
+            "bridge.call: request body exceeds the 64 MiB dispatch cap",
+        ));
+    }
     let req = DispatchReq {
         method,
         path,
@@ -199,7 +225,7 @@ mod tests {
     /// WHATWG Response（status/headers/text()）。
     #[tokio::test(flavor = "current_thread")]
     async fn fake_hook_roundtrip_response_shape() {
-        let slot: Arc<DispatchSlot> = Arc::new(std::sync::OnceLock::new());
+        let slot: Arc<DispatchSlot> = Arc::new(DispatchSlot::new());
         let b = crate::bridge::Bridge::with_dbs_and_loader(
             std::collections::HashMap::new(),
             std::sync::Arc::new(crate::bridge::InMemoryKV::new()),
@@ -211,7 +237,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        slot.set(Arc::new(|req: DispatchReq| {
+        slot.install(Arc::new(|req: DispatchReq| {
             assert_eq!(req.method, "POST");
             assert_eq!(req.path, "/v1/api/echo?a=1");
             assert!(req.headers.iter().any(|(k, v)| k == "x-test" && v == "yes"));
@@ -228,10 +254,7 @@ mod tests {
                     body: br#"{"pong":true}"#.to_vec(),
                 }
             })
-        }))
-        .is_ok()
-        .then_some(())
-        .expect("slot set");
+        }));
         let cap = b
             .run_with(
                 r#"(async () => {
@@ -257,5 +280,49 @@ mod tests {
         assert_eq!(d["status"], 201);
         assert_eq!(d["echo"], "ping-bytes");
         assert_eq!(d["text"], r#"{"pong":true}"#);
+    }
+
+    /// 回归（评审 #1）：换代 install 覆盖旧 hook——gen-2 安装后 bridge.call 必须
+    /// 命中 gen-2（OnceLock 时代 `let _ = set` 丢弃 Err，桥永绑 gen-1 路由表）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn reinstall_overrides_previous_generation_hook() {
+        let slot: Arc<DispatchSlot> = Arc::new(DispatchSlot::new());
+        let b = crate::bridge::Bridge::with_dbs_and_loader(
+            std::collections::HashMap::new(),
+            std::sync::Arc::new(crate::bridge::InMemoryKV::new()),
+            crate::bridge::SchemaRegistry::new(),
+            false,
+            None,
+            crate::bridge::Extras {
+                dispatch: Some(slot.clone()),
+                ..Default::default()
+            },
+        );
+        let mk = |tag: &'static str| -> DispatchHook {
+            Arc::new(move |_req: DispatchReq| {
+                Box::pin(async move {
+                    DispatchResp {
+                        status: 200,
+                        headers: vec![],
+                        body: tag.as_bytes().to_vec(),
+                    }
+                })
+            })
+        };
+        slot.install(mk("gen-1"));
+        slot.install(mk("gen-2"));
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                   const r = await bridge.call({ method: "GET", path: "/x" });
+                   json.ok({ text: await r.text() });
+                 })();"#,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{}", v["msg"]);
+        assert_eq!(v["data"]["text"], "gen-2", "换代后必须命中 gen-2 hook");
     }
 }

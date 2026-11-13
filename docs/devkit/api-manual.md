@@ -2047,15 +2047,17 @@ export default {
   再 `bridge.call` → 目标侧 503 `nested bridge.call is not supported`。
   编排链请压扁为深度 1：代理一次 `bridge.call` 直达最终端点。
 - **内部池禁 loopback fetch**：已在内部分发池上运行的 handler（dispatch
-  目标）`fetch` loopback 地址（`localhost` / `127.*` / `::1` / `0.0.0.0`）
-  在发真实请求前即被拒（TypeError 点名
+  目标）`fetch` loopback 地址（`localhost` / `127.*` / `::1` / `0.0.0.0`，
+  v0.1.136 补 IPv6 全形 `0:0:0:0:0:0:0:1`/`::ffff:127.0.0.1`，input 归一化
+  支持 `URL`/`Request` 对象）在发真实请求前即被拒（TypeError 点名
   `fetch to loopback is not supported on the internal dispatch pool (use bridge.call for in-process endpoints)`）——否则外层公共槽等内部池 handler、内部 handler 又
   占公共槽，与公共池 fetch 回环死锁同构重现。runtime 不知自身监听地址，故
   loopback 一律拦（其他本地端口服务同受此限）；同进程端点请用 `bridge.call`，
   出进程转发走对外地址。
-- **非流式**：响应体整体缓冲（上限 64 MiB、缓冲等待 30s），SSE / 长下载类
-  端点不适合经它转发（超限/超时收敛 502
-  `dispatch response is streamed or exceeds the body cap`）。
+- **非流式**：响应体整体缓冲（上限 64 MiB、缓冲等待 30s；请求体同限 64 MiB，
+  v0.1.136），SSE / 长下载类端点不适合经它转发（超限/超时收敛 502
+  `dispatch response is streamed or exceeds the body cap`；请求超限抛
+  `bridge.call: request body exceeds the 64 MiB dispatch cap`）。
 - body 经 base64 载体过 op 边界：大 body 有内存放大（约 4/3），超大上报类
   转发请走 `fetch` 出进程或 blob 中转。
 - 非法 method / 非 `/` 起始路径 → 400 信封（不抛）。
@@ -3997,8 +3999,10 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 
 | 限制 | 说明 / 绕行 |
 |---|---|
-| `bridge.call`（v0.1.131）非流式 + 深度 1 + `oj test` 同样可用 | 进程内 dispatch 整体缓冲（64 MiB / 30s，超限 502）；嵌套（dispatch 目标再 call）503；`oj test` 走 `App::from_config` 真管线可用（有真副作用）；只有裸嵌入式 Bridge 才抛 `dispatch not available`。SSE/长下载转发走 `fetch` 出进程；编排链压扁成一次直达 |
-| svc 凭据自动轮换（R6，v0.1.132；评审收口 v0.1.133）边界 | 宽限 24h 固定（无配置项）；服务端主动续签（`rotates_at`/`rotation_policy`）未做——消费方惰性 rotate 已覆盖诉求；「永不过期」另立 R 项；新 jti 过 SvcGate **即时可见**（miss 穿透重查——否则轮换后新 bearer 要等满 30s TTL，"无感知续期"不成立）；伪造/未知 jti 记 2s 负缓存（窗内不打库直接拒，探测不放大查询）；吊销/宽限移出仍 ≤30s 生效；并发 rotate 由条件 UPDATE 栅栏收口（行锁串行化，后到者 0 行 → 409，不产生两行 active）；明文 token 落库后暴露面 = create 响应 + svc 自认证 `current`（admin list 永不回显）——**整表即凭据，库导出/备份按凭据物料管控** |
+| `bridge.call`（v0.1.131）非流式 + 深度 1 + `oj test` 同样可用 | 进程内 dispatch 整体缓冲（响应 64 MiB / 30s，超限 502）；**请求体同限 64 MiB**（v0.1.136，超限抛 `bridge.call: request body exceeds the 64 MiB dispatch cap`——dispatch 是第三条入站通路，不得绕开入站 413）；打保留端点（health/plugins/mcp/rpc）方法不匹配回 **405 + `Allow` 头**、HEAD 按 GET 语义空体（v0.1.136，与 HTTP 面一致）；嵌套（dispatch 目标再 call）503；`oj test` 走 `App::from_config` 真管线可用（有真副作用）；只有裸嵌入式 Bridge 才抛 `dispatch not available`。SSE/长下载转发走 `fetch` 出进程；编排链压扁成一次直达 |
+| svc 凭据自动轮换（R6，v0.1.132；评审收口 v0.1.133）边界 | 宽限 24h 固定（无配置项）；服务端主动续签（`rotates_at`/`rotation_policy`）未做——消费方惰性 rotate 已覆盖诉求；「永不过期」另立 R 项；新 jti 过 SvcGate **即时可见**（miss 穿透重查——否则轮换后新 bearer 要等满 30s TTL，"无感知续期"不成立）；伪造/未知 jti 记 2s 负缓存（v0.1.136 细化：**窗内只抑全量扫描**、miss 走 PK 点查
+`WHERE jti = ?`/`$1`（方言感知占位符，绑定参数）——探测不放大全表扫，窗内新签发 jti
+即时可见；并发 miss 经单飞锁双检，全窗至多一次全扫）；吊销/宽限移出仍 ≤30s 生效；并发 rotate 由条件 UPDATE 栅栏收口（行锁串行化，后到者 0 行 → 409，不产生两行 active）；明文 token 落库后暴露面 = create 响应 + svc 自认证 `current`（**只认当前 active bearer**，v0.1.136——宽限中的旧 bearer 也 40311，被轮换凭据无权读出新令牌；admin list 永不回显）——**整表即凭据，库导出/备份按凭据物料管控** |
 | ~~相对 `require("./x")` 不支持~~（v0.1.30 已支持） | 相对 require / JSON 模块 / 循环 require 均可用；`exports`/`conditions` 与 pnpm 布局完整支持。残留限制：`exports` 的 `types`/`browser` 条件不命中；CJS `module.exports` 替换函数式写法启发式识别 |
 | blob multipart 预签名（v0.1.30） | `blob.uploadUrl` 的 multipart 形态暂返回 Err（object_store 无 multipart presign API）；单发 PUT 预签名 + `PUT {base}/blob/{key}` 直传路由（≤1 GiB）已覆盖大文件场景，>100MB 分片需求出现再补 |
 | build 剥 `.route` 仅识别语句起始的标准赋值写法 | `fn.route = "…"` 顶层标准写法可用；花式写法可能漏剥 |
@@ -4314,10 +4318,13 @@ config）给列表面三态：
   `[{name, tool_count}]`（模块 tag 首现序），与 tools **同一展示裁剪后集合**
   （scopes/act_mask 裁掉的工具不进组——分组信息不放大暴露面）。
 - **routed**：list 恰好两个元工具——
-  `oj_search_tools`（args：`query` 必填，`group`/`limit` 选填）与
+  `oj_search_tools`（args：`query` 必填**且非空**——空串是任意串子串，不拦则一次
+  call 拉平整个目录、routed 不枚举形同虚设，v0.1.135 起 -32602 两线同拒；
+  `group`/`limit` 选填）与
   `oj_list_groups`。检索语义：对**展示裁剪后**集合大小写不敏感子串匹配，
   score = name 2 / description 1 / group 1 可叠加，score desc + name asc；
-  limit 缺省 10、上限 50；match 项带完整 `inputSchema`（直呼所需契约）+
+  limit 缺省 10、上限 50，**仅 JSON 整数参与钳制**（`3.5`/`"5"` 按缺省 10，
+  两线一致——v0.1.135 对齐；下限钳 1 防 `limit=0` 伪造命中假零信号）；match 项带完整 `inputSchema`（直呼所需契约）+
   `group` + `annotations`（destructiveHint 透传不丢）。返回
   `content` + `structuredContent`（两线同形状）。**call 面不变**：list 之外的
   业务 tool 名照呼（spec 允许 call 名不在 list 内——客户端策略差异，
@@ -4326,15 +4333,24 @@ config）给列表面三态：
   同形状（`matches: []`）。隐藏的是**上下文占用**，不是工具存在性：已知工具名
   直呼被 scopes 裁 → 403（`[code=403] `），未知名 → -32601（存在性 oracle 是
   有意保留的文档化策略）。
-- **`oj_` 保留前缀**：业务 tool 净化名撞 `oj_` 前缀 → 启动 fail-fast（装配与
-  `oj mcp` 双路扫描；报错列 sanitized name + operationId + method + oa_path）。
+- **元工具保留名（v0.1.135 由前缀收窄为精确名）**：业务 tool 净化名**恰好等于**
+  `oj_search_tools` / `oj_list_groups` 才启动 fail-fast（装配与 `oj mcp` 双路扫描；
+  报错列 sanitized name + operationId + method + oa_path）。`oj_` 前缀本身不再有
+  特殊含义——模块名以 `oj` 开头（如 `oj-market` → `oj_market_*`）合法，call 面
+  直呼照常；派生 operationId 恒带 `_<method>` 后缀，精确撞名仅可能来自未来的
+  operationId 覆盖能力。扫描先经 `server.mcp.modules` 白名单裁剪——**被排除的
+  模块不参与校验**（不暴露就不阻断启动）。
 - **命中率日志**：每次检索记 INFO
   `mcp search: query=.. group=.. limit=.. returned=.. zero=.. elapsed_ms=..`
   （线路 A 模板走 stderr 同字段）——零命中与耗时突增是后续排序/索引优化信号源。
-- **线路 A 已知分歧**：静态快照无 per-request user，分组/检索面聚合**全量**
-  tools（act/scopes 仍在执行侧拦，仅分组统计预可见——名称/计数级）；
-  `searchTools` 本地实现与 serve 侧**共享一致性向量**钉语义
-  （`serve/src/fixtures/mcp_search_vectors.json`）。
+- **线路 A 已知分歧**：`oj mcp` 产物在**生成期**应用 `server.mcp.modules` 白名单
+  （静态固化，v0.1.135 起——此前产物含全量模块，配置的暴露限制被静默放大；
+  保留名检查亦在裁剪后集合上跑，与 serve 装配同口径）；无 per-request user，
+  分组/检索面聚合**全量（白名单内）** tools（act/scopes 仍在执行侧拦，仅分组
+  统计预可见——名称/计数级）；`searchTools` 本地实现与 serve 侧**共享一致性
+  向量**钉语义（`serve/src/fixtures/mcp_search_vectors.json`）；元工具名单经
+  `META` 单源派生（与 serve `meta_tool_defs` 同源注入，新增元工具无需改模板
+  拦截逻辑）。
 - **缓存**：`/mcp`、`/rpc` 响应统一 `cache-control: no-store`（tools/list 按凭据
   裁剪，防中介缓存把甲的可见集回给乙）。
 
@@ -4396,7 +4412,7 @@ CRUD + CSV）、`obo-audit`（换签审计分页 + CSV）。`svc` 的 scopes **�
 | 端点 | 认证 | 行为 |
 |---|---|---|
 | `POST /v1/api/system/service-token/rotate` | 该 name **active** 的 svc bearer（守卫验签 + jti 门 + claims.svc/jti） | 旧行置 `superseded` + **24h 宽限**（宽限内旧 bearer 在途仍放行，过期自动 40311）→ 同 name/scopes 签新 token（新 jti，exp 重新计 90d）落库 → 返回 `{token, jti, expires_at}`。**幂等护栏**：宽限内的旧 bearer 再 rotate → 409；**并发栅栏**：两个并发 rotate 持同一 active bearer 时，条件 UPDATE（仅 active/存量 NULL 行可翻转，按影响行数判胜负）经行锁串行化——后到者命中 0 行 → 同一 409，不产生两行 active；翻转 + 插入 **同事务**（`db.tx`）——insert 失败整事务回滚，旧 bearer 仍 active，宽限窗内可重试恢复（瞬态故障不卡死账号） |
-| `GET /v1/api/system/service-token/current` | 该 name 有效（active 或宽限内）的 svc bearer | 返回该 name 最新 active bearer `{token, jti, expires_at, scopes}`——消费方**跨重启恢复**最新令牌，避免重新人工配置 |
+| `GET /v1/api/system/service-token/current` | 该 name **当前 active** 的 svc bearer（v0.1.136：宽限内的旧 bearer 也 40311 `bearer superseded`——被轮换凭据无权读出新令牌；jti 字节级比对） | 返回该 name 最新 active bearer `{token, jti, expires_at, scopes}`——消费方**跨重启恢复**最新令牌（用共享存储里 rotator 回写的最新 bearer 调），避免重新人工配置；全丢则 admin 重签 |
 
 两端点 **scopes 豁免**（read 档 bot 也必须能自轮换——强制 write 档反而是提权
 面；同 `/auth/obo` 先例），但 **jti 门照常**：吊销/宽限移出的旧 bearer 换不动。

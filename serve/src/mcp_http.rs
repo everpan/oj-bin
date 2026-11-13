@@ -131,7 +131,7 @@ fn mount_for_endpoint<'a>(
 fn tools_for(st: &AppState, prefix: &str, table: &RouteTable) -> Result<Vec<McpTool>, String> {
     let spec = crate::openapi::generate(table, prefix)?;
     let tools = spec_to_tools(&spec)?;
-    Ok(apply_modules_filter(
+    Ok(crate::mcp::apply_modules_filter(
         tools,
         st.pipeline.mcp.as_ref().and_then(|m| m.modules.as_ref()),
     ))
@@ -253,26 +253,6 @@ pub fn search_tools(
         })
         .collect();
     json!({ "matches": matches })
-}
-
-/// modules 白名单（R9 fail-closed）：Some 时仅保留 tags 与名单**有交集**的 tool，
-/// 无 tags 的路由排除；名单匹配不到任何模块 → 空列表（不得回落全集）。
-fn apply_modules_filter(tools: Vec<McpTool>, modules: Option<&Vec<String>>) -> Vec<McpTool> {
-    let Some(mods) = modules else {
-        return tools;
-    };
-    tools
-        .into_iter()
-        .filter(|t| {
-            t.tool
-                .get("tags")
-                .and_then(|v| v.as_array())
-                .is_some_and(|tags| {
-                    tags.iter()
-                        .any(|tg| tg.as_str().is_some_and(|s| mods.iter().any(|m| m == s)))
-                })
-        })
-        .collect()
 }
 
 /// tools/list 展示裁剪（spec 2026-11-11 P3）：scopes/act_mask 只裁「可见性」，
@@ -558,6 +538,18 @@ async fn read_inbound(
     })
 }
 
+/// 展示裁剪**单源**（评审 #13）：tools/list 与 run_meta_tool（检索/分组）必须跑
+/// 同一集合——防探测「同形状」不变量依赖两边一致，三步序各自 copy 是漂移源。
+fn shown_tools<'a>(st: &AppState, tools: &'a [McpTool], user: Option<&Value>) -> Vec<&'a McpTool> {
+    let act_mask = st
+        .pipeline
+        .mcp
+        .as_ref()
+        .map(|m| m.act_mask_destructive)
+        .unwrap_or(false);
+    filter_tools_for_display(tools, user, act_mask)
+}
+
 pub async fn handle(
     State(st): State<AppState>,
     uri: Uri,
@@ -585,46 +577,48 @@ pub async fn handle(
                 return json_rpc_response(&rpc_err(id.clone(), -32603, "no api mount for /mcp"));
             };
             match method.as_str() {
-                "tools/list" => tools_for(&st, prefix, table)
-                    .map(|tools| {
-                        // P3：按 endpoint user 的 scopes/act_mask 裁剪**展示面**；
-                        // 调用面（tools/call → tools_for）不裁——admit 单点拦。
-                        let act_mask = st
-                            .pipeline
-                            .mcp
-                            .as_ref()
-                            .map(|m| m.act_mask_destructive)
-                            .unwrap_or(false);
-                        let shown = filter_tools_for_display(&tools, user.as_ref(), act_mask);
-                        // L2 routed（spec 2026-11-12）：list 面只回元工具，业务工具
-                        // 经 oj_search_tools 检索后直呼（call 面不变——spec 允许
-                        // call 名不在 list 内，客户端策略差异，warden/Codex 先例）。
-                        if st
-                            .pipeline
-                            .mcp
-                            .as_ref()
-                            .is_some_and(|m| m.expose == crate::mcp::ExposeMode::Routed)
-                        {
-                            return json!({ "tools": crate::mcp::meta_tool_defs() });
-                        }
-                        // L1 grouped（spec 2026-11-12）：分组面在消费 shown 之前算——
-                        // _meta 扩展位（反域名点分键）；groups 与 tools 同一裁剪后
-                        // 集合，分组信息不放大暴露面。flat/routed 不出此键。
-                        let grouped = st
-                            .pipeline
-                            .mcp
-                            .as_ref()
-                            .is_some_and(|m| m.expose == crate::mcp::ExposeMode::Grouped)
-                            .then(|| build_groups(&shown));
-                        let mut result = json!({
-                            "tools": shown.into_iter().map(|t| t.tool.clone()).collect::<Vec<_>>()
-                        });
-                        if let Some(groups) = grouped {
-                            result["_meta"] = json!({ "com.only-js.groups": groups });
-                        }
-                        result
-                    })
-                    .map_err(|e| ("-32603", e)),
+                "tools/list" => {
+                    // L2 routed（spec 2026-11-12）：list 面只回元工具——**在
+                    // tools_for 之前短路**：routed 的 list 与业务目录无关，先跑
+                    // 一遍 catalog 生成再丢弃是大盘点下的纯浪费（评审 #13）。
+                    // 业务工具经 oj_search_tools 检索后直呼（call 面不变——spec
+                    // 允许 call 名不在 list 内，warden/Codex 先例）。
+                    if st
+                        .pipeline
+                        .mcp
+                        .as_ref()
+                        .is_some_and(|m| m.expose == crate::mcp::ExposeMode::Routed)
+                    {
+                        Ok(json!({ "tools": crate::mcp::meta_tool_defs() }))
+                    } else {
+                        tools_for(&st, prefix, table)
+                            .map(|tools| {
+                                // P3：按 endpoint user 的 scopes/act_mask 裁剪
+                                // **展示面**；调用面（tools/call → tools_for）不裁
+                                // ——admit 单点拦。裁剪集合与 run_meta_tool 同一份
+                                // （shown_tools 单源）。
+                                let shown = shown_tools(&st, &tools, user.as_ref());
+                                // L1 grouped（spec 2026-11-12）：分组面在消费 shown
+                                // 之前算——_meta 扩展位（反域名点分键）；groups 与
+                                // tools 同一裁剪后集合，分组信息不放大暴露面。
+                                // flat/routed 不出此键。
+                                let grouped = st
+                                    .pipeline
+                                    .mcp
+                                    .as_ref()
+                                    .is_some_and(|m| m.expose == crate::mcp::ExposeMode::Grouped)
+                                    .then(|| build_groups(&shown));
+                                let mut result = json!({
+                                    "tools": shown.into_iter().map(|t| t.tool.clone()).collect::<Vec<_>>()
+                                });
+                                if let Some(groups) = grouped {
+                                    result["_meta"] = json!({ "com.only-js.groups": groups });
+                                }
+                                result
+                            })
+                            .map_err(|e| ("-32603", e))
+                    }
+                }
                 _ => call_tool(&st, &headers, prefix, table, &params, user.as_ref()).await,
             }
         }
@@ -739,10 +733,11 @@ async fn call_tool(
         return Err(("-32602", "params.name must be a string".to_string()));
     };
     let args = params.get("arguments").and_then(|v| v.as_object());
-    // L2 routed（spec 2026-11-12）：oj_* 保留前缀在 tools_for **之前**短路——
-    // catalog 生成错误不得把元工具误报 -32601（spec 允许 call 名不在 list 内，
-    // 客户端策略差异，warden/Codex 先例）；未知 oj_ 名归 -32601。
-    if name.starts_with(crate::mcp::META_PREFIX) {
+    // L2 routed（spec 2026-11-12；2026-11-13 收窄为精确名）：元工具保留名在
+    // tools_for **之前**短路——catalog 生成错误不得把元工具误报 -32601（spec 允许
+    // call 名不在 list 内，客户端策略差异，warden/Codex 先例）；精确名之外（含
+    // oj_ 前缀的业务 tool，如 oj_market_*）走常规 tool 查找，不得被元工具分发劫持。
+    if crate::mcp::is_reserved_name(name) {
         return run_meta_tool(st, prefix, table, name, args, user).await;
     }
     let tools = tools_for(st, prefix, table).map_err(|e| ("-32603", e))?;
@@ -765,13 +760,8 @@ async fn run_meta_tool(
     user: Option<&Value>,
 ) -> Result<Value, (&'static str, String)> {
     let tools = tools_for(st, prefix, table).map_err(|e| ("-32603", e))?;
-    let act_mask = st
-        .pipeline
-        .mcp
-        .as_ref()
-        .map(|m| m.act_mask_destructive)
-        .unwrap_or(false);
-    let shown = filter_tools_for_display(&tools, user, act_mask);
+    // 展示裁剪单源（评审 #13）：检索/分组与 tools/list 跑同一 shown 集合。
+    let shown = shown_tools(st, &tools, user);
     match name {
         "oj_search_tools" => {
             let Some(query) = args.and_then(|a| a.get("query")).and_then(|v| v.as_str()) else {
@@ -780,9 +770,19 @@ async fn run_meta_tool(
                     "params.arguments.query must be a string".to_string(),
                 ));
             };
+            // 空 query 全量枚举护栏（review S1，v0.1.135）：空串是任意串的子串——
+            // 不拦则 routed 模式一次 call 即可拉平整个目录（routed 不枚举的设计
+            // 形同虚设），两线同口径拒绝。
+            if query.is_empty() {
+                return Err((
+                    "-32602",
+                    "params.arguments.query must be a non-empty string".to_string(),
+                ));
+            }
             let group = args.and_then(|a| a.get("group")).and_then(|v| v.as_str());
-            // 负/零限界按 0 传给 search_tools（下限钳 1，两线一致）；
-            // 非整数 JSON 数（如 3.5）as_i64 得 None → 缺省 10（与 shim 同侧）。
+            // 负/零限界按 0 传给 search_tools（下限钳 1，两线一致）；非整数 JSON 数
+            // （如 3.5）as_i64 得 None → 缺省 10——shim 侧 callMeta 已对齐同口径
+            //（仅 JSON 整数参与钳制，review #8；日志记钳后值，与 search_log_line 同字段）。
             let limit = args
                 .and_then(|a| a.get("limit"))
                 .and_then(|v| v.as_i64())
@@ -975,7 +975,7 @@ mod tests {
             },
         };
         let tools = vec![mk_tool(json!(["user"])), mk_tool(Value::Null)];
-        let out = apply_modules_filter(tools, Some(&vec!["不存在".to_string()]));
+        let out = crate::mcp::apply_modules_filter(tools, Some(&vec!["不存在".to_string()]));
         assert!(out.is_empty(), "白名单无命中必须为空列表");
         // 有交集保留；无 tags 排除。
         let tools = vec![
@@ -983,12 +983,12 @@ mod tests {
             mk_tool(json!(["admin"])),
             mk_tool(Value::Null),
         ];
-        let out = apply_modules_filter(tools, Some(&vec!["user".to_string()]));
+        let out = crate::mcp::apply_modules_filter(tools, Some(&vec!["user".to_string()]));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].tool["tags"][0], "user");
         // None = 不过滤。
         let tools = vec![mk_tool(json!(["user"])), mk_tool(Value::Null)];
-        assert_eq!(apply_modules_filter(tools, None).len(), 2);
+        assert_eq!(crate::mcp::apply_modules_filter(tools, None).len(), 2);
     }
 
     // ---- 参数约定：path 填充 ----

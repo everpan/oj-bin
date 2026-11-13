@@ -70,7 +70,7 @@ fn stable_min(platform: Option<Arc<PlatformGrant>>, old: PerGenAssembly) -> Stab
         platform,
         exec: None,
         reload: Arc::new(std::sync::OnceLock::new()),
-        dispatch: Arc::new(std::sync::OnceLock::new()),
+        dispatch: Arc::new(only_js::bridge::dispatch_bridge::DispatchSlot::new()),
         generic_axes: only_js::bridge::generic_axis::registry_from(vec![]),
         oj_info: Arc::new(serde_json::json!({})),
     }

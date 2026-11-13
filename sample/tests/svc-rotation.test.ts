@@ -35,9 +35,15 @@ describe("svc token rotation (R6)", () => {
     expect(new1.jti === old1.jti).toBeFalsy();
     expect(new1.expires_at >= old1.expires_at).toBeTruthy();
 
-    // ③ 旧 bearer（宽限内）可 current 取回最新 active = 新 bearer
-    const cur = JSON.parse((await client.get("/system/service-token/current/", {
+    // ③ 旧 bearer（宽限内）取 current → 40311（评审 #4：明文面只回**当前 active
+    //    行持有者**——泄漏的旧凭据若可取回新 bearer，即可 current→rotate 链式续换，
+    //    轮换=吊销被架空）；当前 active bearer → 200 取回自身。
+    const curOld = JSON.parse((await client.get("/system/service-token/current/", {
       headers: svcHdr(old1.token),
+    })).body);
+    expect(curOld.code).toBe(40311);
+    const cur = JSON.parse((await client.get("/system/service-token/current/", {
+      headers: svcHdr(new1.token),
     })).body);
     expect(cur.code).toBe(0);
     expect(cur.data.jti).toBe(new1.jti);
@@ -89,6 +95,26 @@ describe("svc token rotation (R6)", () => {
     const mine = list.data.filter((r: any) => r.name === raceName);
     expect(mine.filter((r: any) => r.status === "active").length).toBe(1);
     expect(mine.filter((r: any) => r.status === "superseded").length).toBe(1);
+  });
+
+  it("admin 顺序双 POST 同名：驱旧生效，恰一行 active（评审 #6）", async () => {
+    const h = await adminHdrs();
+    const doubleName = svcName + "-dbl";
+    const p1 = JSON.parse((await client.post("/admin/service-token/", {
+      headers: h, body: JSON.stringify({ name: doubleName, scopes: ["read"] }),
+    })).body);
+    expect(p1.code).toBe(0);
+    const p2 = JSON.parse((await client.post("/admin/service-token/", {
+      headers: h, body: JSON.stringify({ name: doubleName, scopes: ["write"] }),
+    })).body);
+    expect(p2.code).toBe(0);
+    const list = JSON.parse((await client.get("/admin/service-token/", { headers: h })).body);
+    const mine = list.data.filter((r: any) => r.name === doubleName);
+    expect(mine.filter((r: any) => r.status === "active").length).toBe(1);
+    expect(mine.filter((r: any) => r.status === "superseded").length).toBe(1);
+    expect(mine.find((r: any) => r.status === "active").jti).toBe(p2.data.jti);
+    // 驱旧行带 24h 宽限期（SvcGate 在途平滑语义与 rotate 路径一致）。
+    expect(mine.find((r: any) => r.status === "superseded").grace_until > 0).toBeTruthy();
   });
 
   it("匿名 → 401（守卫）；员工 token → 403（非 svc bearer）", async () => {
