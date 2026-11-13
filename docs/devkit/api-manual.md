@@ -4435,7 +4435,7 @@ external_sub}`）→ 员工受托 token（10 分钟，`claims.act.sub` 指回 sv
 | code | 场景 |
 |---|---|
 | 40310 | 绑定缺失（该 external_sub 没有绑定行） |
-| 40311 | svc 凭据已吊销（jti 不在册） |
+| 40311 | svc 凭据已吊销（jti 不在册）——**换签面同步点查，revoke 立即 40311**（v0.1.137；不受 admit 30s 吊销缓存影响，该缓存只滞后 /mcp、/rpc 直连面） |
 | 40312 | 凭据非 svc（普通员工 token 打到 obo；或 claims.svc 在但 roles 不含 bot——双查纵深） |
 | 40313 | 员工已停用（users.disabled） |
 

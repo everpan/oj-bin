@@ -16,6 +16,15 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.137（2026-11-13）
+
+- **fix(sample)：/auth/obo 吊销回判恢复同步点查**——v0.1.136 评审 #10 误删 handler 内「登记行存在」
+  检查（前提「行永不删」不成立：revoke = 物理删行，行即吊销真相源）；而 admit ② 门 SvcGate
+  正缓存有 30s 吊销滞后（/mcp 在途平滑，设计内）——删行后窗口内 OBO 请求穿透到 handler，
+  被停用检查抢先返回 40313，CI `mcp_e2e_obo_full_matrix` 吊销腿红。现恢复 handler 同步点查：
+  revoke 立即 40311（spec Task 6 契约），仅 1 次 PK 点查；admit 的 30s 滞后语义对
+  /mcp、/rpc 直连面不变。
+
 ## v0.1.136（2026-11-13，tag v0.1.136）
 
 code review（v0.1.132 起）确认发现全量收口——MCP 两线一致簇已于 v0.1.135
