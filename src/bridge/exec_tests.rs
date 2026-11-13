@@ -1173,7 +1173,10 @@ export default {
 #[tokio::test(flavor = "current_thread")]
 async fn exec_bdd_streaming_scenarios() {
     let jail = tmp("stream-jail").canonicalize().unwrap();
-    std::fs::write(jail.join("big.bin"), vec![b'a'; OUTPUT_LIMIT + 1]).unwrap();
+    // 4× 帽：drain 在 mpsc 背压下会停读，若文件只比帽大 1B，背压窗口内子进程
+    // 可能已把管道内容写完以 0 退出（supervisor 先采信 wait 分支）——Linux CI 实测
+    // 竞态红；4× 保证触发时子进程仍有大量待写数据阻塞在管道上，组杀必中。
+    std::fs::write(jail.join("big.bin"), vec![b'a'; OUTPUT_LIMIT * 4]).unwrap();
     let base = tmp("stream-mods").canonicalize().unwrap();
     let api_js = api_src_stream(&jail);
     let (resolver, _seen) = test_resolver(&[
@@ -1377,7 +1380,10 @@ export default {
 #[tokio::test(flavor = "current_thread")]
 async fn exec_bdd_streaming_scenarios_windows() {
     let jail = tmp("stream-jail").canonicalize().unwrap();
-    std::fs::write(jail.join("big.bin"), vec![b'a'; OUTPUT_LIMIT + 1]).unwrap();
+    // 4× 帽：drain 在 mpsc 背压下会停读，若文件只比帽大 1B，背压窗口内子进程
+    // 可能已把管道内容写完以 0 退出（supervisor 先采信 wait 分支）——Linux CI 实测
+    // 竞态红；4× 保证触发时子进程仍有大量待写数据阻塞在管道上，组杀必中。
+    std::fs::write(jail.join("big.bin"), vec![b'a'; OUTPUT_LIMIT * 4]).unwrap();
     let base = tmp("stream-mods").canonicalize().unwrap();
     let api_js = api_src_stream_win(&jail);
     let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| "C:/Windows".to_string());
