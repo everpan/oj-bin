@@ -131,7 +131,7 @@ use crate::config::BrokerCfg;
 use futures::stream::Stream;
 use oj_plugin_ffi::{
     BlobBackendVtable, DataAccessorVtable, EsBackendVtable, EventBrokerVtable, FfiFuture,
-    KVStoreVtable, RBytes, RString,
+    KVStoreVtable, RBytes, ROption, RString,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -1160,7 +1160,9 @@ impl EventBroker for FfiEventBroker {
             (is_new_topic, inserted)
         };
         if is_new_topic {
-            let fut = (self.vtable.subscribe)(self.handle, RString::from(topic));
+            // ABI 13 group 参：空串 = 插件缺省语义（cfg group / 匿名排他队列）；
+            // 房间集群中继的显式实例组在 REF-04 落地时传入。
+            let fut = (self.vtable.subscribe)(self.handle, RString::from(topic), RString::from(""));
             if let Err(e) = await_ffi(fut).await {
                 // 回滚：仅移除本次刚注册的本通道（列表空则删整条 topic），
                 // 不误伤其他订阅者。
@@ -1199,6 +1201,13 @@ impl Drop for FfiEventBroker {
 }
 
 // ---- kv 轴适配器（Task 4.4）：FfiKVStore（vtable → core KVStore；InMemoryKV 留内置兜底）----
+
+/// ABI 13 新槽的 TTL 过线编码：Some → 整秒（ceil 留宿主，同 expire 规约）、None → 0
+/// （契约约定 0 = 无 TTL）。
+fn kv_ttl_secs(ttl: Option<std::time::Duration>) -> u64 {
+    ttl.map(|d| crate::bridge::kv::expire_secs(d) as u64)
+        .unwrap_or(0)
+}
 
 /// 经 vtable + FfiFuture 转发（handle 由 connect 产生；五方法过线）。
 /// 返回编码：get = JSON `Option<String>`；expire = JSON `bool`；incr = JSON `i64`；
@@ -1246,6 +1255,56 @@ impl KVStore for FfiKVStore {
         let fut = (self.vtable.incr)(self.handle, RString::from(key));
         let bytes = await_ffi(fut).await.map_err(|e| ffi_err("kv incr", e))?;
         serde_json::from_slice(&bytes).map_err(|e| ffi_err("kv incr decode", e))
+    }
+
+    async fn cas(
+        &self,
+        key: &str,
+        expected: Option<&str>,
+        value: Option<&str>,
+        ttl: Option<std::time::Duration>,
+    ) -> BridgeResult<bool> {
+        let fut = (self.vtable.cas)(
+            self.handle,
+            RString::from(key),
+            ROption::from(expected.map(RString::from)),
+            ROption::from(value.map(RString::from)),
+            kv_ttl_secs(ttl),
+        );
+        let bytes = await_ffi(fut).await.map_err(|e| ffi_err("kv cas", e))?;
+        serde_json::from_slice(&bytes).map_err(|e| ffi_err("kv cas decode", e))
+    }
+
+    async fn setnx(
+        &self,
+        key: &str,
+        value: &str,
+        ttl: Option<std::time::Duration>,
+    ) -> BridgeResult<bool> {
+        let fut = (self.vtable.setnx)(
+            self.handle,
+            RString::from(key),
+            RString::from(value),
+            kv_ttl_secs(ttl),
+        );
+        let bytes = await_ffi(fut).await.map_err(|e| ffi_err("kv setnx", e))?;
+        serde_json::from_slice(&bytes).map_err(|e| ffi_err("kv setnx decode", e))
+    }
+
+    async fn getset(
+        &self,
+        key: &str,
+        value: &str,
+        ttl: Option<std::time::Duration>,
+    ) -> BridgeResult<Option<String>> {
+        let fut = (self.vtable.get_set)(
+            self.handle,
+            RString::from(key),
+            RString::from(value),
+            kv_ttl_secs(ttl),
+        );
+        let bytes = await_ffi(fut).await.map_err(|e| ffi_err("kv getset", e))?;
+        serde_json::from_slice(&bytes).map_err(|e| ffi_err("kv getset decode", e))
     }
 }
 

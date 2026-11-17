@@ -1304,8 +1304,12 @@ const seq = Number(rows[0].m) + 1;
 | `kv.del` | `del(key: string): Promise<boolean>` | 删键 |
 | `kv.expire` | `expire(key: string, ttlSec: number): Promise<boolean>` | 设过期（秒）；真 Redis 走 EXPIRE，内存 KV 惰性过期。`ttlSec` 越出 i64 值域**报错**（v0.1.84——此前回绕成负数会被 Redis 理解为「立即删键」） |
 | `kv.incr` | `incr(key: string): Promise<number>` | 自增返回新值（键不存在从 0 起） |
+| `kv.cas` | `cas(key: string, expected: string \| null, value: string \| null, ttlSec?: number): Promise<boolean>` | **原子比较写（v0.1.138，ABI 13）**：`expected=null` 表「键不存在才写」（此时 `value=null` 为幂等 noop——键不存在返回 `true` 且不写）；`value=null` 表「匹配则删除」（解锁原语）；值不匹配返回 `false` 且不写。`ttlSec` 缺省 = 无 TTL。真 Redis 走单条 EVAL Lua（GET 比较 → SET/DEL 同脚本执行，无 get→set 竞态窗口）；内存 KV 单写锁内完成。典型用法：锁句柄的 `unlock`/`extend`（见 `kv.lock`）与压实提交护栏（先 `cas(代际键, expected, new)` 再动数据——kv CAS 失败则禁止一切后续写） |
+| `kv.setNX` | `setNX(key: string, value: string, ttlSec?: number): Promise<boolean>` | **原子占位（v0.1.138）**：键（存活视图中）不存在才写，返回是否写入；`ttlSec` 到期自动释放（真 Redis 走 `SET NX EX`）。锁与单飞的占位原语 |
+| `kv.getSet` | `getSet(key: string, value: string, ttlSec?: number): Promise<string \| null>` | **原子换写（v0.1.138）**：无条件覆盖并返回旧值（缺失 `null`）；真 Redis 走 `SET … GET`（GETSET 自 6.2 废弃，不用） |
+| `kv.lock` | `lock(key: string, opts?: { ttlSec?: number, retry?: { tries?: number, delayMs?: number } }): Promise<Lock>` | **租约锁（v0.1.138，JS 糖，`kv.lock` 与 `redis.lock` 同面）**：`setNX` 占位随机 token（`ttlSec` 缺省 30s 租约）；获取失败**抛错** `kv.lock: not acquired: <key>`（无 retry 时立即抛；`retry: { tries, delayMs }` 逐次重试，间隔经 `tasks.sleep`——本 runtime 无 timer 全局）。`Lock.unlock(): Promise<boolean>` = token 匹配才删（错 token/已过期返回 `false`，**不误删他人锁**）；`Lock.extend(): Promise<boolean>` = 同值续租。**unlock/extend 返回 `false` 即租约已失（过期或被夺）——调用方必须立即放弃所守护的工作**；正确性不得依赖锁（提交点再 `cas` 校验代际，锁只是吞吐优化） |
 
-（`redis.get / redis.set / redis.del / redis.expire / redis.incr` 与上表同签名——二者同源同面。）
+（`redis.get / redis.set / redis.del / redis.expire / redis.incr / redis.cas / redis.setNX / redis.getSet / redis.lock` 与上表同签名——二者同源同面。）
 
 ```ts
 // 读穿缓存（摘自 src/order/detail/api.ts，改编）
@@ -4060,6 +4064,7 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | `mgmt` 管理面（v0.1.100，M1 宿主面） | 缺省 disabled（`mgmt.*` 报 `mgmt is disabled…`）；`mgmt.axes` 收编的轴从 `axis()` 公开面消失（旁路封堵）；未声明 op → 结构化 `OJ_DB_UNSUPPORTED`（`e.data.capability` = op 名）；register 探活失败即拒；双档 allow（read/write，缺省 fail-closed，enabled 时 allow 全缺拒启）。**readOnly 是插件自报、宿主不可验证**（connector 须第一方）。mongo 真 connector（M2）未交付。见 `db-guide.md` §11.8 |
 | `http.file(i)` 对流式大文件报错（v0.1.38） | > `max_upload` 的 multipart 文件由服务端流式落 blob（字节不进 handler）——报错文案指路 `files[i].key`/`.url`；小文件行为不变 |
 | `bus` 缺省进程内，跨实例不互通 | 需要跨实例广播配 `broker.kind` |
+| `kv.cas/setNX/getSet/lock` 在内存 KV（未配 `redis.default`）下**进程本地**（v0.1.138） | 内存 KV 的原子原语与锁只在**本进程内**互斥——多实例部署下 `kv.lock` 会**各自成功**（假单飞）。需要跨实例协调（锁/单飞/序号去重）必须配 `redis.default`；用「锁是本地」的内存 KV 跑多实例压实类任务是数据损坏级错误 |
 | bus 二进制 wire 约定（v0.1.16） | JSON → record/信封文本帧；字节 → record payload = 原始字节、投递为 Binary 帧。消费侧启发式：UTF-8 且为含 `topic`+`data` 的 JSON 对象才按文本信封，否则按二进制透传——**恰为该形状 JSON 的二进制载荷会以文本帧投递**（无害，自辨） |
 | WS 二进制状态（Yjs awareness 等）不进 `sess.state` | `sess.state` 必须可 JSON 序列化；二进制状态走 base64 字符串存 `sess.state`/kv，或分片放 kv |
 | `WhereCond.and/or` 嵌套未展开 | 多个 `where()` 即 AND；复杂条件用 `db.query` 参数化 SQL |

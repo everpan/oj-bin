@@ -1,6 +1,6 @@
 [package]
 name = "oj-kv-redis"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "kv 轴 redis cdylib 插件：RedisKV 迁自 core kv.rs（Task 4.4）"
 

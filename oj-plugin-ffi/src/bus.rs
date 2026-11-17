@@ -16,7 +16,10 @@ pub struct EventBrokerVtable {
     /// 二进制载荷 = 原始字节（宿主消费侧按「UTF-8 且含 topic/data 键的 JSON 对象」
     /// 启发式还原帧型，见宿主 envelope_or_binary）。
     pub publish: extern "C" fn(handle: u64, topic: RString, data: RBytes) -> FfiFuture,
-    /// 起消费循环（每 topic 至多一次；宿主按 topic 扇出）。ok 值 = 空。
-    pub subscribe: extern "C" fn(handle: u64, topic: RString) -> FfiFuture,
+    /// 起消费循环（每 (topic, group) 至多一次；宿主按 topic 扇出）。ok 值 = 空。
+    /// ABI 13 增 group 参：空串 = 插件缺省语义（kafka 用 cfg group、rabbitmq 匿名排他
+    /// 队列）；显式组 = 按组独立订阅（kafka per-subscribe consumer group——「每实例广播
+    /// 扇出」类订阅用实例标识作组，避免同组多实例互相抢消费）。
+    pub subscribe: extern "C" fn(handle: u64, topic: RString, group: RString) -> FfiFuture,
     pub close: extern "C" fn(handle: u64),
 }

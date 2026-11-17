@@ -9,10 +9,12 @@
 //! set/del = 空。跨线时长以秒计（宿主侧已向上取整，Redis EXPIRE 只认整秒）。
 
 use oj_plugin_ffi::{
-    ABI_VERSION, FfiFuture, HostContext, KVStoreVtable, PluginDescriptor, RArc, RResult, RString,
+    ABI_VERSION, FfiFuture, HostContext, KVStoreVtable, PluginDescriptor, RArc, ROption, RResult,
+    RString,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -35,7 +37,28 @@ fn state() -> &'static KVPluginState {
     PLUGIN.get().expect("oj-kv-redis: init not called")
 }
 
-// ---- FfiFuture 桥（统一走 oj-plugin-ffi 的 catch_unwind 安全工厂：spawn_ffi_future / catch_future）----
+// ---- FfiFuture 桥 ----
+
+/// 泛型 FFI 跳板：统一各 vtable 方法重复的 `catch_future + state + spawn_ffi_future`
+/// 样板（原每方法一套）。panic 仍由 catch_future 收敛为 RResult::Err；state 为进程级
+/// 'static（OnceLock），闭包自由搬移。future 由调用方 `Box::pin`（工具链不支持
+/// Fn 界限返回 impl Trait；`state()` 必须在跳板内取——panic 守卫纪律）。
+fn kv_call<F>(f: F) -> FfiFuture
+where
+    F: FnOnce(
+        &'static KVPluginState,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send>>,
+{
+    oj_plugin_ffi::catch_future(move || {
+        let st = state();
+        oj_plugin_ffi::spawn_ffi_future(&st.rt, f(st))
+    })
+}
+
+/// ROption<RString> → Option<String>（cas 的可空 expected/value 过线解码）。
+fn r_opt_str(o: &ROption<RString>) -> Option<String> {
+    o.as_ref().map(|s| s[..].to_string())
+}
 
 // ---- redis 逻辑（迁自 core RedisKV，语义对齐）----
 
@@ -124,6 +147,93 @@ impl RedisKV {
         let mut c = self.conn.clone();
         c.incr(key, 1).await.map_err(|e| format!("redis incr: {e}"))
     }
+
+    /// ttl_secs u64 → i64（回绕会把超大 ttl 变负值 → Redis 负数 = 立即删键的静默错动作，
+    /// 与 expire 同口径越界拒绝）。
+    fn ttl_i64(&self, ttl_secs: u64, op: &str) -> Result<i64, String> {
+        i64::try_from(ttl_secs)
+            .map_err(|_| format!("kv {op}: ttl_secs {ttl_secs} exceeds i64 range — rejected"))
+    }
+
+    /// 原子比较写：单条 EVAL Lua（GET 比较 → SET/DEL 同脚本执行），无 GET→SET 竞态窗口。
+    /// expected=None 表「键不存在才写」（此时 value=None 为幂等 noop）；value=None 表
+    /// 「匹配则删除」；ttl_secs=0 表无 TTL。
+    async fn cas(
+        &self,
+        key: &str,
+        expected: Option<&str>,
+        value: Option<&str>,
+        ttl_secs: u64,
+    ) -> Result<bool, String> {
+        let ttl = self.ttl_i64(ttl_secs, "cas")?;
+        // ARGV：1=expected 为 null、2=expected、3=value 为 null、4=ttl_secs、5=value。
+        const CAS_LUA: &str = r#"local cur = redis.call('GET', KEYS[1])
+if ARGV[1] == '1' then
+  if cur then return 0 end
+elseif cur == false or cur ~= ARGV[2] then
+  return 0
+end
+if ARGV[3] == '1' then
+  redis.call('DEL', KEYS[1])
+  return 1
+end
+if ARGV[4] ~= '0' then
+  redis.call('SET', KEYS[1], ARGV[5], 'EX', ARGV[4])
+else
+  redis.call('SET', KEYS[1], ARGV[5])
+end
+return 1"#;
+        let mut c = self.conn.clone();
+        let r: i64 = redis::cmd("EVAL")
+            .arg(CAS_LUA)
+            .arg(1)
+            .arg(key)
+            .arg(expected.is_none() as i64)
+            .arg(expected.unwrap_or_default())
+            .arg(value.is_none() as i64)
+            .arg(ttl)
+            .arg(value.unwrap_or_default())
+            .query_async(&mut c)
+            .await
+            .map_err(|e| format!("redis cas: {e}"))?;
+        Ok(r == 1)
+    }
+
+    /// 原子占位：`SET key value NX [EX ttl]`（nil = 键已存在，未写）。
+    async fn setnx(&self, key: &str, value: &str, ttl_secs: u64) -> Result<bool, String> {
+        let ttl = self.ttl_i64(ttl_secs, "setnx")?;
+        let mut c = self.conn.clone();
+        let mut cmd = redis::cmd("SET");
+        cmd.arg(key).arg(value).arg("NX");
+        if ttl > 0 {
+            cmd.arg("EX").arg(ttl);
+        }
+        let r: Option<String> = cmd
+            .query_async(&mut c)
+            .await
+            .map_err(|e| format!("redis setnx: {e}"))?;
+        Ok(r.is_some())
+    }
+
+    /// 原子换写：`SET key value GET [EX ttl]`（GETSET 自 6.2 废弃，不用）；
+    /// 返回旧值（不存在 → None）。
+    async fn get_set(
+        &self,
+        key: &str,
+        value: &str,
+        ttl_secs: u64,
+    ) -> Result<Option<String>, String> {
+        let ttl = self.ttl_i64(ttl_secs, "getset")?;
+        let mut c = self.conn.clone();
+        let mut cmd = redis::cmd("SET");
+        cmd.arg(key).arg(value).arg("GET");
+        if ttl > 0 {
+            cmd.arg("EX").arg(ttl);
+        }
+        cmd.query_async(&mut c)
+            .await
+            .map_err(|e| format!("redis getset: {e}"))
+    }
 }
 
 impl KVPluginState {
@@ -161,14 +271,50 @@ impl KVPluginState {
         let n = self.store(handle)?.incr(key).await?;
         serde_json::to_vec(&n).map_err(|e| format!("kv incr encode: {e}"))
     }
+
+    async fn do_cas(
+        &self,
+        handle: u64,
+        key: &str,
+        expected: Option<String>,
+        value: Option<String>,
+        ttl_secs: u64,
+    ) -> Result<Vec<u8>, String> {
+        let ok = self
+            .store(handle)?
+            .cas(key, expected.as_deref(), value.as_deref(), ttl_secs)
+            .await?;
+        serde_json::to_vec(&ok).map_err(|e| format!("kv cas encode: {e}"))
+    }
+
+    async fn do_setnx(
+        &self,
+        handle: u64,
+        key: &str,
+        value: &str,
+        ttl_secs: u64,
+    ) -> Result<Vec<u8>, String> {
+        let ok = self.store(handle)?.setnx(key, value, ttl_secs).await?;
+        serde_json::to_vec(&ok).map_err(|e| format!("kv setnx encode: {e}"))
+    }
+
+    async fn do_get_set(
+        &self,
+        handle: u64,
+        key: &str,
+        value: &str,
+        ttl_secs: u64,
+    ) -> Result<Vec<u8>, String> {
+        let old = self.store(handle)?.get_set(key, value, ttl_secs).await?;
+        serde_json::to_vec(&old).map_err(|e| format!("kv getset encode: {e}"))
+    }
 }
 
-// ---- vtable（同步签名返回 FfiFuture；connect 产 handle，close 释放）----
+// ---- vtable（kv_call 泛型跳板：每方法一行 Box::pin(async)；connect 产 handle，close 释放）----
 
 extern "C" fn connect(cfg: RString) -> FfiFuture {
-    oj_plugin_ffi::catch_future(|| {
-        let st = state();
-        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move {
+    kv_call(move |st| {
+        Box::pin(async move {
             let cfg: ConnectCfg =
                 serde_json::from_str(&cfg[..]).map_err(|e| format!("redis: bad cfg: {e}"))?;
             let kv = RedisKV::arc(&cfg.url).await?; // 探活 fail-fast（conn 不挂启动）
@@ -180,41 +326,55 @@ extern "C" fn connect(cfg: RString) -> FfiFuture {
 }
 
 extern "C" fn get(handle: u64, key: RString) -> FfiFuture {
-    oj_plugin_ffi::catch_future(|| {
-        let st = state();
-        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move { st.do_get(handle, &key[..]).await })
-    })
+    kv_call(move |st| Box::pin(async move { st.do_get(handle, &key[..]).await }))
 }
 
 extern "C" fn set(handle: u64, key: RString, value: RString) -> FfiFuture {
-    oj_plugin_ffi::catch_future(|| {
-        let st = state();
-        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move {
-            st.do_set(handle, &key[..], &value[..]).await
-        })
-    })
+    kv_call(move |st| Box::pin(async move { st.do_set(handle, &key[..], &value[..]).await }))
 }
 
 extern "C" fn del(handle: u64, key: RString) -> FfiFuture {
-    oj_plugin_ffi::catch_future(|| {
-        let st = state();
-        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move { st.do_del(handle, &key[..]).await })
-    })
+    kv_call(move |st| Box::pin(async move { st.do_del(handle, &key[..]).await }))
 }
 
 extern "C" fn expire(handle: u64, key: RString, ttl_secs: u64) -> FfiFuture {
-    oj_plugin_ffi::catch_future(|| {
-        let st = state();
-        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move {
-            st.do_expire(handle, &key[..], ttl_secs).await
+    kv_call(move |st| Box::pin(async move { st.do_expire(handle, &key[..], ttl_secs).await }))
+}
+
+extern "C" fn incr(handle: u64, key: RString) -> FfiFuture {
+    kv_call(move |st| Box::pin(async move { st.do_incr(handle, &key[..]).await }))
+}
+
+extern "C" fn cas(
+    handle: u64,
+    key: RString,
+    expected: ROption<RString>,
+    value: ROption<RString>,
+    ttl_secs: u64,
+) -> FfiFuture {
+    kv_call(move |st| {
+        Box::pin(async move {
+            st.do_cas(
+                handle,
+                &key[..],
+                r_opt_str(&expected),
+                r_opt_str(&value),
+                ttl_secs,
+            )
+            .await
         })
     })
 }
 
-extern "C" fn incr(handle: u64, key: RString) -> FfiFuture {
-    oj_plugin_ffi::catch_future(|| {
-        let st = state();
-        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move { st.do_incr(handle, &key[..]).await })
+extern "C" fn setnx(handle: u64, key: RString, value: RString, ttl_secs: u64) -> FfiFuture {
+    kv_call(move |st| {
+        Box::pin(async move { st.do_setnx(handle, &key[..], &value[..], ttl_secs).await })
+    })
+}
+
+extern "C" fn get_set(handle: u64, key: RString, value: RString, ttl_secs: u64) -> FfiFuture {
+    kv_call(move |st| {
+        Box::pin(async move { st.do_get_set(handle, &key[..], &value[..], ttl_secs).await })
     })
 }
 
@@ -231,6 +391,9 @@ static VTABLE: KVStoreVtable = KVStoreVtable {
     del,
     expire,
     incr,
+    cas,
+    setnx,
+    get_set,
     close,
 };
 
@@ -374,6 +537,132 @@ mod tests {
         );
 
         close(handle);
+    }
+
+    /// 真 Redis 原子原语（env-gated，BDD）：setNX 占位/重复拒、cas 错 token 拒/续租/
+    /// 解锁、getSet 换写返回旧值。`OJ_TEST_REDIS` 未设置 → 跳过（不进网络）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn given_real_redis_when_cas_setnx_getset_then_atomic_semantics_hold() {
+        let Ok(url) = std::env::var("OJ_TEST_REDIS") else {
+            eprintln!("skip: OJ_TEST_REDIS unset");
+            return;
+        };
+        let _ = std::result::Result::from(init(host(), RString::from("{}")));
+        let cfg = serde_json::json!({ "url": url }).to_string();
+        let bytes = drive(&mut connect(RString::from(cfg.as_str())))
+            .await
+            .expect("connect");
+        let handle = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["handle"]
+            .as_u64()
+            .unwrap();
+        let k = format!("oj-test/atomic-{}", std::process::id());
+
+        // Given 空闲键 When setNX 占位 Then true；重复占位 Then false。
+        let b = drive(&mut setnx(
+            handle,
+            RString::from(k.as_str()),
+            RString::from("t1"),
+            30,
+        ))
+        .await
+        .expect("setnx");
+        assert!(serde_json::from_slice::<bool>(&b).unwrap());
+        let b = drive(&mut setnx(
+            handle,
+            RString::from(k.as_str()),
+            RString::from("t2"),
+            30,
+        ))
+        .await
+        .expect("setnx2");
+        assert!(!serde_json::from_slice::<bool>(&b).unwrap());
+        let got = drive(&mut get(handle, RString::from(k.as_str())))
+            .await
+            .expect("get");
+        assert_eq!(
+            serde_json::from_slice::<Option<String>>(&got)
+                .unwrap()
+                .as_deref(),
+            Some("t1")
+        );
+
+        // Given 持锁 token When 错 token cas 续租 Then false 且值不变。
+        let b = drive(&mut cas(
+            handle,
+            RString::from(k.as_str()),
+            some_str("wrong"),
+            some_str("wrong"),
+            0,
+        ))
+        .await
+        .expect("cas-wrong");
+        assert!(!serde_json::from_slice::<bool>(&b).unwrap());
+        // When 同 token cas 续租（ttl=30）Then true；When value=null 的 cas Then 解锁 true；
+        // 二次解锁 Then false（键已删，expected 不匹配）。
+        let b = drive(&mut cas(
+            handle,
+            RString::from(k.as_str()),
+            some_str("t1"),
+            some_str("t1"),
+            30,
+        ))
+        .await
+        .expect("cas-extend");
+        assert!(serde_json::from_slice::<bool>(&b).unwrap());
+        let b = drive(&mut cas(
+            handle,
+            RString::from(k.as_str()),
+            some_str("t1"),
+            none_str(),
+            0,
+        ))
+        .await
+        .expect("cas-unlock");
+        assert!(serde_json::from_slice::<bool>(&b).unwrap());
+        let b = drive(&mut cas(
+            handle,
+            RString::from(k.as_str()),
+            some_str("t1"),
+            none_str(),
+            0,
+        ))
+        .await
+        .expect("cas-unlock2");
+        assert!(!serde_json::from_slice::<bool>(&b).unwrap());
+
+        // getSet：首写返回 null；换写返回旧值。
+        let b = drive(&mut get_set(
+            handle,
+            RString::from(k.as_str()),
+            RString::from("n1"),
+            0,
+        ))
+        .await
+        .expect("getset1");
+        assert_eq!(serde_json::from_slice::<Option<String>>(&b).unwrap(), None);
+        let b = drive(&mut get_set(
+            handle,
+            RString::from(k.as_str()),
+            RString::from("n2"),
+            0,
+        ))
+        .await
+        .expect("getset2");
+        assert_eq!(
+            serde_json::from_slice::<Option<String>>(&b)
+                .unwrap()
+                .as_deref(),
+            Some("n1")
+        );
+
+        close(handle);
+    }
+
+    fn some_str(s: &str) -> ROption<RString> {
+        ROption::from(Some(RString::from(s)))
+    }
+    fn none_str() -> ROption<RString> {
+        ROption::from(None::<RString>)
     }
 
     extern "C" fn test_log(_level: u8, _msg: RString) {}

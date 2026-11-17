@@ -346,6 +346,8 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `crypto.aesGcmEncrypt` 传 24 字节密钥报错 | 不支持 AES-192——密钥仅 16（AES-128）/32（AES-256）字节的 hex 或 base64；应用层加解密，密钥自管不进 config（v0.1.35） |
 | `crypto.verifyEd25519` 报 `verifyEd25519: key not hex/base64` | 公钥传了 base64url（含 `-`/`_`）或 PEM——只收 hex/base64 编码的 32 字节**原始** key（PEM/SPKI 不支持）；签名同理只收标准 base64（**base64url 不支持**）。格式错抛错、验签不过返回 `false`（v0.1.75） |
 | 特权模块运行时报 `NotCapable: module 'x' is not platform-privileged` | 部署形态陷阱：模块必须部署在 `platform.root` 下**且**该目录列为 `mounts[].api` 条目（归属与路由只能来自挂载 discover），再加 `platform.modules` 名单——三缺一都拿不到特权；`platform:` 段整个不配则报 `platform not configured`（fail-closed，v0.1.75） |
+| `kv.lock` 的 `unlock()`/`extend()` 返回 `false`（v0.1.138） | **租约已失（过期或被夺）——必须立即放弃所守护的工作**，不是「重试一次」。正确性不得依赖锁：压实/换快照类关键提交在提交点再 `kv.cas(代际键, expected, new)` 校验（kv CAS 失败则禁止一切后续写），锁只是吞吐优化。另注意：`unlock` 二次调用返回 `false` 是正常语义（token 已删），不是 bug |
+| 多实例部署用内存 KV 的 `kv.cas/setNX/getSet/lock` 做跨实例协调（v0.1.138） | 内存 KV（未配 `redis.default`）的原子原语与锁**进程本地**——多实例下 `kv.lock` 会**各自成功**（假单飞），压实类任务可能并发双跑写坏数据。跨实例协调必须配 `redis.default`（见 api-manual §13 限制表） |
 | `exec.run` 报 `NotCapable: … not authorized for exec` / `template mismatch` / `ambiguous` | **exec 授权 ≠ `platform.modules`**（两名单独立，只配一边拿不到另一边）：`platform.exec.<模块>.allow` 里要有匹配的 argv 模板——literal token 逐字相等、`${path:}`/`${raw:}` 占位符恰吸一 token、同一 argv 命中两条模板即歧义拒绝（v0.1.75） |
 | `exec.run` 里给子进程传相对路径就以为出不了 jail | cwd 钉在 fs.root 但**不构成隔离边界**——路径越界防线在 `${path:}` 占位符校验（`fs.root ∪ trusted_paths`），别把越出集合的路径交给子进程（v0.1.75） |
 | exec 子进程里 `argv[0]` 和模板首 token 不一致 | 预期：宿主侧把首 token 解析为**绝对路径**（"oj"→服务进程自身；其余 PATH 解析，Windows 裸名再按 `PATHEXT` 补 `.exe`/`.cmd`）再传给子进程；模板首 token 必须是裸名（路径分隔符直接拒）（v0.1.75） |

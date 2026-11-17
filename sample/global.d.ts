@@ -233,6 +233,8 @@ interface Logger {
 // ======== 四、存储（kv / blob / fs / es） ========
 
 // redis.* / kv.* ：KV 存储（redis.default 配置即真 Redis，否则进程内存 KV）。
+// cas/setNX/getSet/lock（v0.1.138，ABI 13）：原子原语与租约锁。内存 KV 下这些是
+// 进程本地——多实例协调（锁/单飞/去重）必须配 redis.default。
 interface KVApi {
   get(key: string): Promise<string | null>;
   set(key: string, value: string): Promise<boolean>;
@@ -241,6 +243,29 @@ interface KVApi {
   expire(key: string, ttlSec: number): Promise<boolean>;
   // 自增返回新值（键不存在从 0 起）。
   incr(key: string): Promise<number>;
+  // 原子比较写：expected=null 表「键不存在才写」（此时 value=null 为幂等 noop，返回
+  // true 且不写）；value=null 表「匹配则删除」（解锁原语）；值不匹配返回 false 且不写。
+  // ttlSec 缺省 = 无 TTL。unlock/extend 与压实提交护栏的底层。
+  cas(key: string, expected: string | null, value: string | null, ttlSec?: number): Promise<boolean>;
+  // 原子占位：键不存在才写，返回是否写入；ttlSec 到期自动释放。
+  setNX(key: string, value: string, ttlSec?: number): Promise<boolean>;
+  // 原子换写：无条件覆盖并返回旧值（缺失 null）。
+  getSet(key: string, value: string, ttlSec?: number): Promise<string | null>;
+  // 租约锁：setNX 占位随机 token；获取失败抛错（kv.lock: not acquired: <key>）。
+  // unlock/extend 返回 false 即租约已失（过期或被夺）——调用方必须立即放弃所守护的
+  // 工作（正确性靠提交点 cas fencing，锁只是吞吐优化）。内存 KV 下进程本地。
+  lock(key: string, opts?: {
+    ttlSec?: number;
+    retry?: { tries?: number; delayMs?: number };
+  }): Promise<KVLock>;
+}
+
+interface KVLock {
+  readonly token: string;
+  // token 匹配才删（错 token/已过期返回 false，不误删他人锁）。
+  unlock(): Promise<boolean>;
+  // 同值续租（租约时长同 ttlSec）。
+  extend(): Promise<boolean>;
 }
 
 // ======== 五、实时与消息（ws / bus） ========

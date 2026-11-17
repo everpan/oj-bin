@@ -5076,3 +5076,52 @@ routed（list 恰好 `oj_search_tools`/`oj_list_groups`；search 的 match 带
 | 空 query 报 `-32602 … non-empty` | v0.1.135 护栏：空串是任意串子串，不拦则 routed 模式一次 call 拉平全目录（routed 不枚举的设计形同虚设）；两线同拒，给非空关键词即可 |
 | 业务 tool 名恰为 `oj_search_tools`/`oj_list_groups` 启动报错 | v0.1.135 起仅**精确名**才 fail-fast（装配与 `oj mcp` 双路扫描）——按报错里的 operationId/method/oa_path 改路由名；`oj_` 前缀（如 `oj_market_*`）合法不叫撞名；被 `server.mcp.modules` 白名单排除的模块不参与校验 |
 | 线路 A 分组/检索可见被 scopes 裁的工具 | 已知分歧：静态快照无 per-request user，聚合全量（仅名称/计数级；执行仍由服务端 admit 拦） |
+
+## 场景 79：并发压实的单飞与护栏——`kv.lock` + `kv.cas` fencing（v0.1.138）
+
+> 何时抄我：定时压实/换快照/重建物化数据这类「多 worker 只允许一个执行者」的关键
+> 路径——直接非原子 get/set 有竞态，双跑会写坏数据。权威语义在
+> `api-manual.md` §6「kv / redis」与 §13 限制表（内存 KV 进程本地）。
+
+```ts
+// src/_search/compact/api.ts 或 tasks 模块内（挂 tasks.crontab）
+async function compactPage(pageId: string) {
+  // 1) 单飞：60s 租约 + 有界重试；抢不到（并发压实者持锁）本轮直接放弃。
+  const lock = await kv.lock(`wiki:compact:${pageId}`, {
+    ttlSec: 60,
+    retry: { tries: 5, delayMs: 200 },
+  }).catch(() => null);
+  if (lock === null) return { skipped: true };
+
+  try {
+    // 2) 读代际值（存在 kv，勿读 db——与 CAS 同源才有原子可比性）。
+    const gen = await kv.get(`wiki:gen:${pageId}`);
+    const snap = await buildSnapshot(pageId); // 合并更新日志，生成新快照（读旧快照+日志）
+
+    // 3) fencing：提交前 CAS 推进代际——失败 = 有并发压实者已推进，本轮作废（数据无损）。
+    //    kv CAS 成功才允许写后续数据；kv CAS 不随 db 事务回滚，顺序不能反。
+    const advanced = await kv.cas(`wiki:gen:${pageId}`, gen, String(snap.seq));
+    if (!advanced) return { fenced: true };
+
+    // 4) 两阶段落库：tx1 upsert 快照行；tx2 分块 DELETE 已合并日志（崩溃间隙重放幂等）。
+    await commitSnapshot(pageId, snap);
+    return { committed: snap.seq };
+  } finally {
+    // 5) unlock 返回 false = 租约已失（超 60s 或被夺）——本轮结果已由 3) 的 CAS
+    //    护栏保证不写坏；记日志即可，不要「补写」。
+    const ok = await lock.unlock();
+    if (!ok) log.warn(`lease lost during compact: ${pageId}`);
+  }
+}
+```
+
+验证口径：两个并发 worker 同页压实 → 恰一个 `committed`，另一个 `skipped` 或
+`fenced`；杀掉持锁 worker 不 unlock → 60s 后新锁可获取（租约自动释放）；错 token
+unlock 不误删他人锁。
+
+| 坑 | 解 |
+|---|---|
+| `unlock()` 返回 `false` | 租约已失（工作超 `ttlSec`、或 GC/慢查询拖过租约点）——**放弃所守护的工作**，别补写；长任务把 `ttlSec` 给足并在中途 `extend()` |
+| 多实例下锁「各自成功」 | 内存 KV（未配 `redis.default`）的锁**进程本地**——多实例部署必须配 Redis，见 api-manual §13 限制表 |
+| 用 `get` → 判断 → `set` 手写「原子」 | check-then-act 非原子，并发下产生多个持有者；占位一律 `setNX`，条件写一律 `cas` |
+| 压实提交顺序反了（先动数据后 CAS） | kv CAS 不随 db 事务回滚——CAS 必须**先于**一切写；CAS 失败 = 本轮作废 |

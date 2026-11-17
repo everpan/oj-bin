@@ -226,9 +226,13 @@ async fn real_rabbitmq_publish_subscribe_roundtrip() {
         .unwrap();
 
     let topic = format!("t.{}", std::process::id());
-    drive(&mut subscribe(handle, RString::from(topic.as_str())))
-        .await
-        .expect("subscribe");
+    drive(&mut subscribe(
+        handle,
+        RString::from(topic.as_str()),
+        RString::from(""),
+    ))
+    .await
+    .expect("subscribe");
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     drive(&mut publish(
         handle,

@@ -22,6 +22,31 @@ extern "C" fn expire(_handle: u64, _key: RString, _ttl: u64) -> oj_plugin_ffi::F
 extern "C" fn incr(_handle: u64, _key: RString) -> oj_plugin_ffi::FfiFuture {
     oj_plugin_ffi::ready_err("mini-legacy: not a real kv")
 }
+extern "C" fn cas(
+    _handle: u64,
+    _key: RString,
+    _expected: oj_plugin_ffi::ROption<RString>,
+    _value: oj_plugin_ffi::ROption<RString>,
+    _ttl: u64,
+) -> oj_plugin_ffi::FfiFuture {
+    oj_plugin_ffi::ready_err("mini-legacy: not a real kv")
+}
+extern "C" fn setnx(
+    _handle: u64,
+    _key: RString,
+    _value: RString,
+    _ttl: u64,
+) -> oj_plugin_ffi::FfiFuture {
+    oj_plugin_ffi::ready_err("mini-legacy: not a real kv")
+}
+extern "C" fn get_set(
+    _handle: u64,
+    _key: RString,
+    _value: RString,
+    _ttl: u64,
+) -> oj_plugin_ffi::FfiFuture {
+    oj_plugin_ffi::ready_err("mini-legacy: not a real kv")
+}
 extern "C" fn close(_handle: u64) {}
 
 static KV: KVStoreVtable = KVStoreVtable {
@@ -31,6 +56,9 @@ static KV: KVStoreVtable = KVStoreVtable {
     del,
     expire,
     incr,
+    cas,
+    setnx,
+    get_set,
     close,
 };
 

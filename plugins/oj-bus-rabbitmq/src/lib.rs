@@ -441,7 +441,10 @@ impl BusPluginState {
         Ok(b"".to_vec())
     }
 
-    async fn do_subscribe(&self, handle: u64, topic: &str) -> Result<Vec<u8>, String> {
+    async fn do_subscribe(&self, handle: u64, topic: &str, group: &str) -> Result<Vec<u8>, String> {
+        // group（ABI 13）在本臂为文档化 no-op：订阅者一律走匿名排他自动删除队列
+        // （每订阅者独立、断连回收）——天然「每实例广播扇出」，组概念无映射。
+        let _ = group;
         let b = self.broker(handle)?;
         // 首次搭建同步执行：broker 不可达仍让 vtable.subscribe 以 Err 透出（宿主回滚
         // 刚注册的通道），语义与既有装配一致。
@@ -528,13 +531,12 @@ extern "C" fn publish(handle: u64, topic: RString, data: RBytes) -> FfiFuture {
     })
 }
 
-extern "C" fn subscribe(handle: u64, topic: RString) -> FfiFuture {
+extern "C" fn subscribe(handle: u64, topic: RString, group: RString) -> FfiFuture {
     oj_plugin_ffi::catch_future(|| {
         let st = state();
-        oj_plugin_ffi::spawn_ffi_future(
-            &st.rt,
-            async move { st.do_subscribe(handle, &topic[..]).await },
-        )
+        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move {
+            st.do_subscribe(handle, &topic[..], &group[..]).await
+        })
     })
 }
 

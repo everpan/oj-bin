@@ -41,6 +41,8 @@ pub type RVec<T> = stabby::vec::Vec<T>;
 pub type RBytes = stabby::vec::Vec<u8>;
 pub type RResult<T, E> = stabby::result::Result<T, E>;
 pub type RArc<T> = stabby::sync::Arc<T>;
+/// FFI 面的可空值（stabby Option ↔ std Option 双向 From）。
+pub type ROption<T> = stabby::option::Option<T>;
 
 /// 轴声明（自报清单条目）。RString 不可 const 构造 → 清单调用期经 RVec 返回
 ///（评审 M1：不做 static 数组）。
@@ -88,7 +90,12 @@ pub struct GenericVtable {
 /// 12 = 数据库方言能力模型起（DataAccessorVtable 增工厂级 `describe()` 槽——返回
 ///      `{dialect, capabilities}` JSON；结构化错误信封经 db 轴 Err(RString) 载荷升级；
 ///     未知方言不再回落 Sqlite。宿主 + 插件同产物重编发布。M1，v0.1.88）。
-pub const ABI_VERSION: u32 = 12;
+/// 13 = kv 原子原语与 bus 订阅分组起（KVStoreVtable 增 cas/setnx/get_set 三槽——
+///      协作后端的单飞/占位/换写与锁句柄 JS 糖的底层；EventBrokerVtable.subscribe 增
+///      group 参——空串 = 插件缺省语义，显式组供「每实例广播扇出」类订阅（如 WS 房间
+///      集群中继，kafka 臂 per-subscribe consumer group）。宿主 + 插件同产物重编发布。
+///      B1，2026-11）。
+pub const ABI_VERSION: u32 = 13;
 
 /// 构建指纹：rustc 版本 + oj-plugin-ffi 版本 + target triple（诊断用，不匹配仅告警）。
 pub const HOST_FINGERPRINT: &str = concat!(

@@ -76,13 +76,23 @@ impl KafkaCore {
         })
     }
 
-    fn bus_consumer_cfg(&self) -> ClientConfig {
+    /// bus 面消费者配置：group=None 用 cfg 缺省组（auto.offset.reset=earliest，
+    /// 既有语义零变化）；Some(g) 覆盖 group.id 且 reset=latest——显式组订阅（ABI 13
+    /// 房间集群中继类「每实例广播扇出」）不回放历史，停机窗口帧由上层 resync 兜底。
+    fn bus_consumer_cfg(&self, group: Option<&str>) -> ClientConfig {
         // bus 面维持现状：auto-commit（push 扇出语义）。
         let mut c = ClientConfig::new();
         c.set("bootstrap.servers", &self.brokers)
-            .set("group.id", &self.group)
+            .set("group.id", group.unwrap_or(&self.group))
             .set("enable.auto.commit", "true")
-            .set("auto.offset.reset", "earliest");
+            .set(
+                "auto.offset.reset",
+                if group.is_some() {
+                    "latest"
+                } else {
+                    "earliest"
+                },
+            );
         c
     }
 
@@ -202,19 +212,16 @@ struct BusInstance {
     /// close = drop 发送端 → 所有 clone 的 Receiver 收到 closed → 消费任务退出
     /// （评审 S1 泄漏修复；Receiver 一份留在实例内供 close 前检查，一份随任务）。
     stop_tx: tokio::sync::watch::Sender<bool>,
-    consumer_cfg: ClientConfig,
 }
 
 impl BusInstance {
     fn new(cfg: &BrokerCfgJson) -> Result<Self, String> {
         let core = Arc::new(KafkaCore::new(cfg)?);
         let (stop_tx, _) = tokio::sync::watch::channel(false);
-        let consumer_cfg = core.bus_consumer_cfg();
         Ok(Self {
             core,
             topic_prefix: cfg.topic_prefix.clone().unwrap_or_default(),
             stop_tx,
-            consumer_cfg,
         })
     }
 
@@ -417,11 +424,14 @@ impl BusPluginState {
 
     /// 起消费循环：收到消息经宿主 deliver 上送（逻辑 topic + 原始帧 payload）。
     /// stop_tx drop（close）→ changed()/closed 任一即退出循环（评审 S1 泄漏修复）。
-    async fn do_subscribe(&self, handle: u64, topic: &str) -> Result<Vec<u8>, String> {
+    /// group（ABI 13）：空串 = cfg 缺省组；显式组 = per-subscribe consumer（每 (topic,
+    /// group) 一条订阅，宿主 SUBSCRIBE_GATE 保证同键至多一次）。
+    async fn do_subscribe(&self, handle: u64, topic: &str, group: &str) -> Result<Vec<u8>, String> {
         let b = self.bus_broker(handle)?;
         let physical = b.topic_of(topic);
         let consumer: StreamConsumer = b
-            .consumer_cfg
+            .core
+            .bus_consumer_cfg(if group.is_empty() { None } else { Some(group) })
             .create()
             .map_err(|e| format!("kafka consumer {physical}: {e}"))?;
         consumer
@@ -495,13 +505,12 @@ extern "C" fn publish(handle: u64, topic: RString, data: RBytes) -> FfiFuture {
     })
 }
 
-extern "C" fn subscribe(handle: u64, topic: RString) -> FfiFuture {
+extern "C" fn subscribe(handle: u64, topic: RString, group: RString) -> FfiFuture {
     oj_plugin_ffi::catch_future(|| {
         let st = state();
-        oj_plugin_ffi::spawn_ffi_future(
-            &st.rt,
-            async move { st.do_subscribe(handle, &topic[..]).await },
-        )
+        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move {
+            st.do_subscribe(handle, &topic[..], &group[..]).await
+        })
     })
 }
 
@@ -771,6 +780,25 @@ mod tests {
 
     // ---- bus 面（既有用例零改动 = 回归护栏）----
 
+    /// Given 显式 group（ABI 13 房间集群中继类订阅）When bus_consumer_cfg Then group.id
+    /// 被覆盖且 auto.offset.reset=latest（新组不回放历史）；Given 缺省 Then cfg group
+    /// 且 earliest（既有语义零变化）。
+    #[test]
+    fn given_explicit_group_when_consumer_cfg_then_overridden_and_reset_latest() {
+        let core = KafkaCore::new(&BrokerCfgJson {
+            brokers: vec!["b:9092".into()],
+            group: Some("cfg-g".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let c = core.bus_consumer_cfg(Some("inst-1"));
+        assert_eq!(c.get("group.id"), Some("inst-1"));
+        assert_eq!(c.get("auto.offset.reset"), Some("latest"));
+        let d = core.bus_consumer_cfg(None);
+        assert_eq!(d.get("group.id"), Some("cfg-g"));
+        assert_eq!(d.get("auto.offset.reset"), Some("earliest"));
+    }
+
     /// cfg 校验离线路径：brokers 缺失 fail-fast。
     #[test]
     fn kafka_requires_brokers() {
@@ -848,9 +876,13 @@ mod tests {
             .unwrap();
 
         let topic = format!("t.{}", std::process::id());
-        drive(&mut subscribe(handle, RString::from(topic.as_str())))
-            .await
-            .expect("subscribe");
+        drive(&mut subscribe(
+            handle,
+            RString::from(topic.as_str()),
+            RString::from(""),
+        ))
+        .await
+        .expect("subscribe");
         // 等消费者就绪
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         drive(&mut publish(

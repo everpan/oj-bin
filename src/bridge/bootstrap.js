@@ -123,6 +123,9 @@ import {
   op_kv_del,
   op_kv_expire,
   op_kv_incr,
+  op_kv_cas,
+  op_kv_setnx,
+  op_kv_getset,
   op_ldap_call,
   op_log,
   op_mail_enqueue,
@@ -765,6 +768,49 @@ globalThis.log = {
   error: (msg, ...kv) => logCall(3, msg, kv),
 };
 
+// null expected = write-if-absent; null value = delete-on-match; ttlSeconds optional
+const kvAtomic = {
+  cas: (key, expected, value, ttlSeconds) =>
+    op_kv_cas(String(key), expected == null ? null : String(expected),
+              value == null ? null : String(value),
+              ttlSeconds == null ? -1 : Number(ttlSeconds) * 1000),
+  setNX: (key, value, ttlSeconds) =>
+    op_kv_setnx(String(key), String(value), ttlSeconds == null ? -1 : Number(ttlSeconds) * 1000),
+  getSet: (key, value, ttlSeconds) =>
+    op_kv_getset(String(key), String(value), ttlSeconds == null ? -1 : Number(ttlSeconds) * 1000),
+};
+
+// Lease lock (sugar over setNX/cas, no vtable slot): the random token is the stored
+// value; unlock = cas(token -> null), extend = cas(token -> token, same ttl). Both
+// return false once the lease is lost (expired or stolen) -- the caller MUST abandon
+// the work it guards at that point (fencing at the commit site is the real guard).
+// Rejects (throw) when not acquired. Retry delay uses tasks.sleep: no timer globals
+// in this runtime, so delayMs has no other legal wait.
+const kvLock = async (key, opts) => {
+  const o = opts || {};
+  const ttlSec = Math.max(0, o.ttlSec === undefined ? 30 : Number(o.ttlSec));
+  const token = crypto.randomHex(16);
+  const tryOnce = () => op_kv_setnx(String(key), token, ttlSec * 1000);
+  let ok = false;
+  if (o.retry) {
+    const tries = Math.max(1, Number(o.retry.tries === undefined ? 1 : o.retry.tries));
+    const delayMs = Math.max(0, Number(o.retry.delayMs === undefined ? 100 : o.retry.delayMs));
+    for (let i = 0; i < tries; i++) {
+      if (i > 0 && delayMs > 0) await op_tasks_sleep(delayMs);
+      if (await tryOnce()) { ok = true; break; }
+    }
+  } else {
+    ok = await tryOnce();
+  }
+  if (!ok) throw new Error(`kv.lock: not acquired: ${String(key)}`);
+  return {
+    token,
+    unlock: () => op_kv_cas(String(key), token, null, -1),
+    extend: () => op_kv_cas(String(key), token, token, ttlSec * 1000),
+  };
+};
+kvAtomic.lock = kvLock;
+
 // ----- redis: KV backend (in-memory default; real Redis when configured) -----
 globalThis.redis = {
   get: (key) => op_kv_get(String(key)),
@@ -773,6 +819,7 @@ globalThis.redis = {
   // ttl in seconds (op takes ms)
   expire: (key, ttlSeconds) => op_kv_expire(String(key), Number(ttlSeconds) * 1000),
   incr: (key) => op_kv_incr(String(key)),
+  ...kvAtomic,
 };
 
 // ----- kv: same KV as redis global (spec name for oj handlers) -----
@@ -782,6 +829,7 @@ globalThis.kv = {
   del: (key) => op_kv_del(String(key)),
   expire: (key, ttlSeconds) => op_kv_expire(String(key), Number(ttlSeconds) * 1000),
   incr: (key) => op_kv_incr(String(key)),
+  ...kvAtomic,
 };
 
 // ----- blob: object storage (blob(name) named multi-backend; bare call = blob("default")) -----

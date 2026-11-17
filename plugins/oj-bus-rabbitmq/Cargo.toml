@@ -1,6 +1,6 @@
 [package]
 name = "oj-bus-rabbitmq"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "bus 轴 rabbitmq cdylib 插件：lapin 迁自 core broker/rabbitmq.rs（Task 4.3）"
 

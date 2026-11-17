@@ -1063,8 +1063,8 @@ extern "C" fn mock_bus_publish(handle: u64, topic: RString, data: RBytes) -> Ffi
     }
     ready(Ok(b"".to_vec()))
 }
-extern "C" fn mock_bus_subscribe(handle: u64, topic: RString) -> FfiFuture {
-    // 先记录（模拟插件侧已起消费循环），再按开关返回失败。
+extern "C" fn mock_bus_subscribe(handle: u64, topic: RString, _group: RString) -> FfiFuture {
+    // 先记录（模拟插件侧已起消费循环），再按开关返回失败。group（ABI 13）不参与断言。
     BUS_SUBSCRIBES
         .lock()
         .unwrap()
@@ -1350,6 +1350,22 @@ extern "C" fn mock_kv_close(handle: u64) {
     KV_CLOSED.store(handle, AtomicOrdering::SeqCst);
 }
 
+extern "C" fn mock_kv_cas(
+    _h: u64,
+    _k: RString,
+    _e: ROption<RString>,
+    _v: ROption<RString>,
+    _t: u64,
+) -> FfiFuture {
+    ready(Ok(serde_json::to_vec(&true).unwrap()))
+}
+extern "C" fn mock_kv_setnx(_h: u64, _k: RString, _v: RString, _t: u64) -> FfiFuture {
+    ready(Ok(serde_json::to_vec(&true).unwrap()))
+}
+extern "C" fn mock_kv_get_set(_h: u64, _k: RString, _v: RString, _t: u64) -> FfiFuture {
+    ready(Ok(b"null".to_vec()))
+}
+
 fn mock_kv_vtable() -> &'static KVStoreVtable {
     Box::leak(Box::new(KVStoreVtable {
         connect: mock_kv_connect,
@@ -1358,6 +1374,9 @@ fn mock_kv_vtable() -> &'static KVStoreVtable {
         del: mock_kv_del,
         expire: mock_kv_expire,
         incr: mock_kv_incr,
+        cas: mock_kv_cas,
+        setnx: mock_kv_setnx,
+        get_set: mock_kv_get_set,
         close: mock_kv_close,
     }))
 }

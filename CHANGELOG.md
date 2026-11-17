@@ -16,6 +16,44 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.138（2026-11-17，未打标签）
+
+**feat(kv)：KV 原子原语与租约锁（ABI 13）**——协作后端（快照压实单飞、更新日志去重、
+锁句柄）的底层协调原语；`kv` 与 `redis` 同面：
+
+- `kv.cas(key, expected|null, value|null, ttlSec?)`：原子比较写——`expected=null` 表
+  「键不存在才写」（此时 `value=null` 为幂等 noop），`value=null` 表「匹配则删除」
+  （解锁原语），值不匹配返回 `false` 且不写；真 Redis 走单条 EVAL Lua（无 get→set 竞态
+  窗口），内存 KV 单写锁内完成（**过期判定时刻取自写锁内**——锁外取 now + 锁上排队会以
+  陈旧 now 误判未过期产生双持有者）。
+- `kv.setNX(key, value, ttlSec?)`：原子占位（`SET NX EX`）；`kv.getSet(key, value,
+  ttlSec?)`：原子换写返回旧值（`SET … GET`——GETSET 自 6.2 废弃不用）。
+- `kv.lock(key, { ttlSec, retry: { tries, delayMs } })`：JS 糖（零 vtable 槽）——随机
+  token 经 `setNX` 占位，`unlock()` = token 匹配才删（不误删他人锁），`extend()` = 同值
+  续租；**unlock/extend 返回 `false` 即租约已失，调用方必须放弃所守护的工作**（正确性靠
+  提交点 CAS fencing，锁只是吞吐优化）；获取失败抛错，重试间隔经 `tasks.sleep`（本
+  runtime 无 timer 全局）。
+- **内存 KV 下四者进程本地**：多实例部署下 `kv.lock` 会各自成功（假单飞）——跨实例协调
+  必须配 `redis.default`（api-manual §13 限制表新行 + SKILL 陷阱两行 + scenarios 场景 79
+  「压实单飞 + CAS fencing」范式 + `sample/global.d.ts` 类型同步）。
+
+**feat(ffi)：ABI 12→13**——KVStoreVtable 增 `cas/setnx/get_set` 三槽（ttl_secs=0 表无
+TTL；可空参数走新 `ROption<T>`）；EventBrokerVtable.subscribe 增 `group` 参（空串 =
+插件缺省语义）。宿主 + 插件同产物重编发布；**第三方 kv/bus 插件二进制须按 ABI 13 重编**
+（`oj-plugin-ffi` 0.1.4，严格相等门禁）。旧 bin/ 产物会被门禁按设计拒载
+（`plugin ABI mismatch: plugin=12 host=13`）——重新整体拷贝 `bin/`。
+
+**refactor(plugins)：FFI 跳板泛型化 + bus 订阅分组**：
+
+- oj-kv-redis 0.1.1：`kv_call` 泛型跳板统一七处 vtable 方法样板（原每方法一套
+  `catch_future + state + spawn_ffi_future`）；cas/setnx/get_set 三实现。
+- oj-bus-kafka 0.1.1：`subscribe` 接受显式 group——按订阅建消费者（group.id 覆盖 +
+  `auto.offset.reset=latest`，供「每实例广播扇出」类订阅不回放历史、不与同组多实例抢
+  消费）；缺省组维持 earliest 既有语义零变化。
+- oj-bus-rabbitmq 0.1.1：订阅签名对齐（group 为文档化 no-op——匿名排他队列天然
+  per-subscriber 广播）。
+- mini-kv / mini-legacy 夹具 vtable 同形。
+
 ## v0.1.137（2026-11-13，tag v0.1.137）
 
 - **fix(sample)：/auth/obo 吊销回判恢复同步点查**——v0.1.136 评审 #10 误删 handler 内「登记行存在」

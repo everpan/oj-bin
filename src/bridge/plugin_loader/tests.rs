@@ -772,6 +772,21 @@ extern "C" fn pl_kv_stub_set(_h: u64, _k: RString, _v: RString) -> FfiFuture {
 extern "C" fn pl_kv_stub_expire(_h: u64, _k: RString, _t: u64) -> FfiFuture {
     oj_plugin_ffi::ready_err("stub")
 }
+extern "C" fn pl_kv_stub_cas(
+    _h: u64,
+    _k: RString,
+    _e: oj_plugin_ffi::ROption<RString>,
+    _v: oj_plugin_ffi::ROption<RString>,
+    _t: u64,
+) -> FfiFuture {
+    oj_plugin_ffi::ready_err("stub")
+}
+extern "C" fn pl_kv_stub_setnx(_h: u64, _k: RString, _v: RString, _t: u64) -> FfiFuture {
+    oj_plugin_ffi::ready_err("stub")
+}
+extern "C" fn pl_kv_stub_get_set(_h: u64, _k: RString, _v: RString, _t: u64) -> FfiFuture {
+    oj_plugin_ffi::ready_err("stub")
+}
 extern "C" fn pl_kv_close(_h: u64) {}
 
 static PL_KV_VT: KVStoreVtable = KVStoreVtable {
@@ -781,6 +796,9 @@ static PL_KV_VT: KVStoreVtable = KVStoreVtable {
     del: pl_kv_stub_get,
     expire: pl_kv_stub_expire,
     incr: pl_kv_stub_get,
+    cas: pl_kv_stub_cas,
+    setnx: pl_kv_stub_setnx,
+    get_set: pl_kv_stub_get_set,
     close: pl_kv_close,
 };
 
