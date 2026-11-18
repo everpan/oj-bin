@@ -16,6 +16,45 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.140（2026-11-18，未打标签）
+
+**WS 五钩子与房间跨实例中继（REF-02 / REF-04 / REQ-02a）**——下游第二轮 issue
+承接，无 ABI 变更：
+
+- **`upgrade()` 握手期钩子（REQ-02a，v0.1.140）**：WS 生命周期扩为五钩子
+  `upgrade` / `connection` / `message` / `close` / `error`。`upgrade()` 在 101 之前
+  经帧池运行，拿到携带 query / headers / user 的 GET RequestInfo——鉴权、ACL、
+  租户校验写这里。`json.fail(status, msg)` 即拒绝握手：客户端拿到该 HTTP 状态响应
+  （无 101），msg 透传；`json.ok` 或**钩子缺席 = 放行**（既有模块行为零变化），
+  返回值被忽略。钩子抛错 → 403。e2e：403 无 101 / 101 照常 + connection 触发。
+- **`ws.close(code, reason)` 应用保留关闭码（REQ-02a，v0.1.140）**：只放行
+  `1000` 与 `4000-4999`（RFC 6455 应用区间；协议保留码 1xxx/2xxx/3xxx 一律拒绝，
+  reason ≤123 字节），错误文案指明可用区间。message/close 钩子内调用后，服务端向
+  客户端发显式 Close 帧（axum `CloseFrame`），并抑制尾随空 Close。e2e：
+  `ws.close(4403, "revoked")` → 客户端收到 opcode 0x8 + code 4403 + reason。
+- **房间跨实例中继 `ws.rooms_cluster`（REF-04，v0.1.140）**：`ws:` 配置段新增
+  `rooms_cluster: bool`（默认 false）。开启后 `ws.broadcast` 本地先行、再经
+  `ws-relay` topic（kafka 物理 topic = `<topic_prefix>ws-relay`）扇出到其他实例，
+  **模块代码零改动**。装配三道防线：① 双门禁——broker 必须是 kafka/rabbitmq、
+  kv 必须是 redis 插件（进程内 Bus / InMemoryKV 的「假集群」启动即拒，错误文案
+  点名修法；broker 外置却没开旗 → WARN）；② boot 自回声探针（probe room 打nonce
+  回环，10s 不见自回声 fail-fast 退出——broker 不可达/权限/消费未跑三悬崖全覆盖，
+  零 ABI 依赖）；③ 中继循环丢弃 `inst == self` 帧。信封
+  `{"room","inst","t":"t"|"b","d"}`（二进制 base64），**无 seq**——跨实例定序/去重
+  由上层协同库负责。单元：双实例扇出一次 / 二进制无损 / 自回声探针。
+- **`ws.roomState` 房间态镜像 + `sess.binSet/binGet` 连接态（REF-02，v0.1.140）**：
+  `ws.roomStateSet/Get/Del(room, key, bytes)` 房间域二进制态（awareness 聚合），
+  **按 `<connId>` 键入防多客户端 LWW 互踩**；`sess.binSet/binGet(key, bytes)` 连接域
+  二进制态（Yjs awareness / 会话二进制），不经 JSON 序列化、断连自动释放；值帽均
+  1 MiB（超出报错指向 blob/kv）。`sess` 增 `id` 只读属性（进程内自增连接标识）。
+- **bus kafka 臂手动 commit（v0.1.140）**：`enable.auto.commit=false`，投递成功
+  后按 offset+1 异步提交——崩溃窗口从丢帧变为重复投递，**消费侧逻辑必须幂等**
+  （CRDT applyUpdate 天然幂等）。插件 `oj-bus-kafka` bump 0.1.2（行为变更）。
+- devkit 四件套 + `sample/global.d.ts` 同步：api-manual §ws.ts 五钩子契约 /
+  ws.close 行 / roomState 三行 + rooms_cluster 段 / sess binSet·binGet / §10 ws
+  配置块 / §13 两行（假集群门禁、手动 commit 幂等）；scenarios 场景 81；SKILL
+  四行陷阱；README 三行能力摘要。
+
 ## v0.1.139（2026-11-18，未打标签）
 
 **fix(devkit)：bus.subscribe 显式消费组 + 类型/契约修正**——下游第二轮 issue

@@ -302,6 +302,12 @@ async fn ws_two_conns_first_frame_delivery_pure_axum() {
                     let msg = match frame {
                         WsSend::Text(t) => Message::Text(t.into()),
                         WsSend::Binary(b) => Message::Binary(b.into()),
+                        WsSend::Close(c, r) => {
+                            Message::Close(Some(axum::extract::ws::CloseFrame {
+                                code: c,
+                                reason: r.into(),
+                            }))
+                        }
                     };
                     if sink.send(msg).await.is_err() {
                         return;
@@ -1568,4 +1574,146 @@ async fn frame_pool_preserves_per_connection_order() {
         let v: serde_json::Value = serde_json::from_str(&c.read_text().await).unwrap();
         assert_eq!(v["data"]["n"], expect, "同连接回帧必须保序: {v}");
     }
+}
+
+// ---- REQ-02a（v0.1.140）：upgrade 期拒绝 + ws.close 应用保留关闭码 ----
+
+// Given upgrade() json.fail(403)
+// When 握手
+// Then 403 响应（无 101），msg 透传——连接未建立、不入房间
+#[tokio::test]
+async fn upgrade_hook_reject_yields_status_response_without_101() {
+    let _e2e = ws_e2e_lock();
+    let t = crate::tests::routes(&[]);
+    let handler = t.0.join("ws.js");
+    std::fs::write(
+        &handler,
+        r#"export default { upgrade() { json.fail(403, "no-acl"); }, connection() { json.ok({}); } };"#,
+    )
+    .unwrap();
+    let addr = spawn(
+        app(
+            vec![],
+            crate::make_actor(t.0.clone(), true),
+            None,
+            crate::StaticOpts::default(),
+            crate::Pipeline::default(),
+            Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+            Arc::new(std::sync::RwLock::new(None)),
+            Arc::default(),
+            None,
+        )
+        .merge(js_route(
+            "/ws/acl",
+            test_pool(&handler, std::time::Duration::from_secs(1)),
+            WsOptions::default(),
+        )),
+    )
+    .await;
+    // 拒绝路径保持 keepalive（连接不关闭），故不能 read_to_end——有界读到齐响应即止。
+    // 同理 Connection 必须含 upgrade，否则 axum 提取器在 handler 前 400。
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    s.write_all(
+        b"GET /ws/acl HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+          Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let mut res = Vec::new();
+    let mut chunk = [0u8; 1024];
+    for _ in 0..16 {
+        if res.windows(6).any(|w| w == b"no-acl") {
+            break;
+        }
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), s.read(&mut chunk))
+            .await
+            .unwrap()
+            .unwrap();
+        if n == 0 {
+            break;
+        }
+        res.extend_from_slice(&chunk[..n]);
+    }
+    let res = String::from_utf8_lossy(&res).into_owned();
+    assert!(res.starts_with("HTTP/1.1 403"), "expect 403, got: {res}");
+    assert!(res.contains("no-acl"), "hook msg must surface: {res}");
+    assert!(!res.starts_with("HTTP/1.1 101"));
+}
+
+// Given upgrade() json.ok
+// When 握手
+// Then 101 照常、connection() 正常执行（钩子缺席 = 行为零变化）
+#[tokio::test]
+async fn upgrade_hook_pass_then_handshake_101_and_connection_fires() {
+    let _e2e = ws_e2e_lock();
+    let t = crate::tests::routes(&[]);
+    let handler = t.0.join("ws.js");
+    std::fs::write(
+        &handler,
+        r#"export default { upgrade() { json.ok({ acl: "ok" }); }, connection() { ws.send("hello"); } };"#,
+    )
+    .unwrap();
+    let addr = spawn(
+        app(
+            vec![],
+            crate::make_actor(t.0.clone(), true),
+            None,
+            crate::StaticOpts::default(),
+            crate::Pipeline::default(),
+            Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+            Arc::new(std::sync::RwLock::new(None)),
+            Arc::default(),
+            None,
+        )
+        .merge(js_route(
+            "/ws/acl-ok",
+            test_pool(&handler, std::time::Duration::from_secs(2)),
+            WsOptions::default(),
+        )),
+    )
+    .await;
+    let mut c = WsClient::connect(addr, "/ws/acl-ok").await; // 101 断言在 connect 内
+    assert_eq!(c.read_text_to().await, "hello");
+}
+
+// Given message() 调 ws.close(4403, "revoked")
+// When 客户端发一帧
+// Then 收到显式 Close 帧：code = 4403、reason = revoked（不可重试语义）
+#[tokio::test]
+async fn ws_close_app_code_reaches_client_close_frame() {
+    let _e2e = ws_e2e_lock();
+    let t = crate::tests::routes(&[]);
+    let handler = t.0.join("ws.js");
+    std::fs::write(
+        &handler,
+        r#"export default { message() { ws.close(4403, "revoked"); } };"#,
+    )
+    .unwrap();
+    let addr = spawn(
+        app(
+            vec![],
+            crate::make_actor(t.0.clone(), true),
+            None,
+            crate::StaticOpts::default(),
+            crate::Pipeline::default(),
+            Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+            Arc::new(std::sync::RwLock::new(None)),
+            Arc::default(),
+            None,
+        )
+        .merge(js_route(
+            "/ws/deny",
+            test_pool(&handler, std::time::Duration::from_secs(1)),
+            WsOptions::default(),
+        )),
+    )
+    .await;
+    let mut c = WsClient::connect(addr, "/ws/deny").await;
+    c.send_text("go").await;
+    let (opcode, payload) = c.read_frame().await;
+    assert_eq!(opcode, 0x8, "expected close frame, got opcode {opcode:x}");
+    assert!(payload.len() >= 2, "close payload must carry code");
+    let code = ((payload[0] as u16) << 8) | payload[1] as u16;
+    assert_eq!(code, 4403);
+    assert_eq!(&payload[2..], b"revoked");
 }

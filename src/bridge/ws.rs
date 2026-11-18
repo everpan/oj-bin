@@ -15,22 +15,99 @@ use super::{ReqState, WsSend};
 
 // ---- WsHub：进程级房间中心（同 DELIVER_TARGETS 单例先例） ----
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock, Mutex};
 use tokio::sync::mpsc;
+
+/// 二进制状态值帽（sess.bin 与 roomState 同一口径；可配诉求等真实场景再开 knob）。
+const BIN_STATE_MAX_BYTES: usize = 1024 * 1024;
 
 /// 房间表：room → conn → per-conn 发送端（attach 时建立的 bus_tx 克隆）。
 /// ponytail: remove_conn/广播清理为 O(rooms) 遍历——连接数 ≤ 千级
 /// （ws.max_connections 默认 1000），可接受；rooms 膨胀时再上 conn→rooms 反查索引。
 pub struct WsHub {
     rooms: Mutex<HashMap<String, HashMap<u64, mpsc::UnboundedSender<WsSend>>>>,
+    /// 连接域二进制状态（REF-02，v0.1.140）：conn → key → bytes。断连随 remove_conn 清理。
+    conn_bins: Mutex<HashMap<u64, BTreeMap<String, Vec<u8>>>>,
+    /// 房间域二进制状态（REF-02，v0.1.140）：room → key → bytes。进程本地镜像，
+    /// **按连接键入**（"<connId>"）防多客户端共写互踩（LWW stomp）——约定由库层封装。
+    room_state: Mutex<HashMap<String, BTreeMap<String, Vec<u8>>>>,
 }
 
 impl WsHub {
     pub fn new() -> Self {
         Self {
             rooms: Mutex::new(HashMap::new()),
+            conn_bins: Mutex::new(HashMap::new()),
+            room_state: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// sess.binSet：连接域二进制状态写入（断连自动释放）。
+    pub fn bin_set(&self, conn: u64, key: &str, bytes: Vec<u8>) -> Result<(), String> {
+        if bytes.len() > BIN_STATE_MAX_BYTES {
+            return Err(format!(
+                "sess.binSet: value {} bytes exceeds the {} bytes cap — store large blobs via blob/kv",
+                bytes.len(),
+                BIN_STATE_MAX_BYTES
+            ));
+        }
+        self.conn_bins
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(conn)
+            .or_default()
+            .insert(key.to_string(), bytes);
+        Ok(())
+    }
+
+    /// sess.binGet：连接域二进制状态读取（不存在 = None）。
+    pub fn bin_get(&self, conn: u64, key: &str) -> Option<Vec<u8>> {
+        self.conn_bins
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&conn)
+            .and_then(|m| m.get(key).cloned())
+    }
+
+    /// ws.roomStateSet：房间域二进制状态镜像（进程本地，最终一致）。
+    pub fn room_state_set(&self, room: &str, key: &str, bytes: Vec<u8>) -> Result<(), String> {
+        if bytes.len() > BIN_STATE_MAX_BYTES {
+            return Err(format!(
+                "ws.roomStateSet: value {} bytes exceeds the {} bytes cap — awareness blobs \
+                 should stay small; store large state via blob/kv",
+                bytes.len(),
+                BIN_STATE_MAX_BYTES
+            ));
+        }
+        self.room_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(room.to_string())
+            .or_default()
+            .insert(key.to_string(), bytes);
+        Ok(())
+    }
+
+    pub fn room_state_get(&self, room: &str, key: &str) -> Option<Vec<u8>> {
+        self.room_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(room)
+            .and_then(|m| m.get(key).cloned())
+    }
+
+    /// ws.roomStateDel：删除房间域键；房间域条目清空后回收整房（防膨胀）。
+    pub fn room_state_del(&self, room: &str, key: &str) -> bool {
+        let mut g = self.room_state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(m) = g.get_mut(room) else {
+            return false;
+        };
+        let was = m.remove(key).is_some();
+        if m.is_empty() {
+            g.remove(room);
+        }
+        was
     }
 
     /// 加入房间（重复 join 同房间 = 幂等替换发送端）。
@@ -92,13 +169,18 @@ impl WsHub {
             .map_or(0, |c| c.len())
     }
 
-    /// 连接断开：从全部房间摘除（所有退出路径经 ConnHandle::detach 调用）。
+    /// 连接断开：从全部房间摘除（所有退出路径经 ConnHandle::detach 调用）；
+    /// 连接域二进制状态一并释放（sess.bin 断连自动清理契约）。
     pub fn remove_conn(&self, conn: u64) {
         let mut rooms = self.rooms.lock().unwrap_or_else(|e| e.into_inner());
         rooms.retain(|_, conns| {
             conns.remove(&conn);
             !conns.is_empty()
         });
+        self.conn_bins
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&conn);
     }
 }
 
@@ -114,6 +196,7 @@ impl WsSend {
         let frame = match self {
             WsSend::Text(t) => WsSend::Text(t.clone()),
             WsSend::Binary(b) => WsSend::Binary(b.clone()),
+            WsSend::Close(c, r) => WsSend::Close(*c, r.clone()),
         };
         tx.send(frame).map_err(|_| ())
     }
@@ -199,6 +282,102 @@ pub(crate) fn op_ws_room_size(state: &mut OpState, #[string] room: String) -> u3
     hub().room_size(&room) as u32
 }
 
+/// sess.binSet(key, bytes)：连接域二进制状态写入（REF-02，v0.1.140；断连自动释放）。
+/// 仅 WS 帧上下文（连接身份取 sess.id 同源 conn）。
+#[op2]
+pub(crate) fn op_ws_bin_set(
+    state: &mut OpState,
+    #[string] key: String,
+    #[buffer] data: JsBuffer,
+    conn: u32,
+) -> Result<(), deno_error::JsErrorBox> {
+    conn_checked(state, conn).map_err(deno_error::JsErrorBox::generic)?;
+    hub()
+        .bin_set(conn as u64, &key, data.to_vec())
+        .map_err(deno_error::JsErrorBox::generic)
+}
+
+/// sess.binGet(key)：连接域二进制状态读取（不存在 = null）。
+#[op2]
+pub(crate) fn op_ws_bin_get(
+    state: &mut OpState,
+    #[string] key: String,
+    conn: u32,
+) -> Result<Option<Vec<u8>>, deno_error::JsErrorBox> {
+    conn_checked(state, conn).map_err(deno_error::JsErrorBox::generic)?;
+    Ok(hub().bin_get(conn as u64, &key))
+}
+
+/// ws.roomStateSet(room, key, bytes)：房间域二进制状态镜像（进程本地）。
+/// 键布局约定：awareness 聚合**按连接键入** `<connId>`——多客户端共写同一键无合并语义
+/// （LWW 互踩），迟到者全量读各键逐个 apply（oj-collab 库封装）。
+#[op2]
+pub(crate) fn op_ws_room_state_set(
+    state: &mut OpState,
+    #[string] room: String,
+    #[string] key: String,
+    #[buffer] data: JsBuffer,
+) -> Result<(), deno_error::JsErrorBox> {
+    let _ = state;
+    hub()
+        .room_state_set(&room, &key, data.to_vec())
+        .map_err(deno_error::JsErrorBox::generic)
+}
+
+/// ws.roomStateGet(room, key)：房间域读取（不存在 = null）。
+#[op2]
+pub(crate) fn op_ws_room_state_get(
+    state: &mut OpState,
+    #[string] room: String,
+    #[string] key: String,
+) -> Result<Option<Vec<u8>>, deno_error::JsErrorBox> {
+    let _ = state;
+    Ok(hub().room_state_get(&room, &key))
+}
+
+/// ws.roomStateDel(room, key)：房间域删除（模块 close 钩子清 awareness 死条目用）。
+#[op2(fast)]
+pub(crate) fn op_ws_room_state_del(
+    state: &mut OpState,
+    #[string] room: String,
+    #[string] key: String,
+) -> u32 {
+    let _ = state;
+    u32::from(hub().room_state_del(&room, &key))
+}
+
+/// rooms_cluster 中继发布（v0.1.140，REF-04）：JSON 载荷臂。未开旗（relay 未起）= no-op；
+/// JS 面为 fire-and-forget（`.catch(() => {})`），错误在 op 侧返回前无日志出口——
+/// 发布失败（broker 抖动）按「丢帧由库层 resync 兜底」契约静默。
+#[op2]
+pub(crate) async fn op_ws_relay_publish(
+    #[string] room: String,
+    #[string] data: String,
+) -> Result<(), deno_error::JsErrorBox> {
+    match super::relay::relay() {
+        None => Ok(()),
+        Some(r) => r
+            .publish(&room, &WsSend::Text(data))
+            .await
+            .map_err(deno_error::JsErrorBox::generic),
+    }
+}
+
+/// rooms_cluster 中继发布：二进制载荷臂（信封内 base64）。
+#[op2]
+pub(crate) async fn op_ws_relay_publish_bin(
+    #[string] room: String,
+    #[buffer] data: JsBuffer,
+) -> Result<(), deno_error::JsErrorBox> {
+    match super::relay::relay() {
+        None => Ok(()),
+        Some(r) => r
+            .publish(&room, &WsSend::Binary(data.to_vec()))
+            .await
+            .map_err(deno_error::JsErrorBox::generic),
+    }
+}
+
 /// ws.send(data)：记录一次主动发送（Processor 按序推给 Writer）。
 #[op2(fast)]
 pub(crate) fn op_ws_send(state: &mut OpState, #[string] data: String) {
@@ -217,11 +396,34 @@ pub(crate) fn op_ws_send_bin(state: &mut OpState, #[buffer] data: JsBuffer) {
         .push(WsSend::Binary(data.to_vec()));
 }
 
-/// ws.close()：请求关闭当前连接。
+/// ws.close(code?, reason?)：请求关闭当前连接（REQ-02a，v0.1.140）。
+/// 无参 = 无码关闭（原行为）；带码只放行 **1000 与 4000-4999**（3xxx/系统保留段报错），
+/// reason ≤123 字节（RFC 6455）；4xxx 语义 = 不可重试关闭（客户端在该段停 provider）。
 /// 名字避开 deno_websocket 内置 `op_ws_close`（出站客户端，v0.1.7 并存注册）。
-#[op2(fast)]
-pub(crate) fn op_ws_frame_close(state: &mut OpState) {
-    state.borrow_mut::<ReqState>().ws_close = true;
+#[op2]
+pub(crate) fn op_ws_frame_close(
+    state: &mut OpState,
+    code: Option<u16>,
+    #[string] reason: Option<String>,
+) -> Result<(), deno_error::JsErrorBox> {
+    // 无参 close = 普通关闭（映射 1000；枚举层面无「无码 Close」形态）。
+    let (code, reason) = match (code, reason) {
+        (None, r) => (1000u16, r.unwrap_or_default()),
+        (Some(c), r) => (c, r.unwrap_or_default()),
+    };
+    if code != 1000 && !(4000..=4999).contains(&code) {
+        return Err(deno_error::JsErrorBox::generic(format!(
+            "ws.close: code {code} not allowed — use 1000 or the 4000-4999 application range \
+             (3xxx are transport-reserved; 4xxx means do-not-reconnect)"
+        )));
+    }
+    if reason.len() > 123 {
+        return Err(deno_error::JsErrorBox::generic(
+            "ws.close: reason exceeds 123 bytes (RFC 6455 limit)",
+        ));
+    }
+    state.borrow_mut::<ReqState>().ws_close = Some((code, reason));
+    Ok(())
 }
 
 /// WS 帧收尾：dispatcher finally 把 __sess 快照交还（帧池状态外置回传）。
@@ -292,6 +494,52 @@ mod hub_tests {
         assert_eq!(h.room_size("a"), 0);
         // 空房间广播 = 0，不炸。
         assert_eq!(h.broadcast("nope", 0, WsSend::Text("y".into())), 0);
+    }
+
+    /// REF-02：sess.bin 连接域——写入/读取往返，断连（remove_conn）自动释放。
+    #[test]
+    fn given_sess_bin_when_conn_disconnects_then_connection_state_released() {
+        let h = WsHub::new();
+        h.bin_set(7, "awareness", vec![1, 2, 3]).unwrap();
+        assert_eq!(h.bin_get(7, "awareness"), Some(vec![1, 2, 3]));
+        assert_eq!(h.bin_get(7, "absent"), None);
+        assert_eq!(h.bin_get(8, "awareness"), None, "连接隔离");
+        h.remove_conn(7);
+        assert_eq!(h.bin_get(7, "awareness"), None, "断连自动释放");
+    }
+
+    /// REF-02：roomState 房间域——房间隔离；del 逐键回收，整房清空即回收。
+    #[test]
+    fn given_room_state_when_keys_written_then_isolated_and_del_reclaims() {
+        let h = WsHub::new();
+        h.room_state_set("r", "c1", vec![1]).unwrap();
+        h.room_state_set("r", "c2", vec![2]).unwrap();
+        h.room_state_set("other", "c1", vec![9]).unwrap();
+        assert_eq!(h.room_state_get("r", "c1"), Some(vec![1]));
+        assert_eq!(h.room_state_get("r", "c2"), Some(vec![2]));
+        assert_eq!(h.room_state_get("other", "c1"), Some(vec![9]), "房间隔离");
+        assert!(h.room_state_del("r", "c1"));
+        assert_eq!(h.room_state_get("r", "c1"), None);
+        assert_eq!(
+            h.room_state_get("r", "c2"),
+            Some(vec![2]),
+            "逐键删除不伤邻键"
+        );
+        assert!(h.room_state_del("r", "c2"));
+        assert!(
+            !h.room_state_del("r", "c2"),
+            "整房清空后回收（再删 = false）"
+        );
+    }
+
+    /// REF-02：值帽——超 1 MiB 拒写（错误文案指路 blob/kv）。
+    #[test]
+    fn given_room_state_over_cap_when_set_then_rejected() {
+        let h = WsHub::new();
+        let big = vec![0u8; 1024 * 1024 + 1];
+        assert!(h.bin_set(7, "big", big.clone()).is_err());
+        assert!(h.room_state_set("r", "big", big).is_err());
+        assert_eq!(h.bin_get(7, "big"), None, "拒写不落盘");
     }
 }
 

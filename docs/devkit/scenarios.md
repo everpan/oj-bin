@@ -5171,3 +5171,50 @@ HTTP 路径调用 `bus.subscribe` 报错（订阅对象是连接本身）。
 | group 传了但「每台都收到」 | broker 不是 kafka——`await bus.kind()` 先判型；进程内/rabbitmq 臂忽略 group |
 | 想回放历史消息 | kafka 臂**显式 group 时 `auto.offset.reset=latest`**：只收订阅之后的新事件，停机窗口内事件按设计丢弃（重要消息自建对账/落库兜底）；要 earliest 回放走 cfg `broker.group`（不传 group） |
 | 以 group 之名做「发布确认」 | group 是消费侧概念，与 publish 返回值（本地接收数）无关；跨实例投递确认需业务自建回执 |
+
+## 场景 81：WS 房间跨实例广播——`ws.rooms_cluster` 房间中继（v0.1.140）
+
+> 何时抄我：同一 WS 房间（如协同编辑房间、聊天室）的连接分布在**多个 oj 实例**上，
+> 本地 `ws.broadcast` 只覆盖本实例——开 `ws.rooms_cluster` 后广播自动经消息中继扇出到
+> 全部实例，业务模块代码零改动。
+
+```yaml
+# config.yaml —— 两道门禁：broker 必须 kafka/rabbitmq、kv 必须 redis 插件
+broker:
+  kind: kafka
+  bootstrap: "broker1:9092"
+  topic_prefix: "acme"      # 中继 topic = <prefix>ws-relay（多环境共集群时务必隔离）
+kv: { default: redis }
+ws:
+  rooms_cluster: true
+```
+
+```ts
+// src/collab/room/api.ts —— 与单实例写法完全一致，本地先行 + 中继扇出由桥接层包办
+export default {
+  message() {
+    const ev = JSON.parse(http.body());
+    ws.join(ev.room); // join 幂等（同房间重复 join 无副作用）
+    sess.state.room = ev.room;
+    ws.broadcast(ev.room, JSON.stringify({ op: ev.op, by: sess.id })); // 自动跨实例
+    const cur = new TextEncoder().encode(JSON.stringify(ev.cursor));
+    ws.roomStateSet(ev.room, `<${sess.id}>/cursor`, cur); // 房间态按连接键入（只收字节）
+  },
+  close() {
+    const r = sess.state.room;
+    if (r) ws.roomStateDel(r, `<${sess.id}>/cursor`); // 退出清态，别让幽灵光标留在别人视野里
+  },
+};
+```
+
+验证口径：两台实例（`broker.kind=kafka` + redis kv + `rooms_cluster: true`）起服务，
+各自连入同一房间；A 实例广播 → B 实例连接同步收到（抓包可见 `ws-relay` topic 上的
+`{"room","inst","t","d"}` 信封）；启动日志出现 `ws.rooms_cluster: relay up (inst …)`；
+停掉 relay 消费（改错 topic_prefix）→ 启动 10s 自检超时而 fail-fast 退出。
+
+| 坑 | 解 |
+|---|---|
+| 启动直接被拒 | 门禁缺一即拒：broker 是进程内 Bus / kv 是 InMemoryKV 都不行——单实例部署不要开此旗；报错文案会指出缺哪道 |
+| broker 是集群却忘了开 | 只 WARN 不拒（向后兼容）——但本地广播跨不了实例，排查「B 实例收不到」先查这旗 |
+| 想给房间消息加全局 seq | 中继信封**无 seq**：跨实例定序/去重由上层协同库（oj-collab）负责，传输层刻意不承诺顺序 |
+| 同一集群多套环境 | 必须给每套配不同 `topic_prefix`，否则中继 topic 撞名互扇 |

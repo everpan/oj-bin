@@ -86,7 +86,11 @@ pub fn js_route(path: &str, pool: Arc<RoutePool>, opts: WsOptions) -> axum::Rout
 /// 守卫形态：upgrade 前过 AuthGuard（path_no_base = base 之后路径，与 HTTP 管线
 /// 同语义；WS 握手 = GET 方法、cookie 为唯一凭证形态——浏览器 WS 发不了
 /// Authorization 头，Bearer 经 query token 的变体本期不做，见 04-oj-upstream-prs）。
-/// Err → 401 不升级；Ok(None)（匿名路径）与 Ok(Some(user)) 都放行。
+/// Err → 401 不升级；Ok(None)（匿名路径）与 Ok(Some(user)) 都放行（user 进 upgrade
+/// 钩子上下文）。AuthGuard 之后、101 之前跑模块可选 `upgrade(ctx)` 钩子（REQ-02a，
+/// v0.1.140）：拒绝 = 无 101、不入房间、不进帧池、connection() 不触发——页面级 ACL
+/// 的「不暴露存在性」只在平台侧成立；`json.fail(n)` 或钩子执行失败即拒，缺席/`json.ok`
+/// 即放行（拒绝响应沿用钩子给的状态码，执行失败 403）。
 pub fn js_route_guarded(
     path: &str,
     path_no_base: &str,
@@ -98,10 +102,13 @@ pub fn js_route_guarded(
     axum::Router::new().route(
         path,
         axum::routing::get(
-            move |ws: axum::extract::WebSocketUpgrade, headers: axum::http::HeaderMap| {
+            move |ws: axum::extract::WebSocketUpgrade,
+                  headers: axum::http::HeaderMap,
+                  uri: axum::http::Uri| {
                 let pool = pool.clone();
                 let path_no_base = path_no_base.clone();
                 async move {
+                    let mut user = None;
                     if let Some(g) = &guard {
                         let authz = headers
                             .get(axum::http::header::AUTHORIZATION)
@@ -114,9 +121,9 @@ pub fn js_route_guarded(
                                 .collect::<std::collections::HashMap<_, _>>(),
                         )
                         .unwrap_or_default();
-                        if let Err(msg) = g.verify(&path_no_base, "GET", authz, Some(&headers_json))
-                        {
-                            return fail_response(401, &msg);
+                        match g.verify(&path_no_base, "GET", authz, Some(&headers_json)) {
+                            Err(msg) => return fail_response(401, &msg),
+                            Ok(u) => user = u,
                         }
                     }
                     if !gate_enter(opts.max_connections) {
@@ -127,6 +134,39 @@ pub fn js_route_guarded(
                     // on_upgrade 回调）与连接真实结束各持一个克隆，GateGuard 恰 drop
                     // 一次——缺了 failed 路径，反复 connect+RST 可永久打满闸门（DoS）。
                     let gate = Arc::new(GateGuard);
+                    // upgrade 期 ACL（临时会话即刻 detach，不占池、不留房间成员）。
+                    let (probe_tx, _probe_rx) = mpsc::unbounded_channel();
+                    let handle = pool.attach(probe_tx);
+                    let req = only_js::bridge::RequestInfo {
+                        method: "GET".into(),
+                        query: crate::dispatch::parse_query(uri.query()),
+                        headers: headers
+                            .iter()
+                            .filter_map(|(k, v)| {
+                                v.to_str()
+                                    .ok()
+                                    .map(|s| (k.as_str().to_string(), s.to_string()))
+                            })
+                            .collect(),
+                        user,
+                        ..Default::default()
+                    };
+                    let verdict = handle.fire_ctx("upgrade", Vec::new(), req).await;
+                    handle.detach();
+                    match verdict {
+                        Ok(o) if o.capture.status < 400 => {}
+                        Ok(o) => {
+                            let msg = msg_of(&o.capture.body);
+                            return fail_response(o.capture.status, &msg);
+                        }
+                        // 预载失败（无钩子/文件缺失）：保持 v0.1.9 起契约——照样 101，
+                        // 由 frame_loop 经闭锁池干净关连接（fire 得 PoolClosed）；
+                        // 升级期 ACL 只拦截钩子真实执行过的连接。
+                        Err(FrameError::PoolClosed) => {}
+                        Err(_) => {
+                            return fail_response(403, "ws upgrade rejected (upgrade hook failed)");
+                        }
+                    }
                     let failed_gate = Arc::clone(&gate);
                     ws.on_failed_upgrade(move |_err| drop(failed_gate))
                         .on_upgrade(move |socket| async move {
@@ -138,6 +178,14 @@ pub fn js_route_guarded(
             },
         ),
     )
+}
+
+/// 拒绝响应文案：从钩子输出的信封提取 msg（解析失败给通用文案）。
+fn msg_of(body: &[u8]) -> String {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("msg").and_then(|m| m.as_str().map(String::from)))
+        .unwrap_or_else(|| "ws upgrade rejected".into())
 }
 
 /// 401 信封（与 tasks.rs fail_response 同形；ws.rs 自带一份避免跨模块伸手）。
@@ -376,32 +424,47 @@ async fn frame_loop(socket: WebSocket, pool: Arc<RoutePool>) {
         Err(e) => eprintln!("ws connection: {e}"),
     }
 
-    // Writer：respChan → 串行写回（Text/Binary 按帧型）；通道排空（连接结束）后发 Close 帧干净关闭。
+    // Writer：respChan → 串行写回（Text/Binary 按帧型）；通道排空（连接结束）后发
+    // Close 帧干净关闭——若已写出显式 Close（ws.close(code, reason)）则不再补发。
     // （置后启动：PoolClosed 断连路径要在 sink 被 writer 接走前直发 Close。）
     let writer = tokio::spawn(async move {
+        let mut sent_close = false;
         while let Some(frame) = resp_rx.recv().await {
             let msg = match frame {
                 WsSend::Text(t) => Message::Text(t.into()),
                 WsSend::Binary(b) => Message::Binary(b.into()),
+                WsSend::Close(c, r) => {
+                    sent_close = true;
+                    Message::Close(Some(axum::extract::ws::CloseFrame {
+                        code: c,
+                        reason: r.into(),
+                    }))
+                }
             };
             if sink.send(msg).await.is_err() {
                 return;
             }
         }
-        let _ = sink.send(Message::Close(None)).await;
+        if !sent_close {
+            let _ = sink.send(Message::Close(None)).await;
+        }
     });
 
+    let mut final_close: Option<(u16, String)> = None;
     while alive {
         let Some((bytes, binary)) = msg_rx.recv().await else {
             break; // 客户端 Close / socket 断
         };
         match handle.fire("message", bytes, binary).await {
             Ok(o) => {
-                let closing = o.close;
-                emit(&resp_tx, o);
-                if closing {
+                // 显式关闭码（REQ-02a）：记码断帧循环，Close 帧排在 close 钩子离帧
+                // 之后写出（顺序契约同 HEAD：message sends → close 钩子 sends → Close）。
+                if o.close.is_some() {
+                    final_close = o.close.clone();
+                    emit(&resp_tx, o);
                     break;
                 }
+                emit(&resp_tx, o);
             }
             // 帧超时 = 必断连（V8 已 terminate，worker 已弃会话）。
             Err(FrameError::Timeout) => {
@@ -424,6 +487,10 @@ async fn frame_loop(socket: WebSocket, pool: Arc<RoutePool>) {
             Ok(o) => emit(&resp_tx, o),
             Err(e) => eprintln!("ws close: {e}"),
         }
+    }
+    // 显式 Close 帧殿后：尾随 close 钩子离帧（Writer 见 Close 后不再补发无码 Close）。
+    if let Some((c, r)) = final_close {
+        let _ = resp_tx.try_send(WsSend::Close(c, r));
     }
     handle.detach(); // 所有退出路径汇合：删会话条目 + 丢排队帧 + 空池退役计时
     drop(resp_tx); // Writer 排空后自然退出

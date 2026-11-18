@@ -1253,6 +1253,30 @@ impl GateLike for config::RpcCfg {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// rooms_cluster 装配门禁（REF-04，v0.1.140）：两个「假集群」悬崖——本地 broker 中继
+/// 永远出不了进程；内存 KV 的 lock/CAS 进程本地，跨实例协调假成功。缺一启动拒绝，
+/// 错误信息点名条件 + 修法 + 单实例提示（供 `rooms_cluster_gate` 单测断言文案）。
+fn rooms_cluster_gate(broker_kind: &str, kv_plugin_present: bool) -> Result<(), String> {
+    if broker_kind == "local" {
+        return Err(
+            "ws.rooms_cluster: broker is the in-process Bus — the relay would never \
+             reach another instance\n  下一步：配置 broker.kind（kafka|rabbitmq，需装对应 \
+             插件）；单实例部署不应开启此旗"
+                .to_string(),
+        );
+    }
+    if !kv_plugin_present {
+        return Err(
+            "ws.rooms_cluster: kv is the builtin InMemoryKV — its lock/CAS are \
+             process-local, cross-instance coordination would fake-succeed\n  下一步：\
+             配置 redis.default（oj-kv-redis 插件）+ broker.kind；单实例部署不应开启此旗"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn assemble_backend(
     cfg: &Config,
     top: &serde_json::Value,
@@ -1488,6 +1512,37 @@ pub async fn assemble_backend(
             .connect(&cfg_broker)
             .await
             .map_err(|e| format!("broker: {e}"))?
+    };
+    // rooms_cluster 三面门禁 + boot 自回声探针（REF-04，v0.1.140）：本地 broker / 内存 KV
+    // 下开旗是「假集群」（中继空转 / 锁与 CAS 进程本地假单飞）——启动拒绝，错误信息点名
+    // 两个条件与修法；broker 已配集群而旗未开 = 回到静默单实例（原始故障模式）→ 告警不无声。
+    let _relay = if cfg.ws.rooms_cluster {
+        rooms_cluster_gate(bus.kind(), registries.kv.is_some())?;
+        let (relay, probe) = only_js::bridge::relay::spawn_relay(bus.clone())
+            .await
+            .map_err(|e| format!("ws.rooms_cluster: {e}"))?;
+        probe
+            .ping(&relay)
+            .await
+            .map_err(|e| format!("ws.rooms_cluster boot probe: {e}"))?;
+        probe
+            .wait(std::time::Duration::from_secs(10))
+            .await
+            .map_err(|e| format!("ws.rooms_cluster: {e}"))?;
+        eprintln!(
+            "[oj-serve] ws.rooms_cluster: relay up (inst {})",
+            relay.inst
+        );
+        Some(relay)
+    } else {
+        if bus.kind() != "local" {
+            eprintln!(
+                "[oj-serve] WARN: broker.kind = {} configured but ws.rooms_cluster is off — \
+                 ws.broadcast stays process-local; cross-instance room fan-out disabled",
+                bus.kind()
+            );
+        }
+        None
     };
     // mail 后端（spec 2026-09-15）：顶层 smtp: 段 + oj-mail 插件 vtable。
     // 必须在 bus 之后——结果上送（`mail.result`）的扇出目标是同一总线实例。

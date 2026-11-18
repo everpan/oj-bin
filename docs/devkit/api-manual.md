@@ -875,10 +875,13 @@ v0.1.86 及以前 WS 按「文件父目录相对挂载根」平铺计算，比 `
 （`/api/wiki/api/ws`），前端按文档连 `/api/wiki/ws` 恒 404；且守卫面同为 `/wiki/api/ws`，
 `anonymous_paths` 里写 `/wiki/ws` 也命中不了（握手 401）。v0.1.87 起两口径统一。
 
-**契约（v0.1.9 起，钩子签名不变）**：default 导出生命周期钩子对象，按事件触发：
+**契约（v0.1.9 起，钩子签名不变；v0.1.140 增 `upgrade`）**：default 导出生命周期钩子对象，按事件触发：
 
 ```ts
 export default {
+  upgrade()    { /* v0.1.140 握手期恰一次（101 前）：可读 http.query/header/user；
+                    json.fail(n, msg) 即拒绝——无 101、不入房间、不进帧池、connection()
+                    不触发（响应沿用该状态码）；json.ok 或缺席 = 放行。页面级 ACL 在此 */ },
   connection() { /* 连接建立后恰好一次：bus.subscribe 在此 */ },
   message()    { /* 每帧一次：http.body 读帧（JSON 自动 parse；Binary 帧 → null，字节走 http.bodyBytes()） */ },
   error(e)     { /* 任一钩子抛异常时兜底，之后连接继续 */ },
@@ -895,7 +898,7 @@ export default {
 帧超时断开**该连接**（毒化只影响执行帧的 Worker，池自动补员，其它连接无感）。
 `ws.max_connections`（默认 1000，0=不限）超限 upgrade 返 503。
 
-- 四钩子全部可选，但**至少导出一个**（全缺 → 连接建立即断）。
+- 五钩子全部可选，但**至少导出一个**（全缺 → 连接建立即断）。
 - 钩子内用既有全局（`json`/`http`/`ws`/`bus`/`sess`/…），与 HTTP handler 一致；**返回值一律忽略**，
   回帧必须显式 `json.ok` / `ws.send`。
 - 可变跨帧状态一律放 `sess.state`（顶层 `const`/`let` 只是 Worker 本地只读缓存，
@@ -1111,7 +1114,7 @@ const n = await db.exec("update user set name = ? where id = ?", ["b", 1]);
 | `fetch(url, options?)` | WHATWG fetch（deno 官方实现，v0.1.8；真 `Response`/`Headers`，https 无需额外配置） |
 | `bridge.call({method, path, headers?, body?})` | **进程内 dispatch**（v0.1.131）：调用本进程另一 endpoint（业务路由/`{base}/mcp`/`{base}/rpc`/`{base}/health`/`{base}/plugins`）并返回标准 `Response`；目标 handler 在**隔离的内部分发池**上执行，不占公共 actor 槽——代理/编排 handler 的进程内转发**用它而不是 `fetch` 回环**（后者并发 ≥ pool_size 全池挂死），见下「bridge」 |
 | `ws.send / close` | WebSocket 帧控制（HTTP 路径下 no-op） |
-| `sess.id / sess.state` | WS 连接 id 与会话状态（仅 ws.ts 钩子内；state 须可 JSON 序列化） |
+| `sess.id / sess.state` | WS 连接 id 与会话状态（仅 ws.ts 钩子内；state 须可 JSON 序列化）；二进制态走 `sess.binSet/binGet`（v0.1.140，断连自动释放） |
 | `new WebSocket(url)` | WHATWG 出站 WS 客户端（任务与 handler 均可用，见下「WebSocket —— 出站客户端」） |
 | `plugins()` | 已加载插件自省 + 宿主 ABI |
 | `ojInfo()` | 装配期固化诊断（v0.1.54；与 `oj info` CLI 同源）：build/abi/plugins/backends/config 五段，config 只出键名，见下「ojInfo()」 |
@@ -2081,15 +2084,21 @@ export default {
 | API | 签名 | 说明 |
 |---|---|---|
 | `ws.send` | `send(data: string \| Uint8Array): void` | 向当前连接发一帧：string → Text 帧（0x1），Uint8Array → Binary 帧（0x2，v0.1.16 起）；HTTP 路径下 no-op |
-| `ws.close` | `close(): void` | 结束当前连接 |
+| `ws.close` | `close(code?: number, reason?: string): void` | 结束当前连接。带码（v0.1.140）只放行 **1000 与 4000-4999**（3xxx/系统保留段报错），reason ≤123 字节；4xxx 语义 = **不可重试关闭**（y-websocket 类客户端在该段停 provider——批量撤销授权不产生重连风暴的前提）；无参 = 无码关闭（原行为） |
 | `ws.join` | `join(room: string): void` | 当前连接加入房间（v0.1.30；仅 ws handler 内，连接身份自动取） |
 | `ws.leave` | `leave(room: string): void` | 当前连接离开房间（v0.1.30；仅 ws handler 内；断连自动摘除，无需兜底） |
 | `ws.broadcast` | `broadcast(room: string, data: string \| ArrayBuffer \| Uint8Array): number` | 房间扇出（v0.1.30）：**除己**送达成员数（socket.io 语义，发送者要回声自己在 JS 里发）；HTTP handler 也可调（无连接身份 = 不排除任何人）。v0.1.52 起 data 与 `ws.send` 对称：string → Text 帧、ArrayBuffer/Uint8Array → Binary 帧；其余类型**报错**而非发垃圾帧 |
 | `ws.roomSize` | `roomSize(room: string): number` | 房间当前成员数（v0.1.30；presence 最小原语，任意上下文可调） |
+| `ws.roomStateSet` | `roomStateSet(room: string, key: string, data: ArrayBuffer \| Uint8Array): void` | 房间域二进制状态镜像（v0.1.140）：进程本地、**最终一致**（集群模式经中继对齐靠 awareness beacon 自愈，非强一致）。值帽 1 MiB；**键布局约定：awareness 聚合一律按连接键入 `"<connId>"`**——单键单 blob 无合并语义，多客户端共写同一键即互踩；迟到者全量读各键逐个 apply |
+| `ws.roomStateGet` | `roomStateGet(room: string, key: string): Uint8Array \| null` | 房间域读取（不存在 = null） |
+| `ws.roomStateDel` | `roomStateDel(room: string, key: string): boolean` | 房间域删除（`close()` 钩子里清 awareness 死条目；整房清空自动回收） |
 
-房间是**进程内**单例 hub；跨实例扇出仍走 `bus.publish`。
+房间是**进程内**单例 hub。`ws.rooms_cluster: true`（v0.1.140）时 `ws.broadcast` 自动跨实例：
+本地成员直投（延迟 0）+ 单共享中继 topic 扇出他实例（`inst == self` 回环丢弃，不重复）——
+**模块代码零改动**；返回值仍为本地送达数（远程不统计）。关闭时跨实例扇出走 `bus.publish` 手工接线。
 | `sess.id` | `number`（只读） | 当前连接 id（路由内自 1 递增） |
 | `sess.state` | 读写属性 | 连接会话状态（Rust 会话表持久，按连接隔离）；**必须可 JSON 序列化**——函数等不可序列化值静默丢失 |
+| `sess.binSet / sess.binGet` | `binSet(key: string, data: ArrayBuffer \| Uint8Array): void` / `binGet(key: string): Uint8Array \| null` | 连接域二进制状态（v0.1.140）：Yjs awareness/会话二进制放这里——**断连自动释放**，不经 JSON 序列化（sess.state 的「不可序列化静默丢失」坑在此豁免）。值帽 1 MiB，大对象走 blob/kv |
 
 仅在 `ws.ts` 钩子内有意义（第 4 章 §ws.ts——帧池执行模型与 sess 约束）。
 
@@ -3359,11 +3368,26 @@ ws:
   # max_connections: 1000      # 全局并发连接闸门：超限 upgrade 返 503；0 = 不限
   # workers_per_route: 2       # 每路由无状态 Worker 数（共享执行该路由全部连接的帧）
   # idle_linger_ms: 0          # 路由连接归零后 Worker 池保活毫秒数（0 = 立即退役）
+  # rooms_cluster: false       # 跨实例房间扇出（v0.1.140）：见下方语义与门禁
 ```
 
 段缺省 = 全默认。语义：内存与连接数解耦——每连接只持会话态（sess.state ≈KB 级），
 V8 runtime 按 Worker 数常驻；单帧超时只断该连接（毒化 Worker 由池补员）。
 执行模型详见第 4 章 §ws.ts。
+
+**rooms_cluster（v0.1.140）**：`true` 时 `ws.broadcast` 本地直投 + 经 broker 单共享
+topic（逻辑名 `ws-relay`，跟随 `broker.topic_prefix`）跨实例扇出——每实例一条订阅
+（kafka = boot-uuid 独立消费组 + `auto.offset.reset=latest`，**不回放历史、实例间无
+rebalance 抢消费**；rabbitmq = 匿名排他队列）。启动探针走**自回声**（发布探针帧并等
+自己收到，broker 不可达/权限错/消费未起任一即启动失败）。**门禁（缺一启动拒绝）**：
+broker 必须是集群后端（`broker.kind: kafka|rabbitmq`）、kv 必须配 `redis.default`
+（内存 KV 的锁/CAS 进程本地，跨实例协调假成功）；反向：broker 已配集群而旗未开 =
+启动 WARN（回静默单实例是原始故障模式，不无声）。**规模上界（诚实声明）**：单 topic
+广播 = 每实例收所有活跃房间全部帧，适合「活跃房间 ≪ 总页面数」的 wiki 型负载，超出
+再议 per-room topic；topic 名漂移（实例间配置不一致）无法自动检测，运维须知。单实例
+部署**不应**开启此旗。投递语义直陈：中继为「本地投递完成后提交」的 at-least-once
+（kafka 手动 commit，v0.1.140 起全 bus 臂生效）——消费侧须幂等；CRDT 帧丢失兜底 =
+`oj-collab` 库层周期 resync（缺口检测 + 快照重放对账）。
 
 ### tenant / auth
 
@@ -4071,8 +4095,10 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | `kv.cas/setNX/getSet/lock` 在内存 KV（未配 `redis.default`）下**进程本地**（v0.1.138） | 内存 KV 的原子原语与锁只在**本进程内**互斥——多实例部署下 `kv.lock` 会**各自成功**（假单飞）。需要跨实例协调（锁/单飞/序号去重）必须配 `redis.default`；用「锁是本地」的内存 KV 跑多实例压实类任务是数据损坏级错误 |
 | `db.tx` 无隔离级别控制（v0.1.139 明示） | `db.tx` 固定使用后端缺省隔离级别（MySQL REPEATABLE READ / PG READ COMMITTED / sqlite 串行），**没有** `isolation` 参数；也不要在事务回调里手写 `SET TRANSACTION`。跨方言并发一致读不要依赖 RR——用「宽限删除 + 读者按 seq 缺口检测重读快照」的方言无关契约兜底（见 scenarios 场景 79） |
 | 两阶段压实 tx2 删除边界（v0.1.139） | 压实/快照类配方的日志清理谓词必须**双条件**：`seq <= 本快照.upto_seq AND created_at < now() - 宽限`（宽限 > 读者读窗口，配方缺省 60s）——只按 seq 删会让读窗口内的读者拿到日志空洞（重建缺编辑），且**永不删高于自己快照 upto_seq 的行**。完整配方与读者并发验证见 scenarios 场景 79 |
+| `ws.rooms_cluster` 假集群门禁（v0.1.140） | 开旗但 broker 为进程内 Bus / kv 为内存 InMemoryKV → **启动拒绝**（中继出不了进程 / 锁与 CAS 假单飞——多实例部署跑压实类任务是数据损坏级错误）；修法进错误文案（配 `broker.kind` + `redis.default`）。broker 已配集群而旗未开 → 启动 WARN。单实例部署不应开旗。规模上界与 topic 漂移见 §10 ws 段 |
+| bus/kafka 手动 commit（v0.1.140） | kafka 臂消费改为「本地投递完成后提交」——**crash-restart 窗口从丢帧变重复投递**（此前 at-most-once：poll 后 auto-commit 前崩溃 = 帧永久丢失）。跨实例扇出与业务订阅一致适用；**消费侧逻辑必须幂等**（CRDT applyUpdate 天然幂等；业务帧自建去重键）。重启后滞后由 per-group offset 决定：显式组 latest（只收新）、缺省组 earliest（回放未提交段） |
 | bus 二进制 wire 约定（v0.1.16） | JSON → record/信封文本帧；字节 → record payload = 原始字节、投递为 Binary 帧。消费侧启发式：UTF-8 且为含 `topic`+`data` 的 JSON 对象才按文本信封，否则按二进制透传——**恰为该形状 JSON 的二进制载荷会以文本帧投递**（无害，自辨） |
-| WS 二进制状态（Yjs awareness 等）不进 `sess.state` | `sess.state` 必须可 JSON 序列化；二进制状态走 base64 字符串存 `sess.state`/kv，或分片放 kv |
+| WS 二进制状态（Yjs awareness 等）不进 `sess.state`（v0.1.140 起首选 `sess.binSet`） | `sess.state` 必须可 JSON 序列化；二进制走 `sess.binSet/binGet`（连接域、断连自动释放、值帽 1 MiB）或房间域 `ws.roomStateSet`；超大对象走 blob/kv |
 | `WhereCond.and/or` 嵌套未展开 | 多个 `where()` 即 AND；复杂条件用 `db.query` 参数化 SQL |
 | `orIgnore()` + `fromSelect()`（v0.1.128 起三方言全支持） | sqlite 渲染 `INSERT OR IGNORE INTO … SELECT …`、mysql 渲染 `INSERT IGNORE INTO … SELECT …`（不要求主键）、pg 渲染 `… ON CONFLICT DO NOTHING`。**只幂等唯一键冲突**——目标表须真有唯一约束，否则冲突子句是空操作、连跑两次重复落；**语义宽度跨方言相反**——pg 上 NOT NULL/CHECK 违例照常报错，sqlite/mysql 的宽形态（OR IGNORE / INSERT IGNORE）对同样脏数据静默丢行（降级为跳过/告警）。mysql VALUES 形态仍渲染 `ON DUPLICATE KEY UPDATE pk=pk`（要求主键）。渲染形态表见 `sql-builder-guide.md` §3.2 |
 | schema 回滚无自动机制 | 迁移只前向；破坏性变更前备份，反向变更写新 seq 迁移 |

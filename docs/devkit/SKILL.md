@@ -223,6 +223,10 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | 重编后的新插件在旧宿主上加载（插件作者） | 旧插件无需重编（`oj_plugin_axes` 缺失回落 per-axis dlsym）；但**新插件必须配新宿主**——旧 cdylib 换新宿主、或新 cdylib 配旧宿主都须 `cargo xtask build` 全量联编，勿混跑版本 |
 | WS 连上但收不到广播 | 订阅只在 WS 会话内有效（`bus.subscribe` 在 HTTP 路径报错）；release 下 URL 含版本段 |
 | `bus.subscribe(topic, { group })` 没分摊（每台都收到，v0.1.139） | group 只在 **kafka 臂**生效（同组跨实例分摊：一个事件恰一个实例处理）；进程内总线与 rabbitmq 臂（匿名排他队列天然广播）**忽略 group**——先 `await bus.kind()` 判型；另注意 kafka 臂显式 group 时 `auto.offset.reset=latest`（只收订阅之后的新事件，停机窗口内事件按设计丢弃），缺省组维持 earliest |
+| `ws.rooms_cluster: true` 启动被拒（v0.1.140） | 两道门禁缺一即拒：broker 必须是 kafka/rabbitmq（进程内 Bus / InMemoryKV 出不了实例）、kv 必须是 redis 插件——单实例部署**不应开此旗**；broker 是外置集群却没开时只 WARN |
+| `ws.close(3003)` 报错（v0.1.140） | 只放行 `1000` 与 `4000-4999` 应用保留区间（RFC 6455），协议保留码（1xxx/2xxx/3xxx）一律拒绝，reason ≤123 字节——表达「不可重试」语义用 4xxx（如 `4403`） |
+| `upgrade()` 钩子没拦住越权连接（v0.1.140） | `json.fail(status, msg)` 即拒绝握手（客户端拿到该 HTTP 状态，无 101）；`json.ok` 或**钩子缺席 = 放行**，返回值被忽略——钩子参数带 GET RequestInfo（query/headers/user），鉴权逻辑写这里，别指望 connection() 再补救（那时 101 已发） |
+| `roomState` 两客户端互踩（v0.1.140） | 房间态按连接键入：`ws.roomStateSet("room", "<connId>/cursor", pos)`（`<>` 内换自己的键），退出时 `ws.roomStateDel("room", "<connId>/cursor")`——裸键是共享 LWW 语义，会被别人覆盖 |
 | 改了 `ext_boot.js` 没生效 | 不做热重载，装配期已冻结 spec——必须重启进程 |
 | `ext_boot.js` 里 `await` 报 SyntaxError | 文件无 import/export，被 CJS 启发式包进非 async 函数——加一句 `export {};` |
 | fs 相对路径「找不到文件」 | 相对路径解析到 **fs.root** 之下（不是进程 cwd）——想读进程 cwd 的文件请用绝对路径，且绝对路径也必须在 root 内 |

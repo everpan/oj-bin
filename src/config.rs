@@ -1417,6 +1417,10 @@ pub struct WsCfg {
     pub workers_per_route: usize,
     /// 路由连接归零后 Worker 池保活毫秒数（0 = 立即退役；调大吃暖启动收益）。
     pub idle_linger_ms: u64,
+    /// 跨实例房间扇出（REF-04，v0.1.140）：true = `ws.broadcast` 本地直投 + broker 中继，
+    /// 各实例中继消费按房间扇出本地成员。需要 `broker.kind` 集群后端 + `redis.default`
+    /// （缺一启动拒绝——本地 broker/内存 KV 下开旗是假集群）；单实例部署勿开。
+    pub rooms_cluster: bool,
 }
 
 impl Default for WsCfg {
@@ -1425,6 +1429,7 @@ impl Default for WsCfg {
             max_connections: 1000,
             workers_per_route: 2,
             idle_linger_ms: 0,
+            rooms_cluster: false,
         }
     }
 }

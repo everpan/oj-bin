@@ -41,6 +41,7 @@ fn frame(
             ev: "message",
             body: vec![],
             binary: false,
+            req: None,
             done: tx,
         },
         rx,

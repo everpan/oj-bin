@@ -679,7 +679,7 @@ async fn ws_global_send_close_and_reset() {
             WsSend::Text("side-b".to_string())
         ]
     );
-    assert!(o.close);
+    assert!(o.close.is_some());
     let v: Value = serde_json::from_slice(&o.capture.body).unwrap();
     assert_eq!(v["data"]["ok1"], true, "{v}");
 
@@ -693,7 +693,7 @@ async fn ws_global_send_close_and_reset() {
         .await
         .unwrap();
     assert!(o2.sends.is_empty());
-    assert!(!o2.close);
+    assert!(o2.close.is_none());
 }
 
 #[tokio::test(flavor = "current_thread")]

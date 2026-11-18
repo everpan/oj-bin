@@ -1083,3 +1083,35 @@ fn mcp_reserved_scan_skips_broken_catalog_and_accepts_oj_prefix_modules() {
     let healthy = mk(&[("/v1/api/user/account", "get")]);
     assert!(scan_reserved_tool_names(&[("/v1/api".to_string(), healthy)], None).is_ok());
 }
+
+// ---- rooms_cluster 装配门禁（REF-04，v0.1.140） ----
+
+// Given broker 为进程内 Bus 且开旗
+// When rooms_cluster_gate
+// Then Err 且文案点名 in-process Bus 与 broker.kind 修法
+#[test]
+fn given_local_broker_when_rooms_cluster_gate_then_rejected_with_broker_hint() {
+    let e = rooms_cluster_gate("local", true).unwrap_err();
+    assert!(e.contains("in-process Bus"), "{e}");
+    assert!(e.contains("broker.kind"), "{e}");
+    assert!(e.contains("rooms_cluster"), "{e}");
+}
+
+// Given 内存 KV（无 kv 插件）且开旗
+// When rooms_cluster_gate
+// Then Err 且文案点名 InMemoryKV 与 redis.default 修法
+#[test]
+fn given_inmemory_kv_when_rooms_cluster_gate_then_rejected_with_redis_hint() {
+    let e = rooms_cluster_gate("kafka", false).unwrap_err();
+    assert!(e.contains("InMemoryKV"), "{e}");
+    assert!(e.contains("redis.default"), "{e}");
+}
+
+// Given 集群 broker + kv 插件在位
+// When rooms_cluster_gate
+// Then Ok（两臂：kafka / rabbitmq）
+#[test]
+fn given_cluster_broker_and_kv_plugin_when_gate_then_passes() {
+    assert!(rooms_cluster_gate("kafka", true).is_ok());
+    assert!(rooms_cluster_gate("rabbitmq", true).is_ok());
+}

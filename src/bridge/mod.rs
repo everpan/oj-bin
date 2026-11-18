@@ -82,6 +82,7 @@ pub mod plugin_loader;
 mod plugins_op;
 mod query;
 mod registry;
+pub mod relay;
 pub mod reload_bridge;
 mod runtime;
 pub mod secret_axis;
@@ -482,8 +483,9 @@ pub struct ReqState {
     pub session: Option<String>,
     /// WS 帧循环专用：ws.send 收集（处理器结束后按序写出，先于信封响应）。
     pub ws_sends: Vec<WsSend>,
-    /// WS 帧循环专用：ws.close 置位 → 本帧结束后关闭连接。
-    pub ws_close: bool,
+    /// WS 帧循环专用：ws.close(code?, reason?) → 本帧结束后关闭（v0.1.140：None = 无码
+    /// 关闭（原行为）；Some((c, r)) = 显式关闭码（平台只放行 1000 与 4000-4999）。
+    pub ws_close: Option<(u16, String)>,
     /// WS 帧收尾（帧池 spec 2026-09-09）：dispatcher `finally` 把 `__sess` 快照交还
     /// （sess.state 外置 Rust 会话表的回传通道；None = 本帧未触发 finally 兜底）。
     pub ws_sess: Option<serde_json::Value>,
@@ -538,7 +540,7 @@ impl ReqState {
         self.tx = None;
         self.session = None;
         self.ws_sends.clear();
-        self.ws_close = false;
+        self.ws_close = None;
         self.ws_sess = None;
         self.module = None;
         self.module_version = None;
@@ -705,6 +707,13 @@ deno_core::extension!(
         ws::op_ws_leave,
         ws::op_ws_broadcast,
         ws::op_ws_broadcast_bin,
+        ws::op_ws_relay_publish,
+        ws::op_ws_relay_publish_bin,
+        ws::op_ws_bin_set,
+        ws::op_ws_bin_get,
+        ws::op_ws_room_state_set,
+        ws::op_ws_room_state_get,
+        ws::op_ws_room_state_del,
         ws::op_ws_room_size,
         mq::op_mq_has,
         mq::op_mq_call,
@@ -1411,7 +1420,7 @@ impl Bridge {
             let op_state = runtime::op_state(&rt);
             let g = op_state.borrow();
             let rs = g.borrow::<ReqState>();
-            (rs.ws_sends.clone(), rs.ws_close)
+            (rs.ws_sends.clone(), rs.ws_close.clone())
         };
         let capture = Self::read_capture(&rt);
         Self::finalize_tx(&rt).await;
@@ -1436,7 +1445,7 @@ impl Bridge {
         let code = format!(
             "const h = (await import(\"{spec}\")).default ?? {{}};\n\
              const fns = {{}};\n\
-             for (const k of [\"connection\", \"message\", \"close\", \"error\"])\n\
+             for (const k of [\"upgrade\", \"connection\", \"message\", \"close\", \"error\"])\n\
                fns[k] = typeof h[k] === \"function\" ? h[k] : null;\n\
              globalThis.__ws_hooks = fns;\n\
              globalThis.__sess = null;\n\
@@ -1444,6 +1453,8 @@ impl Bridge {
                get id() {{ return globalThis.__ws_conn; }},\n\
                get state() {{ return globalThis.__sess ?? (globalThis.__sess = {{}}); }},\n\
                set state(v) {{ globalThis.__sess = v; }},\n\
+               binSet(k, b) {{ return Deno.core.ops.op_ws_bin_set(k, b, globalThis.__ws_conn); }},\n\
+               binGet(k) {{ return Deno.core.ops.op_ws_bin_get(k, globalThis.__ws_conn); }},\n\
              }};\n\
              globalThis.__ws_call = async (conn, ev) => {{\n\
                const fn = globalThis.__ws_hooks[ev];\n\
@@ -1455,7 +1466,7 @@ impl Bridge {
                  try {{ Deno.core.ops.op_ws_sess_set(globalThis.__sess === undefined ? null : globalThis.__sess); }} catch {{}}\n\
                }}\n\
              }};\n\
-             json.ok({{ connection: !!fns.connection, message: !!fns.message,\n\
+             json.ok({{ upgrade: !!fns.upgrade, connection: !!fns.connection, message: !!fns.message,\n\
                         close: !!fns.close, error: !!fns.error }});\n"
         );
         let driver_spec = deno_core::ModuleSpecifier::parse("file:///oj/ws_connect.js")
@@ -1964,16 +1975,19 @@ pub const WS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 pub struct WsOutcome {
     pub capture: Capture,
     pub sends: Vec<WsSend>,
-    pub close: bool,
+    pub close: Option<(u16, String)>,
 }
 
 /// 一条待写出帧（v0.1.16 二进制支持）：ws.send 文本 / 二进制与 bus 广播帧共用同一
 /// 管道（ws_sends → WsOutcome → server resp 通道 → Writer），帧类型在此定型：
 /// Text → WebSocket text 帧；Binary → WebSocket binary 帧（opcode 0x2）。
+/// Close（v0.1.140）：ws.close(code, reason) 的显式关闭帧——4000-4999 应用保留段 =
+/// 「不可重试」语义（y-websocket 类客户端在该段停重连）；hub/bus 通道不产生此变体。
 #[derive(Clone, Debug, PartialEq)]
 pub enum WsSend {
     Text(String),
     Binary(Vec<u8>),
+    Close(u16, String),
 }
 
 /// 池化任务驻留会话（PRD v2 §6.2/6.3）：模块已加载、setup 已执行，模块作用域 = 任务 ctx。

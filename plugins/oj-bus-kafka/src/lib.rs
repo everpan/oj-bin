@@ -80,11 +80,12 @@ impl KafkaCore {
     /// 既有语义零变化）；Some(g) 覆盖 group.id 且 reset=latest——显式组订阅（ABI 13
     /// 房间集群中继类「每实例广播扇出」）不回放历史，停机窗口帧由上层 resync 兜底。
     fn bus_consumer_cfg(&self, group: Option<&str>) -> ClientConfig {
-        // bus 面维持现状：auto-commit（push 扇出语义）。
+        // bus 面手动 commit（v0.1.140，REF-04）：本地投递完成后提交——丢帧主敌消灭，
+        // 崩溃重启窗口改为重复投递（消费侧须幂等，见 do_subscribe 消费循环注释）。
         let mut c = ClientConfig::new();
         c.set("bootstrap.servers", &self.brokers)
             .set("group.id", group.unwrap_or(&self.group))
-            .set("enable.auto.commit", "true")
+            .set("enable.auto.commit", "false")
             .set(
                 "auto.offset.reset",
                 if group.is_some() {
@@ -461,6 +462,21 @@ impl BusPluginState {
                                 to_rbytes(p),
                             );
                             last_err_log = None;
+                            // 手动 commit（v0.1.140，REF-04）：本地投递完成后才提交——
+                            // 崩溃窗口从「poll 后 ~5s auto-commit 丢帧」变为「重启后重复
+                            // 投递」（CRDT applyUpdate 幂等 / awareness beacon 自愈；
+                            // 消费侧须幂等）。commit 失败 = 重启重投，不阻塞消费。
+                            let mut tpl = rdkafka::topic_partition_list::TopicPartitionList::new();
+                            if tpl
+                                .add_partition_offset(
+                                    m.topic(),
+                                    m.partition(),
+                                    rdkafka::topic_partition_list::Offset::Offset(m.offset() + 1),
+                                )
+                                .is_ok()
+                            {
+                                let _ = consumer.commit(&tpl, CommitMode::Async);
+                            }
                         }
                         Some(Err(e)) => {
                             let now = std::time::Instant::now();
@@ -899,8 +915,83 @@ mod tests {
         close(handle);
     }
 
+    /// 真 kafka bus 面 + 显式组 + 手动 commit 消费循环全链（env-gated，v0.1.140）：
+    /// 显式组订阅（per-subscribe consumer + latest）→ publish → host.deliver 可达
+    /// （投递后手动 commit 已在循环内执行——不崩即证路径通；重复/丢失语义由
+    /// 崩溃注入验收，属发布清单项）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn given_real_kafka_when_explicit_group_subscribe_then_publish_delivered() {
+        let brokers = match std::env::var("OJ_TEST_KAFKA_BROKERS") {
+            Ok(b) if !b.is_empty() => b,
+            _ => {
+                eprintln!("skip: OJ_TEST_KAFKA_BROKERS unset");
+                return;
+            }
+        };
+        let cfg = serde_json::json!({
+            "kind": "kafka",
+            "brokers": brokers.split(',').map(|s| s.trim()).collect::<Vec<_>>(),
+            "group": "oj-test-default",
+            "topic_prefix": format!("ojtest-relay-{}", std::process::id()),
+            "url": null,
+        })
+        .to_string();
+        let _ = std::result::Result::from(init(host(), RString::from("{}")));
+        let bytes = drive(&mut connect(RString::from(cfg.as_str())))
+            .await
+            .expect("connect");
+        let handle = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["handle"]
+            .as_u64()
+            .unwrap();
+        let topic = format!("relay.{}", std::process::id());
+        let group = format!("g-{}", std::process::id());
+        drive(&mut subscribe(
+            handle,
+            RString::from(topic.as_str()),
+            RString::from(group.as_str()),
+        ))
+        .await
+        .expect("subscribe");
+        // latest + 消费组 join 需要一点时间：订阅后发布才收得到。
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        let nonce = format!(r#"{{"room":"r","inst":"x","t":"t","d":"nonce-{group}"}}"#);
+        DELIVERED.lock().unwrap().clear();
+        drive(&mut publish(
+            handle,
+            RString::from(topic.as_str()),
+            to_rbytes(nonce.as_bytes()),
+        ))
+        .await
+        .expect("publish");
+        // deadline 轮询 DELIVERED：显式组消费 + deliver 上送 + 手动 commit 全链。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let hit = loop {
+            let got = DELIVERED
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(t, p)| t == &topic && p == nonce.as_bytes());
+            if got || std::time::Instant::now() >= deadline {
+                break got;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        };
+        assert!(
+            hit,
+            "explicit-group consumer must deliver the published frame"
+        );
+        close(handle);
+    }
+
     extern "C" fn test_log(_level: u8, _msg: RString) {}
-    extern "C" fn test_deliver(_topic: RString, _payload: RBytes) {}
+    /// 投递记录：bus 消费循环 → host.deliver 上送（env-gated 腿断言投递可达用）。
+    static DELIVERED: Mutex<Vec<(String, Vec<u8>)>> = Mutex::new(Vec::new());
+    extern "C" fn test_deliver(topic: RString, payload: RBytes) {
+        DELIVERED
+            .lock()
+            .unwrap()
+            .push((topic[..].to_string(), payload[..].to_vec()));
+    }
 
     fn host() -> RArc<HostContext> {
         RArc::new(HostContext {

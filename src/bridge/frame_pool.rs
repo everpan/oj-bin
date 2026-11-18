@@ -21,6 +21,9 @@ pub(crate) struct Frame {
     pub body: Vec<u8>,
     /// 帧型（v0.1.16）：WS binary 帧 true → `RequestInfo.body_binary`。
     pub binary: bool,
+    /// 请求上下文覆盖（v0.1.140 upgrade 钩子）：Some = 以该 RequestInfo 执行
+    /// （GET + query/headers/user 的握手期上下文）；None = 常规帧（WS 最小上下文）。
+    pub req: Option<super::RequestInfo>,
     pub done: oneshot::Sender<Result<WsOutcome, FrameError>>,
 }
 
@@ -344,13 +347,13 @@ impl RoutePool {
                     None => (serde_json::Value::Null, None),
                 }
             };
-            let req = RequestInfo {
+            let req = f.req.unwrap_or(RequestInfo {
                 method: "WS".into(),
                 body: f.body,
                 body_binary: f.binary,
                 bus_tx,
                 ..Default::default()
-            };
+            });
             let r = {
                 cur.store(f.conn, Ordering::SeqCst);
                 let r = ws_event(&mut sess, f.conn, f.ev, &req, &state, self.timeout).await;
@@ -454,7 +457,7 @@ pub(crate) async fn ws_event(
             WsOutcome {
                 capture: super::Bridge::read_capture(&sess.rt),
                 sends: rs.ws_sends.clone(),
-                close: rs.ws_close,
+                close: rs.ws_close.clone(),
             },
             rs.ws_sess.clone(),
         )
@@ -483,6 +486,30 @@ impl ConnHandle {
             ev,
             body,
             binary,
+            req: None,
+            done: tx,
+        });
+        match rx.await {
+            Ok(r) => r,
+            Err(_) => Err(FrameError::PoolClosed), // worker 恐慌/drop
+        }
+    }
+
+    /// 带请求上下文的事件执行（v0.1.140 upgrade 钩子专用）：钩子以 GET + 握手期
+    /// query/headers/user 运行，而非 WS 帧最小上下文。
+    pub async fn fire_ctx(
+        &self,
+        ev: &'static str,
+        body: Vec<u8>,
+        req: super::RequestInfo,
+    ) -> Result<WsOutcome, FrameError> {
+        let (tx, rx) = oneshot::channel();
+        self.pool.sched.submit(Frame {
+            conn: self.conn,
+            ev,
+            body,
+            binary: false,
+            req: Some(req),
             done: tx,
         });
         match rx.await {

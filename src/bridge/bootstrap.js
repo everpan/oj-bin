@@ -163,6 +163,8 @@ import {
   op_ws_join,
   op_ws_leave,
   op_ws_broadcast,
+  op_ws_relay_publish,
+  op_ws_relay_publish_bin,
   op_ws_room_size,
   op_fs_resolve,
   op_exec_run,
@@ -932,18 +934,32 @@ globalThis.ws = {
     typeof data === "string"
       ? op_ws_send(data)
       : op_ws_send_bin(data instanceof ArrayBuffer ? new Uint8Array(data) : data),
-  close: () => op_ws_frame_close(),
+  close: (code, reason) =>
+    op_ws_frame_close(code === undefined ? null : code, reason === undefined ? null : reason),
   join: (room) => op_ws_join(String(room), wsConnId(true)),
   leave: (room) => op_ws_leave(String(room), wsConnId(true)),
-  broadcast: (room, data) =>
-    typeof data === "string"
-      ? op_ws_broadcast(String(room), data, wsConnId(false))
-      : op_ws_broadcast_bin(
-          String(room),
-          data instanceof ArrayBuffer ? new Uint8Array(data) : data,
-          wsConnId(false),
-        ),
+  broadcast: (room, data) => {
+    const r = String(room);
+    // rooms_cluster (v0.1.140): relay to other instances, fire-and-forget; errors
+    // are swallowed here, the op resolves no-op when the relay is not running.
+    // Local fan-out stays sync-first (socket.io except-self semantics unchanged).
+    if (typeof data === "string") {
+      const n = op_ws_broadcast(r, data, wsConnId(false));
+      op_ws_relay_publish(r, data).catch(() => {});
+      return n;
+    }
+    const u8 = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
+    const n = op_ws_broadcast_bin(r, u8, wsConnId(false));
+    op_ws_relay_publish_bin(r, u8).catch(() => {});
+    return n;
+  },
   roomSize: (room) => op_ws_room_size(String(room)),
+  // Room-domain binary state mirror (v0.1.140): per-conn keyed entries for awareness
+  // aggregation; process-local, eventually consistent across instances.
+  roomStateSet: (room, key, data) =>
+    op_ws_room_state_set(String(room), String(key), data instanceof ArrayBuffer ? new Uint8Array(data) : data),
+  roomStateGet: (room, key) => op_ws_room_state_get(String(room), String(key)),
+  roomStateDel: (room, key) => op_ws_room_state_del(String(room), String(key)) === 1,
 };
 
 // WS connection id injected per frame (__ws_conn); strict = throw outside ws handler.

@@ -274,15 +274,23 @@ interface KVLock {
 // send 帧型由参数类型决定：string → Text 帧(0x1)；Uint8Array/ArrayBuffer → Binary 帧(0x2)。
 interface WSApi {
   send(data: string | ArrayBuffer | Uint8Array): void;
-  close(): void;
-  // 房间原语（进程内单例 hub；跨实例扇出仍走 bus.publish）：
+  // 显式关闭（v0.1.140）：无参 = 无码关闭；code 只收 1000 与 4000-4999（应用保留段，
+  // 语义 = 不可重试关闭，y-websocket 类客户端在该段停重连）；reason ≤123 字节。
+  close(code?: number, reason?: string): void;
+  // 房间原语（进程内单例 hub）：
   // join/leave 仅在 ws.ts 生命周期钩子内可用（连接身份自动取，断连自动摘除）；
   // broadcast 为 socket.io 除己语义（发送者要回声自己在 JS 里发），HTTP handler 可调
   // （无连接身份 = 不排除任何人）；roomSize 任意上下文可调。
+  // ws.rooms_cluster: true 时 broadcast 自动跨实例扇出（模块代码零改动）。
   join(room: string): void;
   leave(room: string): void;
   broadcast(room: string, data: string | ArrayBuffer | Uint8Array): number;
   roomSize(room: string): number;
+  // 房间域二进制状态镜像（v0.1.140）：awareness 聚合按连接键入 "<connId>"（多客户端
+  // 共写同一键 = LWW 互踩）；进程本地、最终一致；值帽 1 MiB。
+  roomStateSet(room: string, key: string, data: ArrayBuffer | Uint8Array): void;
+  roomStateGet(room: string, key: string): Uint8Array | null;
+  roomStateDel(room: string, key: string): boolean;
 }
 
 // sess.* ：WS 帧池会话上下文（**只在 ws.ts 生命周期钩子内存在**）。路由级无状态 Worker
@@ -294,6 +302,10 @@ interface WsSess {
   // 跨帧持久的会话状态。**必须可 JSON 序列化**：不可序列化时该帧的状态回传被丢弃
   // （Rust 侧保留旧快照），连接不中断——所以别往里塞函数 / class 实例 / Uint8Array。
   state: Record<string, Json>;
+  // 连接域二进制状态（v0.1.140）：Yjs awareness / 会话二进制放这里——不经 JSON
+  // 序列化、断连自动释放；值帽 1 MiB（大对象走 blob/kv）。
+  binSet(key: string, data: ArrayBuffer | Uint8Array): void;
+  binGet(key: string): Uint8Array | null;
 }
 
 // blob.* ：对象存储（可调用取命名实例：blob("media").put(...)；裸调用 blob.put(...) 等价 default）。
