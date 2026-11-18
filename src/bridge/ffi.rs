@@ -1142,7 +1142,12 @@ impl EventBroker for FfiEventBroker {
         fanout_targets(topic, frame)
     }
 
-    async fn subscribe(&self, topic: &str, tx: UnboundedSender<WsSend>) -> BridgeResult<()> {
+    async fn subscribe(
+        &self,
+        topic: &str,
+        group: Option<&str>,
+        tx: UnboundedSender<WsSend>,
+    ) -> BridgeResult<()> {
         // 全程持门禁：vtable.subscribe 是「本地注册 + 起消费循环」的原子单元；
         // 失败回滚刚注册的通道，避免僵尸注册导致该 topic 静默丢失。
         let _gate = SUBSCRIBE_GATE.lock().await;
@@ -1161,8 +1166,12 @@ impl EventBroker for FfiEventBroker {
         };
         if is_new_topic {
             // ABI 13 group 参：空串 = 插件缺省语义（cfg group / 匿名排他队列）；
-            // 房间集群中继的显式实例组在 REF-04 落地时传入。
-            let fut = (self.vtable.subscribe)(self.handle, RString::from(topic), RString::from(""));
+            // 显式组（bus.subscribe(topic, { group })）覆盖 group.id（kafka 臂）。
+            let fut = (self.vtable.subscribe)(
+                self.handle,
+                RString::from(topic),
+                RString::from(group.unwrap_or("")),
+            );
             if let Err(e) = await_ffi(fut).await {
                 // 回滚：仅移除本次刚注册的本通道（列表空则删整条 topic），
                 // 不误伤其他订阅者。

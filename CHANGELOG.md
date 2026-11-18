@@ -16,6 +16,32 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.139（2026-11-18，未打标签）
+
+**fix(devkit)：bus.subscribe 显式消费组 + 类型/契约修正**——下游第二轮 issue
+（DEVKIT-DRIFT / REQ-CAP-05a）快修，无 ABI 变更：
+
+- `bus.subscribe(topic, opts?)` 增可选 `{ group }`（v0.1.139）：分布式 broker 显式消费组——
+  **kafka 臂**覆盖 `group.id` 并置 `auto.offset.reset=latest`（同组跨实例分摊消费：一个事件
+  恰一个实例处理）；缺省/空串 = 插件缺省（cfg `broker.group`，offset 维持 earliest）。
+  **进程内总线与 rabbitmq 臂忽略 group**（订阅即进程本地广播 / 匿名排他队列天然广播）。
+  既有约束不变：`bus.subscribe` 仅 WS 生命周期钩子内可用，HTTP 路径报错。core trait
+  `EventBroker::subscribe` 增 `group` 形参（core 内部接口，非 ABI；进程内实现忽略）。
+- `ws.send`/`ws.broadcast` 类型声明补 `| ArrayBuffer`（global.d.ts 滞后于 runtime——
+  ArrayBuffer 自 v0.1.16 就收，bootstrap 显式转 Uint8Array 走 Binary 帧）。
+- 场景 79 增**读者并发契约**（REQ-CAP-05a）：tx2 删除谓词成文双条件
+  `seq <= 本快照.upto_seq AND created_at < now() - 宽限`（宽限 > 读者读窗口）+「永不删
+  高于自己 upto_seq 的行」；读者按 seq 升序分页、缺口/快照推进即重读快照重放
+  （applyUpdate 幂等兜重复）。三方言 env-gated 用例钉住：sqlite 常驻腿 +
+  `OJ_TEST_PG`/`OJ_TEST_MYSQL` 真库腿（宽限下行存留重建无损 / 无宽限必然出洞负对照 /
+  高于 upto_seq 恒幸存）。
+- api-manual §13 增两行：「db.tx 无隔离级别控制」（明示不支持——跨方言并发一致读用
+  方言无关契约兜底，不赌 RR）、「两阶段压实 tx2 删除边界」；场景 80（跨实例任务分摊
+  `bus.subscribe(topic,{group})`，kafka 臂分摊 vs 广播、latest/earliest 语义）；
+  SKILL 陷阱表增 group 判型一行。
+- release：npm 发布后置信轮询 8 次/~5 分钟 → 20 次/~18 分钟（v0.1.138 发布成功但传播
+  超窗，置信腿假红——GitHub Release 与 npm 四包实际全部就绪，本机 `npm i` 冒烟通过）。
+
 ## v0.1.138（2026-11-17，tag v0.1.138）
 
 **feat(kv)：KV 原子原语与租约锁（ABI 13）**——协作后端（快照压实单飞、更新日志去重、

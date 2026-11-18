@@ -2233,8 +2233,8 @@ async fn kafka_plugin_broker_shared_across_channels() {
     let topic = format!("shared.{}", std::process::id());
     let (tx1, mut rx1) = tokio::sync::mpsc::unbounded_channel();
     let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
-    broker.subscribe(&topic, tx1).await.unwrap();
-    broker.subscribe(&topic, tx2).await.unwrap(); // 同 topic 第二通道（不新起消费）
+    broker.subscribe(&topic, None, tx1).await.unwrap();
+    broker.subscribe(&topic, None, tx2).await.unwrap(); // 同 topic 第二通道（不新起消费）
     tokio::time::sleep(std::time::Duration::from_millis(500)).await; // 等消费就绪
     broker
         .publish(
@@ -2299,8 +2299,8 @@ async fn rabbitmq_plugin_broker_shared_across_channels() {
     let topic = format!("shared.{}", std::process::id());
     let (tx1, mut rx1) = tokio::sync::mpsc::unbounded_channel();
     let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
-    broker.subscribe(&topic, tx1).await.unwrap();
-    broker.subscribe(&topic, tx2).await.unwrap();
+    broker.subscribe(&topic, None, tx1).await.unwrap();
+    broker.subscribe(&topic, None, tx2).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     broker
         .publish(

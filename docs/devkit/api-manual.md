@@ -1706,7 +1706,7 @@ server.reloadConfig(force?: boolean): Promise<{
 | API | 签名 | 说明 |
 |---|---|---|
 | `bus.publish` | `publish(topic: string, data?: unknown \| Uint8Array): Promise<number>` | 广播给订阅该 topic 的**全部 WS 会话**，返回接收方数（无订阅返回 0）：JSON 数据 → Text 帧 `{"topic":…,"data":…}`；Uint8Array/ArrayBuffer → **Binary 帧原字节**（不包信封，v0.1.16 起，wire 约定见第 13 章） |
-| `bus.subscribe` | `subscribe(topic: string): Promise<void>` | 当前 WS 会话订阅 topic（**HTTP 路径调用报错**——订阅对象是连接本身） |
+| `bus.subscribe` | `subscribe(topic: string, opts?: { group?: string }): Promise<void>` | 当前 WS 会话订阅 topic（**HTTP 路径调用报错**——订阅对象是连接本身）。`opts.group`（v0.1.139）：分布式 broker 显式消费组——**kafka 臂**覆盖 `group.id` 并置 `auto.offset.reset=latest`，同组跨实例**分摊消费**（一个事件恰一个实例处理）；缺省/空串 = 插件缺省（cfg `broker.group`，offset 语义维持 earliest）。进程内总线（订阅即进程本地广播）与 rabbitmq 臂（匿名排他队列天然广播）**忽略 group**——跨实例分摊必须 kafka + 显式 group |
 | `bus.kind` | `kind(): Promise<string>` | 活跃 broker 类型：`"local"` / `"kafka"` / `"rabbitmq"`（异步 op，判等须 `await`） |
 
 方向约定：**HTTP handler 发布，WS 会话订阅**。订阅在连接断开自动清除；同一会话重复订阅
@@ -1719,6 +1719,10 @@ json.ok({ receivers: n });
 
 // WS 订阅（ws.ts 内，见第 4 章 ws.ts 小节）
 bus.subscribe("news");
+
+// 跨实例分摊（v0.1.139，kafka 臂）：N 个实例同 group 共同消费同一 topic，
+// 每个事件只被组内一个实例处理；不传 group = 插件缺省组（广播面按 cfg）。
+bus.subscribe("jobs", { group: "worker" });
 ```
 
 缺省 `broker` 为进程内总线（跨实例不互通）；`broker.kind: kafka|rabbitmq` 需对应插件。
@@ -4065,6 +4069,8 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | `http.file(i)` 对流式大文件报错（v0.1.38） | > `max_upload` 的 multipart 文件由服务端流式落 blob（字节不进 handler）——报错文案指路 `files[i].key`/`.url`；小文件行为不变 |
 | `bus` 缺省进程内，跨实例不互通 | 需要跨实例广播配 `broker.kind` |
 | `kv.cas/setNX/getSet/lock` 在内存 KV（未配 `redis.default`）下**进程本地**（v0.1.138） | 内存 KV 的原子原语与锁只在**本进程内**互斥——多实例部署下 `kv.lock` 会**各自成功**（假单飞）。需要跨实例协调（锁/单飞/序号去重）必须配 `redis.default`；用「锁是本地」的内存 KV 跑多实例压实类任务是数据损坏级错误 |
+| `db.tx` 无隔离级别控制（v0.1.139 明示） | `db.tx` 固定使用后端缺省隔离级别（MySQL REPEATABLE READ / PG READ COMMITTED / sqlite 串行），**没有** `isolation` 参数；也不要在事务回调里手写 `SET TRANSACTION`。跨方言并发一致读不要依赖 RR——用「宽限删除 + 读者按 seq 缺口检测重读快照」的方言无关契约兜底（见 scenarios 场景 79） |
+| 两阶段压实 tx2 删除边界（v0.1.139） | 压实/快照类配方的日志清理谓词必须**双条件**：`seq <= 本快照.upto_seq AND created_at < now() - 宽限`（宽限 > 读者读窗口，配方缺省 60s）——只按 seq 删会让读窗口内的读者拿到日志空洞（重建缺编辑），且**永不删高于自己快照 upto_seq 的行**。完整配方与读者并发验证见 scenarios 场景 79 |
 | bus 二进制 wire 约定（v0.1.16） | JSON → record/信封文本帧；字节 → record payload = 原始字节、投递为 Binary 帧。消费侧启发式：UTF-8 且为含 `topic`+`data` 的 JSON 对象才按文本信封，否则按二进制透传——**恰为该形状 JSON 的二进制载荷会以文本帧投递**（无害，自辨） |
 | WS 二进制状态（Yjs awareness 等）不进 `sess.state` | `sess.state` 必须可 JSON 序列化；二进制状态走 base64 字符串存 `sess.state`/kv，或分片放 kv |
 | `WhereCond.and/or` 嵌套未展开 | 多个 `where()` 即 AND；复杂条件用 `db.query` 参数化 SQL |

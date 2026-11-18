@@ -83,8 +83,16 @@ impl Bus {
 pub trait EventBroker: Send + Sync {
     /// 广播事件载荷到 topic，返回本地进程内投递成功数。
     async fn publish(&self, topic: &str, data: &BusPayload) -> BridgeResult<usize>;
-    /// 注册本地订阅通道（tx）。
-    async fn subscribe(&self, topic: &str, tx: UnboundedSender<WsSend>) -> BridgeResult<()>;
+    /// 注册本地订阅通道（tx）。`group`：分布式 broker 的显式消费组（v0.1.139；
+    /// kafka 臂 = 覆盖 group.id + `auto.offset.reset=latest`，同组跨实例分摊消费）；
+    /// `None` = 插件缺省（cfg `broker.group` / 匿名排他队列）。进程内 `Bus` 忽略
+    /// group（订阅天然进程本地广播）。
+    async fn subscribe(
+        &self,
+        topic: &str,
+        group: Option<&str>,
+        tx: UnboundedSender<WsSend>,
+    ) -> BridgeResult<()>;
     /// 同步本地扇出一帧（不经网络）。用于**非 async 上下文**——插件线程上的
     /// `HostContext.deliver`（`extern "C"`）把上送结果转给本地订阅者时调用。
     /// 返回本地投递成功数；默认 0 = 本 broker 无本地扇出面。
@@ -105,7 +113,12 @@ impl EventBroker for Bus {
     async fn publish(&self, topic: &str, data: &BusPayload) -> BridgeResult<usize> {
         Ok(Bus::publish(self, topic, data))
     }
-    async fn subscribe(&self, topic: &str, tx: UnboundedSender<WsSend>) -> BridgeResult<()> {
+    async fn subscribe(
+        &self,
+        topic: &str,
+        _group: Option<&str>,
+        tx: UnboundedSender<WsSend>,
+    ) -> BridgeResult<()> {
         Bus::subscribe(self, topic, tx);
         Ok(())
     }
@@ -146,23 +159,31 @@ pub async fn op_bus_publish_bin(
     Ok(n as u32)
 }
 
-/// bus.subscribe(topic)：仅 WS 连接（RequestInfo.bus_tx 注入）可注册；
+/// bus.subscribe(topic, opts?)：仅 WS 连接（RequestInfo.bus_tx 注入）可注册；
 /// HTTP 上下文（bus_tx None）→ JsError "bus.subscribe requires a WebSocket connection"。
+/// `opts.group`：分布式 broker 显式消费组（v0.1.139）；空串/缺省 = 插件缺省语义。
+#[derive(Default, serde::Deserialize)]
+struct BusSubscribeOpts {
+    group: Option<String>,
+}
+
 #[op2]
 pub async fn op_bus_subscribe(
     state: Rc<RefCell<OpState>>,
     #[string] topic: String,
+    #[serde] opts: Option<BusSubscribeOpts>,
 ) -> Result<(), JsErrorBox> {
     // 先取出 Arc/tx 并释放 OpState 的 RefCell 借用，避免跨 await 持有 RefCell 引用（clippy）。
-    let (bus, tx) = {
+    let (bus, tx, group) = {
         let s = state.borrow();
         let bus = s.borrow::<Arc<StableState>>().bus.clone();
         let tx = s.borrow::<ReqState>().req.bus_tx.clone();
-        (bus, tx)
+        let group = opts.and_then(|o| o.group);
+        (bus, tx, group)
     };
     match tx {
         Some(tx) => bus
-            .subscribe(&topic, tx)
+            .subscribe(&topic, group.as_deref(), tx)
             .await
             .map_err(|e| JsErrorBox::generic(e.to_string())),
         None => Err(JsErrorBox::generic(
@@ -193,7 +214,7 @@ mod tests {
         };
         let bus = crate::bridge::broker::build_broker(&None).await.unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        bus.subscribe("t", tx).await.unwrap();
+        bus.subscribe("t", None, tx).await.unwrap();
 
         let mk = |bus: &Arc<dyn EventBroker>| {
             Bridge::with_dbs_and_loader(
@@ -258,6 +279,27 @@ mod tests {
         assert_eq!(b, vec![0, 159, 255]); // 非 UTF-8 字节无损
     }
 
+    /// BDD：进程内 broker 下显式 group 订阅 —— group 是分布式 broker 语义，
+    /// 进程本地广播不区分组：两组订阅者同 topic 全收（「内存总线无分摊」语义锚，
+    /// 跨实例分摊必须配 kafka + 显式 group，见 api-manual bus 章节）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_local_broker_when_subscribe_with_group_then_group_is_noop_fanout_intact() {
+        let broker: Arc<dyn EventBroker> = Arc::new(Bus::new());
+        let (tx1, mut rx1) = tokio::sync::mpsc::unbounded_channel();
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        broker.subscribe("t", Some("g1"), tx1).await.unwrap();
+        broker.subscribe("t", Some("g2"), tx2).await.unwrap();
+        assert_eq!(
+            broker
+                .publish("t", &BusPayload::Json(json!(1)))
+                .await
+                .unwrap(),
+            2
+        );
+        assert!(rx1.try_recv().is_ok());
+        assert!(rx2.try_recv().is_ok());
+    }
+
     #[test]
     fn subscribe_dedupes_same_channel_and_cleans_closed() {
         let bus = Bus::new();
@@ -282,7 +324,7 @@ mod tests {
         let broker: Arc<dyn EventBroker> = Arc::new(Bus::new());
         assert_eq!(broker.kind(), "local");
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        broker.subscribe("e", tx).await.unwrap();
+        broker.subscribe("e", None, tx).await.unwrap();
         assert_eq!(
             broker
                 .publish("e", &BusPayload::Json(json!({"x": 1})))

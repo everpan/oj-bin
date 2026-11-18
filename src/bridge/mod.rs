@@ -2107,3 +2107,7 @@ pub async fn start_inspector(
 #[path = "mod_tests.rs"]
 #[allow(clippy::await_holding_lock)]
 mod tests;
+
+#[cfg(test)]
+#[path = "compaction_reader_tests.rs"]
+mod compaction_reader_tests;

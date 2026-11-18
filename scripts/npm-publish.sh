@@ -169,19 +169,20 @@ if [[ "${DRY_RUN:-0}" != "1" ]]; then
   for t in "${triples[@]}"; do
     read -r os cpu <<<"$(os_cpu_of "$t")"
     pkg="${SCOPE}/oj-${t}"
-    # registry 传播延迟：retry 8 次、退避至 ~5 分钟（镜像 CDN 最坏分钟级）。注意 npm view --json
-    # 在版本不存在时退出码非 0 且把 E404 错误对象打印到 stdout（非空）。必须按「退出码成功且非
+    # registry 传播延迟：retry 20 次、60s 封顶 ≈ 最长 ~18 分钟（v0.1.138 实测：发布成功
+    # 但传播超过旧 8 次/~5 分钟窗，置信腿假红）。注意 npm view --json 在版本不存在时
+    # 退出码非 0 且把 E404 错误对象打印到 stdout（非空）。必须按「退出码成功且非
     # error 对象」判定拿到真元数据——否则错误 JSON 会被当成「非空元数据」短路掉 retry，误报
     # cpu/os 断言失败。
     meta=""; tb=""
-    for attempt in 1 2 3 4 5 6 7 8; do
+    for attempt in $(seq 1 20); do
       if meta=$(npm view "${pkg}@${VERSION}" os cpu --json 2>/dev/null) && \
          [[ -n "$meta" && "$meta" != *'"error"'* ]]; then
         tb=$(npm view "${pkg}@${VERSION}" dist.tarball 2>/dev/null || true)
         break
       fi
       meta=""
-      [[ $attempt -lt 8 ]] && sleep $(( attempt * 15 > 60 ? 60 : attempt * 15 ))
+      [[ $attempt -lt 20 ]] && sleep $(( attempt * 15 > 60 ? 60 : attempt * 15 ))
     done
     if [[ -z "$meta" ]]; then
       # npm view 仍不可见（CLI 负缓存/镜像差异）：直连 registry packument 作第二意见
@@ -194,7 +195,7 @@ if [[ "${DRY_RUN:-0}" != "1" ]]; then
         tb="$(printf '%s' "$pack" | node -e 'const p=JSON.parse(require("fs").readFileSync(0,"utf8"));const v=p.versions&&p.versions[process.argv[1]];process.stdout.write((v&&v.dist&&v.dist.tarball)||"")' "$VERSION")"
         echo "note: npm view 尚未可见，已用 registry packument 兜底验证 ${pkg}@${VERSION}"
       else
-        echo "::error::${pkg}@${VERSION} 元数据获取失败（可能未发布或 registry 传播延迟）：npm view 与 packument 均不可见" >&2
+        echo "::error::${pkg}@${VERSION} 元数据获取失败（等了约 18 分钟仍不可见，registry 传播异常或发布确实失败）：npm view 与 packument 均不可见" >&2
         exit 1
       fi
     fi

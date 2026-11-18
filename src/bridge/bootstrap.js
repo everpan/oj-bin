@@ -968,7 +968,8 @@ globalThis.bus = {
     data instanceof ArrayBuffer || ArrayBuffer.isView(data)
       ? op_bus_publish_bin(String(topic), data instanceof ArrayBuffer ? new Uint8Array(data) : data)
       : op_bus_publish(String(topic), data === undefined ? null : data),
-  subscribe: (topic) => op_bus_subscribe(String(topic)),
+  subscribe: (topic, opts) =>
+    op_bus_subscribe(String(topic), opts === undefined ? null : opts),
   kind: () => op_bus_kind(),
 };
 

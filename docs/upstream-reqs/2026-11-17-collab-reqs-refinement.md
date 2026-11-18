@@ -7,7 +7,9 @@
 > 关键证据以 `file:line` 标注。下游文档行号勘误见 §三.4。
 > **评审状态**：v3 定稿 —— v2 已并入三方专家（协同编辑 / 架构师 / 分布式系统）对抗评审的
 > 全部「必须修改项」（裁决汇总见 §六）；§四的 5 个决策点已由需求方裁决（2026-11-17），
-> 详见 §四决策记录。
+> 详见 §四决策记录。**v4（2026-11-18）**：并入下游第二轮 4 条 issue（DEVKIT-DRIFT /
+> REQ-CAP-01b / 02a / 05a）——§三.1「钩子缺失」勘误作废（四钩子 v0.1.9 起已在，下游纠错
+> 属实，本稿已核实），真缺口改为升级期拒绝原语 + ws.close 应用保留码；裁决记录见 §四、§七。
 
 ---
 
@@ -301,15 +303,13 @@ oj migrate import --from <dsn> --to <dsn|named> --mapping <file> \
 
 ## 三、新增发现（下游六条未覆盖，由本轮核实带出）
 
-1. **`connection()`/`disconnect()` 生命周期钩子缺失**（B1，core 变更，无 ABI）：下游 REF-01
-   草图假设 `export default { connection(), message() }`，但上游 WS 是纯帧驱动
-   （`src/bridge/frame_pool.rs`），不存在 per-connection 入口/出口钩子。需在 frame_pool +
-   serve 的 WS accept/close 路径增加可选 `connection()` / `disconnect()` 导出：
-   - `connection()`：**accept 后、首帧派发前**调用，抛错/返回拒绝信号 → 以**保留 close
-     code（4000 段，如 4001）**关闭——普通 1000/1001 会触发 y-websocket 无限指数退避
-     重连，文档写明客户端在该 code 停 provider；
-   - `disconnect()`：离开时广播 awareness 置空（他人光标立即消失）+ 清理 roomState
-     镜像死条目。
+1. **〔v4 勘误——本条作废〕**：原判「connection()/disconnect() 钩子缺失」**有误**：四钩子
+   （connection/message/error/close）自 v0.1.9 已在（api-manual §ws.ts「契约（v0.1.9 起，
+   钩子签名不变）」），`close()` 收尾恰好一次、三来源统一（客户端断/socket 断/ws.close()），
+   即 `disconnect()` 语义已被覆盖。下游 REQ-CAP-02a 纠错属实，2026-11-18 复核确认。
+   REF-01 的生命周期依赖改走既有钩子；「离开时广播 awareness 置空 + roomState 死条目
+   清理」由模块 `close()` 钩子（oj-collab 库封装）+ core 断连路径自动清理（REF-02 原设计）
+   承担，**无 core 工作量**。真缺口见 §七 REQ-02a（升级期拒绝 + 应用保留关闭码）。
 2. **InMemoryKV 跨实例假成功悬崖**：kv 缺省内置 InMemoryKV（`oj/src/app.rs:117,134`），
    其 lock/CAS 进程本地——多实例下 `kv.lock` 各自成功（假单飞）。B1 fail-fast 联动门禁
    封死（REF-04 机制节 2）。
@@ -334,6 +334,15 @@ oj migrate import --from <dsn> --to <dsn|named> --mapping <file> \
 | 4 | `getSet` | 一并实现（已并入 ABI 13，见 §一；契约见 REF-03） |
 | 5 | redis 测试容器 | 复用本机既有 `poc-redis`（redis:8-alpine，127.0.0.1:6399），无需新起 |
 
+**v4 增补裁决（2026-11-18，第二轮 issue）**：
+
+| # | 决策点 | 裁决 |
+|---|---|---|
+| 6 | v0.1.139 快修版 | 现在做：DEVKIT-DRIFT 两项 + REQ-05a 全套 + §三.1 勘误 + release 置信窗口修因 |
+| 7 | REQ-05a 取舍 | 方案 2+1 并做（tx2 宽限谓词成文 + 永不删高于 upto_seq + 读者并发三方言用例），方案 3 明示「db.tx 无隔离级别控制」进 §13，不交付 isolation 参数 |
+| 8 | REQ-02a 形态 | `upgrade(ctx)` 顶层导出、拒绝 = HTTP 4xx（无 101/不入房间）；`ws.close(code?, reason?)` 只放行 1000 与 4000-4999，reason ≤123 字节 |
+| 9 | 4xxx 客户端行为 | 平台保证发对码 + 文档语义；y-websocket 对 4xxx/升级拒绝的重连行为由 B2 POC 矩阵出证据，若其无条件重连则客户端停止逻辑归下游 provider 包装（按发现项管理，不预先承诺） |
+
 本稿为定稿；再改上述任一裁决须在本节追加变更记录。
 
 ## 五、批次与里程碑
@@ -348,6 +357,16 @@ oj migrate import --from <dsn> --to <dsn|named> --mapping <file> \
 - **B3 迁移工具**：`oj migrate import`，随下游正式数据切换交付。
 
 每批独立评审与验收；B1 是 B2 的硬前置，B3 与 B1/B2 无耦合可并行。
+
+**v4 批次修订（2026-11-18）**：B1 拆为两刀——
+- **v0.1.139 快修**（已裁决，无 ABI）：DEVKIT-DRIFT（broadcast/send 类型补 ArrayBuffer +
+  `bus.subscribe(topic, { group })` 全链）+ REQ-05a（场景 79 读者并发契约 + §13 两行 +
+  三方言 env-gated 用例）+ §三.1 勘误落稿 + release 置信窗口修因（v0.1.138 npm 假红）；
+- **B1' 特性版**（无 ABI）：原 B1 剩余（REF-02 sess.bin/roomState、REF-04 rooms_cluster
+  fail-fast 门禁/手动 commit/boot 探针）+ REQ-02a（upgrade()/ws.close 4xxx）；
+  原 B1 的「connection()/disconnect() 钩子新增」工作量删除（§三.1 勘误）。
+- B2 增补 REQ-01b 三条验收锚（store-backed 四条 / 依赖唯一副本 / close code 矩阵 POC，
+  与 REQ-02a 的 4xxx 验收合并执行）；B3 不变。
 
 ---
 
@@ -371,3 +390,63 @@ oj-collab 独立 npm 分发与文档划界（架构师）；InMemoryKV now-在�
 **评审方法说明**：三方各自独立读稿 + 抽查源码佐证（行号均已复核）；三份评审未交叉见过
 彼此结论，冲突项以实现成本与正确性优先裁决（如两阶段压实同时满足协同的读一致与
 分布式的 gap 锁/停摆诉求）。
+
+---
+
+## 七、v4 增补：下游第二轮 4 条 issue 裁决（2026-11-18）
+
+> 下游在我方 v0.1.138 反馈回执后重整 issue（旧 6 条合并为单一权威文档），新增 4 条跟进。
+> 全部结论基于 2026-11-18 对 v0.1.138 工作树的代码复核。
+
+### DEVKIT-DRIFT　devkit 与契约/手册脱节两处 —— 两条均属实，v0.1.139 修
+
+1. **`ws.broadcast`/`ws.send` 类型滞后**：runtime 自 v0.1.16 就收 ArrayBuffer
+   （bootstrap.js send/broadcast 臂显式 `data instanceof ArrayBuffer ? new Uint8Array(data)`），
+   api-manual 已写 ArrayBuffer；`global.d.ts` 两处类型漏了。修类型即可，零运行时变更。
+2. **`bus.subscribe` group 未暴露**：ABI 13 的 group 只到 FFI 契约层；core trait
+   `EventBroker::subscribe(topic, tx)` 无 group 形参、op 只收 topic。修法：JS 面
+   `bus.subscribe(topic, opts?: { group?: string })` → op 增可选参 → core trait 增
+   `group: Option<&str>`（core 内部 trait，非 ABI）→ FFI 臂透传（oj-bus-kafka 0.1.1 的
+   consumer_cfg 已支持 group.id 覆盖 + latest）。进程内 Bus 忽略 group、rabbitmq 匿名排他
+   队列天然广播无效——均文档明示。group 三层语义与 (topic, group) 不变量不变。
+
+### REQ-CAP-02a　WS 握手期拒绝原语 + 应用保留关闭码 —— 采纳（B1'）
+
+- **勘误接受**：四钩子 v0.1.9 起已在（§三.1 重写）；`disconnect()` 语义由 `close()` 覆盖。
+- **缺口一 `upgrade(ctx)`**：落点 serve 的 WS 升级管线（AuthGuard upgrade 前 →
+  max_connections 503 → on_upgrade 三段现成），AuthGuard 后、101 响应前查模块可选顶层
+  `upgrade(ctx)` 导出并执行（ctx 含 query/header/user）；拒绝 = HTTP 4xx 直接返回——
+  无 101、不入房间、不进帧池、connection() 不触发。页面级 ACL 的「不暴露存在性」
+  只有这里能成立。实现注意：upgrade 钩子在 HTTP 池跑模块代码，与帧池池语义隔离
+  （无连接上下文、ReqState 不含 bus_tx）。
+- **缺口二 `ws.close(code?, reason?)`**：`ws_close` 布尔扩 `Option<(u16, String)>`；
+  平台只放行 **1000 与 4000-4999**（3xxx/系统保留段报错），reason ≤123 字节（RFC 6455）；
+  文档：4xxx = 不可重试关闭语义（客户端在该段停 provider——以 POC 矩阵证据为准，
+  见 §四 裁决 9）。
+
+### REQ-CAP-05a　场景 79 读者隔离 —— 三选一裁「2+1 并做，3 明示不支持」（v0.1.139 已落）
+
+- **方案 2（主兜底）**：tx2 谓词成文 `DELETE WHERE seq <= 本快照.upto_seq AND
+  created_at < now() - 宽限`（宽限缺省 60s > 读者读窗口）+「永不删高于自己 upto_seq 的行」
+  写进场景 79 注释与 §13 限制表。诚实边界：宽限只保护「读窗口 < 宽限」的读者。
+- **方案 1（并入）**：场景 79 增读者并发小节——读者按 seq 升序分页，检测跳变/快照推进
+  即重读快照重放（applyUpdate 幂等兜重复）+ env-gated 三方言用例（sqlite 常驻腿 +
+  OJ_TEST_PG/OJ_TEST_MYSQL 真库腿；用例：宽限下行存留重建无损、无宽限必然出洞负对照、
+  高于 upto_seq 恒幸存）。
+- **方案 3**：手册明示「db.tx 无隔离级别控制」（§13），不交付 isolation 参数；
+  B2 库靠方案 2 + 读者协议即可不依赖 RR，oj-collab 实测若需要再立项。
+- 附带发现（供下游知悉）：sqlx::Any 不做占位符方言翻译——PG 收 `?` 报「syntax error at
+  or near ","」（`?` 是 jsonb 操作符）；跨方言裸 SQL 一律按方言生成 `$n`/`?`。
+
+### REQ-CAP-01b　oj-collab 库验收增补 —— 三条全采纳（并入 B2 验收，无现期代码）
+
+1. **store-backed 验收锚**：与 v3 已定「无常驻 Y.Doc」一致，升格四条可验收锚——
+   ①禁常驻 doc 为唯一真源；②机会缓存必须带 store 水位校验（逐帧比对日志 seq）+ LRU +
+   单文档体积上限；③冷重建（快照+回放）延迟计入帧超时预算并给 SLO 数字；
+   ④多文档并发 heap SLO（256MiB 预算下）。下游证据（idle_linger_ms 缺省 0 = 归零即退役、
+   毒化补员替换、256MiB near-limit 终止 isolate）已复核无误。
+2. **依赖唯一副本**：库以 peerDependencies 声明 yjs + @tiptap/pm + y-prosemirror，
+   README 兼容矩阵三钉（库版本 ↔ runtime 版本 ↔ yjs 版本）+ 唯一副本约束 + CI
+   duplicate 检测建议。
+3. **close code 矩阵进 POC**：1000/1006/4000-4999 × y-websocket 重连行为实测结论写入库
+   文档；与 REQ-CAP-02a 的 4xxx 验收合并为一个 POC 装置（B2 入口执行）。

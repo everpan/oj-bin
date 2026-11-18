@@ -5103,7 +5103,11 @@ async function compactPage(pageId: string) {
     const advanced = await kv.cas(`wiki:gen:${pageId}`, gen, String(snap.seq));
     if (!advanced) return { fenced: true };
 
-    // 4) 两阶段落库：tx1 upsert 快照行；tx2 分块 DELETE 已合并日志（崩溃间隙重放幂等）。
+    // 4) 两阶段落库：tx1 upsert 快照行（upto_seq = 本轮合并到的 seq）；
+    //    tx2 分块 DELETE 已合并日志——谓词必须双条件（宽限保护读窗口内的读者）：
+    //      DELETE … WHERE seq <= ${snap.seq} AND created_at < ${Date.now() - 60_000}
+    //    且永不删 seq > snap.seq 的行；崩溃间隙重放幂等（applyUpdate 可交换）。
+    //    只按 seq 删 = 压实期间正在分页读日志的读者拿到空洞（见下方坑表）。
     await commitSnapshot(pageId, snap);
     return { committed: snap.seq };
   } finally {
@@ -5117,7 +5121,10 @@ async function compactPage(pageId: string) {
 
 验证口径：两个并发 worker 同页压实 → 恰一个 `committed`，另一个 `skipped` 或
 `fenced`；杀掉持锁 worker 不 unlock → 60s 后新锁可获取（租约自动释放）；错 token
-unlock 不误删他人锁。
+unlock 不误删他人锁；**读者并发**（v0.1.139）：压实进行中并发「读快照+分页读日志」
+的读者重建无损——读者按 seq 升序分页，发现 seq 跳变（或快照 seq 越过已读位置）即
+重读快照并从新 upto_seq 重放（applyUpdate 幂等兜重复）。三方言（sqlite/PG/MySQL）
+读者并发用例已随运行时测试钉住：宽限谓词下行存留、无宽限的删除必然出洞（负对照）。
 
 | 坑 | 解 |
 |---|---|
@@ -5125,3 +5132,42 @@ unlock 不误删他人锁。
 | 多实例下锁「各自成功」 | 内存 KV（未配 `redis.default`）的锁**进程本地**——多实例部署必须配 Redis，见 api-manual §13 限制表 |
 | 用 `get` → 判断 → `set` 手写「原子」 | check-then-act 非原子，并发下产生多个持有者；占位一律 `setNX`，条件写一律 `cas` |
 | 压实提交顺序反了（先动数据后 CAS） | kv CAS 不随 db 事务回滚——CAS 必须**先于**一切写；CAS 失败 = 本轮作废 |
+| tx2 只按 `seq <= upto_seq` 删（无宽限项，v0.1.139） | 压实进行中的读者拿到**日志空洞**——重建缺编辑，回写即固化丢失。谓词必须 `seq <= upto_seq AND created_at < now() - 宽限`（宽限 > 读者读窗口），且**永不删高于自己 upto_seq 的行**；更慢的读者靠「seq 跳变 → 重读快照重放」兜底。另见 api-manual §13「db.tx 无隔离级别控制」——跨方言读者隔离不要赌 RR |
+
+## 场景 80：跨实例任务分摊——`bus.subscribe` 显式 group（v0.1.139）
+
+> 何时抄我：多实例部署下同一 topic 的消息只想让**一个**实例处理（任务分摊/去重消费），
+> 而不是每台都收到。kafka 臂专属语义；进程内总线与 rabbitmq 臂忽略 group（各实例全收）。
+
+```yaml
+# config.yaml —— broker 必须是 kafka（group 分摊语义只在此臂生效）
+broker:
+  kind: kafka
+  bootstrap: "broker1:9092"
+  # group: "oj-bus"   # 插件缺省消费组；subscribe 显式传 group 时以传入值为准
+```
+
+```ts
+// src/notify/jobs/ws.ts —— 订阅侧
+export default {
+  connection() {
+    // 同组跨实例分摊：N 个实例同 group → 每个事件恰被组内一个实例的连接收到。
+    bus.subscribe("jobs", { group: "worker" });
+    // 不传 group（或空串）→ 插件缺省组（cfg broker.group，offset 从 earliest 回放）。
+  },
+  message() {
+    const bytes = http.bodyBytes(); // 帧（JSON 任务体或二进制）按业务自解析
+    // … 处理任务帧；处理耗时长的任务记得自建幂等键
+  },
+};
+```
+
+验证口径：两实例同 group 订阅同一 topic → 发布 10 条事件，两实例收到条数合计 = 10
+且单实例收到的事件互不重复（分摊）；改用不同 group → 每实例各收 10 条（广播）；
+HTTP 路径调用 `bus.subscribe` 报错（订阅对象是连接本身）。
+
+| 坑 | 解 |
+|---|---|
+| group 传了但「每台都收到」 | broker 不是 kafka——`await bus.kind()` 先判型；进程内/rabbitmq 臂忽略 group |
+| 想回放历史消息 | kafka 臂**显式 group 时 `auto.offset.reset=latest`**：只收订阅之后的新事件，停机窗口内事件按设计丢弃（重要消息自建对账/落库兜底）；要 earliest 回放走 cfg `broker.group`（不传 group） |
+| 以 group 之名做「发布确认」 | group 是消费侧概念，与 publish 返回值（本地接收数）无关；跨实例投递确认需业务自建回执 |

@@ -271,9 +271,9 @@ interface KVLock {
 // ======== 五、实时与消息（ws / bus） ========
 
 // ws.* ：WebSocket 生命周期钩子内的主动发送/关闭控制（HTTP 路径 no-op）。
-// send 帧型由参数类型决定：string → Text 帧(0x1)；Uint8Array → Binary 帧(0x2)。
+// send 帧型由参数类型决定：string → Text 帧(0x1)；Uint8Array/ArrayBuffer → Binary 帧(0x2)。
 interface WSApi {
-  send(data: string | Uint8Array): void;
+  send(data: string | ArrayBuffer | Uint8Array): void;
   close(): void;
   // 房间原语（进程内单例 hub；跨实例扇出仍走 bus.publish）：
   // join/leave 仅在 ws.ts 生命周期钩子内可用（连接身份自动取，断连自动摘除）；
@@ -281,7 +281,7 @@ interface WSApi {
   // （无连接身份 = 不排除任何人）；roomSize 任意上下文可调。
   join(room: string): void;
   leave(room: string): void;
-  broadcast(room: string, data: string): number;
+  broadcast(room: string, data: string | ArrayBuffer | Uint8Array): number;
   roomSize(room: string): number;
 }
 
@@ -362,7 +362,10 @@ interface FsDirEntry {
 interface BusApi {
   // data 为 Uint8Array/ArrayBuffer → Binary 帧原字节（不包信封）；其余 → JSON 信封 Text 帧。
   publish(topic: string, data?: unknown): Promise<number>;
-  subscribe(topic: string): Promise<void>;
+  // opts.group：分布式 broker（kafka 臂）显式消费组——同组跨实例分摊消费（一个事件恰一
+  // 实例处理），缺省 = cfg broker.group，空串视同缺省；进程内 bus 与 rabbitmq（匿名排他
+  // 队列天然广播）忽略。仅 WS 生命周期钩子内可调。
+  subscribe(topic: string, opts?: { group?: string }): Promise<void>;
   kind(): Promise<string>;
 }
 

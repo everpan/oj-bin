@@ -1037,7 +1037,7 @@ use crate::config::BrokerCfg;
 
 static BUS_CONNECTED_CFG: Mutex<String> = Mutex::new(String::new());
 static BUS_PUBLISHED: Mutex<(u64, String, Vec<u8>)> = Mutex::new((0, String::new(), Vec::new()));
-static BUS_SUBSCRIBES: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
+static BUS_SUBSCRIBES: Mutex<Vec<(u64, String, String)>> = Mutex::new(Vec::new());
 static BUS_CLOSED: AtomicU64 = AtomicU64::new(0);
 /// TDD 开关：置位时 mock_bus_subscribe 先记录（模拟消费循环已起）再返回 Err，
 /// 用于验证 I-1 失败回滚（无僵尸注册）。
@@ -1063,12 +1063,12 @@ extern "C" fn mock_bus_publish(handle: u64, topic: RString, data: RBytes) -> Ffi
     }
     ready(Ok(b"".to_vec()))
 }
-extern "C" fn mock_bus_subscribe(handle: u64, topic: RString, _group: RString) -> FfiFuture {
-    // 先记录（模拟插件侧已起消费循环），再按开关返回失败。group（ABI 13）不参与断言。
+extern "C" fn mock_bus_subscribe(handle: u64, topic: RString, group: RString) -> FfiFuture {
+    // 先记录（模拟插件侧已起消费循环），再按开关返回失败。group（ABI 13）入断言。
     BUS_SUBSCRIBES
         .lock()
         .unwrap()
-        .push((handle, topic[..].to_string()));
+        .push((handle, topic[..].to_string(), group[..].to_string()));
     if BUS_SUBSCRIBE_FAIL.swap(false, AtomicOrdering::SeqCst) {
         return ready(Err("injected subscribe failure".into()));
     }
@@ -1157,7 +1157,7 @@ async fn bus_subscribe_registers_tx_and_deliver_fans_out() {
     BUS_SUBSCRIBES.lock().unwrap().clear();
     let broker = FfiEventBroker::new("kafka", 42, mock_bus_vtable());
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    broker.subscribe("t", tx).await.unwrap();
+    broker.subscribe("t", None, tx).await.unwrap();
     // vtable.subscribe 只起一次（每 topic 至多一个消费循环）。
     assert_eq!(BUS_SUBSCRIBES.lock().unwrap().len(), 1);
     // 模拟插件消费循环经 host.deliver 上送 → 扇出到本地 tx。
@@ -1183,7 +1183,7 @@ async fn bus_deliver_non_utf8_payload_arrives_as_binary_frame() {
     deliver_clear();
     let broker = FfiEventBroker::new("kafka", 42, mock_bus_vtable());
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    broker.subscribe("t", tx).await.unwrap();
+    broker.subscribe("t", None, tx).await.unwrap();
     let raw = vec![0x00, 0xA9, 0xFF, 0xFE]; // 非法 UTF-8
     host_deliver(RString::from("t"), to_rbytes(&raw));
     assert_eq!(rx.try_recv().unwrap(), WsSend::Binary(raw));
@@ -1196,11 +1196,28 @@ async fn bus_subscribe_dedupes_same_channel_and_single_consumer_per_topic() {
     BUS_SUBSCRIBES.lock().unwrap().clear();
     let broker = FfiEventBroker::new("kafka", 42, mock_bus_vtable());
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    broker.subscribe("t", tx.clone()).await.unwrap();
-    broker.subscribe("t", tx).await.unwrap(); // 同 channel 去重
+    broker.subscribe("t", None, tx.clone()).await.unwrap();
+    broker.subscribe("t", None, tx).await.unwrap(); // 同 channel 去重
     let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
-    broker.subscribe("u", tx2).await.unwrap(); // 不同 topic → 新消费
+    broker.subscribe("u", None, tx2).await.unwrap(); // 不同 topic → 新消费
     assert_eq!(BUS_SUBSCRIBES.lock().unwrap().len(), 2); // t 一次 + u 一次
+}
+
+/// BDD（DEVKIT-DRIFT-2）：显式 group 经 FFI 契约原样转发到插件（kafka 臂 = group.id
+/// 覆盖）；缺省转发空串 = 插件缺省语义（cfg group / 匿名排他队列）。
+#[tokio::test(flavor = "multi_thread")]
+async fn bus_subscribe_explicit_group_forwards_to_vtable_default_is_empty() {
+    let _g = T_LOCK.lock().unwrap();
+    deliver_clear();
+    BUS_SUBSCRIBES.lock().unwrap().clear();
+    let broker = FfiEventBroker::new("kafka", 42, mock_bus_vtable());
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    broker.subscribe("t", Some("inst-1"), tx).await.unwrap();
+    let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
+    broker.subscribe("u", None, tx2).await.unwrap();
+    let subs = BUS_SUBSCRIBES.lock().unwrap().clone();
+    assert_eq!(subs[0], (42, "t".to_string(), "inst-1".to_string()));
+    assert_eq!(subs[1].2, ""); // 缺省 = 空串 = 插件缺省语义
 }
 
 /// I-1 TDD：首次订阅 vtable 失败 → 返回 Err 且无僵尸注册（host_deliver 后通道空）。
@@ -1213,7 +1230,7 @@ async fn bus_subscribe_failure_rolls_back_no_zombie() {
     let broker = FfiEventBroker::new("kafka", 42, mock_bus_vtable());
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     BUS_SUBSCRIBE_FAIL.store(true, AtomicOrdering::SeqCst); // 注入失败
-    let res = broker.subscribe("t", tx).await;
+    let res = broker.subscribe("t", None, tx).await;
     assert!(res.is_err(), "subscribe must propagate vtable error");
     // 无僵尸：回滚后该 topic 不应仍注册，host_deliver 不应扇出到通道。
     host_deliver(RString::from("t"), to_rbytes(br#"{"x":1}"#));
@@ -1240,10 +1257,10 @@ async fn bus_subscribe_retries_after_failure_and_fanout() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     // 首次失败（回滚本地注册，但插件侧消费循环已起 → 记一次）。
     BUS_SUBSCRIBE_FAIL.store(true, AtomicOrdering::SeqCst);
-    assert!(broker.subscribe("t", tx.clone()).await.is_err());
+    assert!(broker.subscribe("t", None, tx.clone()).await.is_err());
     // 重试成功。
     BUS_SUBSCRIBE_FAIL.store(false, AtomicOrdering::SeqCst);
-    assert!(broker.subscribe("t", tx).await.is_ok());
+    assert!(broker.subscribe("t", None, tx).await.is_ok());
     // 消费循环被重新起：两次 subscribe 各记一次。
     assert_eq!(BUS_SUBSCRIBES.lock().unwrap().len(), 2);
     // 扇出可达：host.deliver 经 DELIVER_TARGETS 扇到本通道。
@@ -1272,7 +1289,7 @@ async fn ffi_broker_shared_across_bridges() {
     let broker = Arc::new(FfiEventBroker::new("kafka", 42, mock_bus_vtable()));
     // A 侧订阅（如 WS 连接 A）。
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    broker.subscribe("t", tx).await.unwrap();
+    broker.subscribe("t", None, tx).await.unwrap();
     // B 侧发布（同一实例）→ vtable.publish 转发（记录）。
     broker
         .publish("t", &BusPayload::Json(serde_json::json!({"v": 7})))
