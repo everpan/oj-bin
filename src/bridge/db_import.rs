@@ -1275,6 +1275,10 @@ pub async fn op_db_import(
             ));
         }
     };
+    // 门控：未知方言（如即将到来的 "jdbc" 插件）一律结构化 unsupported——run_import
+    // 内部裸调 da.dialect()，未知方言下它在 detached 任务里 panic 会卡死任务（甚至
+    // 经 V8 不可 unwinding 回调直接 abort 进程），必须先于一切方言分支拦住。
+    let _dialect = super::db::require_known_dialect(da.dialect_info(), "import")?;
     let (section, registry, import_registry) = {
         let g = state.borrow();
         let asm = g

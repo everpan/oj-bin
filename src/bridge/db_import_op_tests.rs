@@ -192,3 +192,92 @@ async fn import_blob_and_rows_mutex_and_bad_format() {
     assert_eq!(d["code"], json!("OJ_DB_UNSUPPORTED"), "{d}");
     assert_eq!(d["format"], json!("xlsx"), "{d}");
 }
+
+/// 方言为 "jdbc" 的 fake accessor（即将到来的泛型 JDBC 插件形态）：
+/// dialect_info 报未知名，dialect() 计数——未知方言下它是 panic 路径（FfiDataAccessor
+/// 对 unknown 方言 panic），绝不允许被宿主代码触到。
+struct JdbcLikeAccessor {
+    inner: Arc<InMemoryAccessor>,
+    info: crate::bridge::dialect_caps::DialectInfo,
+    dialect_calls: std::sync::atomic::AtomicUsize,
+}
+
+impl JdbcLikeAccessor {
+    fn new() -> Self {
+        use crate::bridge::dialect_caps::{DialectCaps, IdStrategy, PlaceholderStyle};
+        Self {
+            inner: Arc::new(InMemoryAccessor::new()),
+            info: crate::bridge::dialect_caps::DialectInfo {
+                name: "jdbc".to_string(),
+                caps: DialectCaps {
+                    placeholder: PlaceholderStyle::Q,
+                    id: IdStrategy::None,
+                    stream: true,
+                    cancel: false,
+                },
+            },
+            dialect_calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::bridge::db::DataAccessor for JdbcLikeAccessor {
+    fn dialect(&self) -> crate::bridge::db::Dialect {
+        self.dialect_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // 模拟 FfiDataAccessor::dialect() 对未知方言的 fail-loud panic。
+        panic!("dialect() called on unknown dialect 'jdbc'");
+    }
+    fn dialect_info(&self) -> &crate::bridge::dialect_caps::DialectInfo {
+        &self.info
+    }
+    async fn query_with_params(
+        &self,
+        sql: &str,
+        params: &[serde_json::Value],
+    ) -> crate::bridge::BridgeResult<Vec<crate::bridge::db::Row>> {
+        self.inner.query_with_params(sql, params).await
+    }
+    async fn exec_with_params(
+        &self,
+        sql: &str,
+        params: &[serde_json::Value],
+    ) -> crate::bridge::BridgeResult<i64> {
+        self.inner.exec_with_params(sql, params).await
+    }
+}
+
+/// 未知方言（如 "jdbc"）调 db.import → 结构化 OJ_DB_UNSUPPORTED（capability=import），
+/// 且 da.dialect() 零调用（防回归：无门控时它在 detached 任务里 panic 卡死任务）。
+#[tokio::test(flavor = "current_thread")]
+async fn import_unknown_dialect_gated_without_dialect_call() {
+    let jdbc = Arc::new(JdbcLikeAccessor::new());
+    let acc: Arc<dyn crate::bridge::db::DataAccessor> = jdbc.clone();
+    let b = Bridge::with_dbs_and_loader(
+        HashMap::from([("default".to_string(), acc)]),
+        Arc::new(InMemoryKV::new()),
+        scoped_registry(),
+        false,
+        None,
+        Extras {
+            import_section: Some(Arc::new(Default::default())),
+            db_access: Some(Arc::new(Default::default())),
+            sql_guard: SqlGuard::Off,
+            ..Default::default()
+        },
+    );
+    let d = import_err(
+        &b,
+        r#"{ table: "orders", format: "jsonl", columns: ["id", "tenant_id", "name"], rows: [{ id: 1, tenant_id: "t", name: "a" }] }"#,
+    )
+    .await;
+    assert_eq!(d["code"], json!("OJ_DB_UNSUPPORTED"), "{d}");
+    assert_eq!(d["capability"], json!("import"), "{d}");
+    assert!(d["msg"].as_str().unwrap().contains("not supported"), "{d}");
+    assert_eq!(
+        jdbc.dialect_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "dialect() must not be called"
+    );
+}
