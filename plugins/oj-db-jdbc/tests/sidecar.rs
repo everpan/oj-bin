@@ -70,6 +70,10 @@ fn scenarios() -> Vec<Scenario> {
         ),
         ("hang_hello_bounded_wait", || b(hang_hello_bounded_wait())),
         ("clean_eof_exit", || b(clean_eof_exit())),
+        (
+            "crash_concurrent_restart_exactly_one_death_per_boom",
+            || b(crash_concurrent_restart_exactly_one_death_per_boom()),
+        ),
         ("java_missing_error_lists_search_order", || {
             b(java_missing_error_lists_search_order())
         }),
@@ -192,6 +196,79 @@ async fn crash_inflight_err_stale_handle_reconnect_reqid_continues() -> Result<(
         ),
     )?;
     m.shutdown().await.map_err(|e| format!("shutdown: {e}"))
+}
+
+/// 评审轮 1 Important 钉红用例：判死与重启的竞态。
+///
+/// 时序（旧实现必现）：boom 杀 JVM1 → writer 的 EPIPE 判死与 reader 的 EOF 判死是
+/// 两次独立 declare_dead；两者之间，在途 echo 请求持锁 spawn JVM2（毫秒级）→ 第二次
+/// 判死不认世代，把健康 JVM2 也 take/kill（世代多跳、echo 被假性 drain）。
+/// 不变量（修复后确定成立）：每轮恰好 +1 世代；窗口关闭后探针必须成功。
+async fn crash_concurrent_restart_exactly_one_death_per_boom() -> Result<(), String> {
+    use std::sync::Arc;
+    let m = Arc::new(mgr("crash")); // 收到 {"boom":true} 的请求即 exit(1)
+    let g0 = m.generation();
+    let warm: Value = m
+        .request("query", json!({"sql":"warm"}))
+        .await
+        .map_err(|e| format!("warm: {e}"))?;
+    assert2(warm["req_id"] == json!(1), "warm req_id")?;
+    const ROUNDS: u64 = 5;
+    for round in 1..=ROUNDS {
+        // 1 个 boom + 8 个 echo 同时发出。echo 各带 32KB 载荷（合计 ~256KB > 64KB
+        // 管道缓冲）：writer 注定阻塞在写中途 → JVM1 死于 boom 时 writer 吃 EPIPE 判死 +
+        // reader EOF 判死 = 两次独立 declare_dead 竞争 inner 锁；echo 队列随后 spawn JVM2。
+        // 旧实现（判死不认世代、无条件 bump/drain）：两次判死各 +1 → 每轮 +2，且第二个
+        // declare_dead 会 take/kill 健康的 JVM2、假性 drain echo。本用例钉住不变量。
+        let big = "x".repeat(32 * 1024);
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..9u8 {
+            let m = m.clone();
+            let big = big.clone();
+            set.spawn(async move {
+                if i == 0 {
+                    m.request("query", json!({"boom":true})).await
+                } else {
+                    m.request("query", json!({"sql":big})).await
+                }
+            });
+        }
+        let (mut oks, mut lost) = (0usize, 0usize);
+        while let Some(r) = set.join_next().await {
+            match r.map_err(|e| format!("join: {e}"))? {
+                Ok(_) => oks += 1,
+                Err(e) => {
+                    // 合法失败只有一种：帧确实发给了死掉的 JVM1，被 drain。
+                    assert2(
+                        e.contains("sidecar lost"),
+                        &format!("round {round}: 只允许 sidecar lost, 实际 {e}"),
+                    )?;
+                    lost += 1;
+                }
+            }
+        }
+        println!("[round {round}: {oks} ok / {lost} lost]");
+        // 不变量 1：每轮恰好一次死亡（stale 判死杀健康 JVM2 → 每轮 +2）。
+        assert2(
+            m.generation() == g0 + round,
+            &format!(
+                "round {round}: generation {} != {}（stale 判死多跳 / 健康 JVM 被误杀）",
+                m.generation(),
+                g0 + round
+            ),
+        )?;
+        // 不变量 2：窗口关闭后探针必须成功（健康 JVM 在位，请求不被误丢）。
+        let probe: Value = tokio::time::timeout(BOUND, m.request("query", json!({"sql":"probe"})))
+            .await
+            .map_err(|_| format!("round {round}: probe deadline"))?
+            .map_err(|e| format!("round {round} probe: {e}"))?;
+        assert2(
+            probe["req_id"].as_u64().unwrap_or(0) > 1,
+            "probe req_id 应继续累加",
+        )?;
+    }
+    let _ = m.shutdown().await;
+    Ok(())
 }
 
 async fn hang_hello_bounded_wait() -> Result<(), String> {

@@ -9,7 +9,8 @@
 //! - 三路管道：stdin 写任务（unbounded mpsc 消费，非阻塞投递）；stdout 读任务
 //!   （FrameReader 解帧 → pending oneshot 分派，receiver 已 drop 的 send 失败静默）；
 //!   stderr **常驻 drain 任务**（逐行进尾部环形缓冲 ~20 行供 connect 失败诊断 + 上送宿主 log）。
-//! - 64MiB TooLong / 非 UTF8 / 协议 JSON 坏 / IO 错 / EOF → sidecar 判死：在途 pending
+//! - 64MiB TooLong / 非 UTF8 / 协议 JSON 坏 / IO 错 / EOF → sidecar 判死（**世代闸**：
+//!   只认发起判死的那代 JVM，迟到的旧判死不误杀健康新 JVM、不重复跳世代）：在途 pending
 //!   全部投递 Err（"sidecar lost" + session_disposition=reconnect），handle 世代 +1
 //!   （旧世代句柄经 [`SidecarMgr::check_generation`] 立即报 reconnect，绝不隐式落到新 JVM），
 //!   下一次 request 触发重启。
@@ -102,24 +103,38 @@ impl SidecarCfg {
     }
 }
 
-/// 存活中的 sidecar（writer 通道 + child 所有权）。
+/// 存活中的 sidecar（writer 通道 + child 所有权 + spawn 世代）。
 struct Running {
     /// stdin 写任务入口。drop（判死/关闭）→ 写任务收 None → stdin drop = EOF（§5.1 契约）。
     tx: mpsc::UnboundedSender<String>,
     child: Child,
+    /// spawn 世代：判死只认发起它的那代 JVM——重启后迟到的旧判死不得杀健康新 JVM。
+    epoch: u64,
+}
+
+/// 在途请求条目。
+struct PendingEntry {
+    /// 帧实际投递的目标世代（`Some(epoch)`）；`None` = 已入表未投递（insert 与 send
+    /// 之间的窗口）。判死 drain 只清 `Some(自己的 epoch)` 条目。
+    epoch: Option<u64>,
+    tx: oneshot::Sender<Result<Value, String>>,
 }
 
 struct Shared {
     cfg: SidecarCfg,
     /// None = 未 spawn 或已判死（下一次 request 触发重启）。
     inner: AsyncMutex<Option<Running>>,
-    /// req_id → 在途请求的 oneshot 回送端。std Mutex：临界区只做 map 操作，不跨 await。
-    pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>,
+    /// req_id → 在途请求。std Mutex：临界区只做 map 操作，不跨 await。
+    /// 已知限制（挂账）：JVM 永不响应且调用方被宿主 KillSwitch 取消时，条目留存至
+    /// 下次判死 drain（与 mysql 插件在途请求同语义，非泄漏增长——map 随 drain 清空）。
+    pending: Mutex<HashMap<u64, PendingEntry>>,
     stderr_tail: Mutex<VecDeque<String>>,
     /// 优雅关闭标志：判死路径跳过（EOF 是预期退出，不是协议死）。
     closing: AtomicBool,
     /// handle 世代（spec §5.1）：判死 +1。旧世代句柄经 check_generation 立即报 reconnect。
     generation: AtomicU64,
+    /// spawn 世代分配：每次 spawn 唯一且单调，重启不复用（判死比对依据）。
+    next_epoch: AtomicU64,
     /// req_id 全局单调分配（spec §5.1：**sidecar 重启绝不归零**；Java 只回显不分配）。
     next_req: AtomicU64,
 }
@@ -152,6 +167,7 @@ impl SidecarMgr {
                 stderr_tail: Mutex::new(VecDeque::new()),
                 closing: AtomicBool::new(false),
                 generation: AtomicU64::new(0),
+                next_epoch: AtomicU64::new(0),
                 next_req: AtomicU64::new(0),
             }),
         }
@@ -169,7 +185,13 @@ impl SidecarMgr {
             .ok_or_else(|| format!("sidecar request {op}: payload must be a JSON object"))?;
         let (tx, rx) = oneshot::channel();
         let id = self.shared.next_req.fetch_add(1, Ordering::SeqCst) + 1;
-        self.shared.pending.lock().unwrap().insert(id, tx);
+        // 先入表（epoch=None = 未投递）；send 与 epoch 落记都在 inner 锁内完成——
+        // 判死的 take/drain 也经同一把锁，二者互斥，杜绝「响应到达时条目不在表」。
+        self.shared
+            .pending
+            .lock()
+            .unwrap()
+            .insert(id, PendingEntry { epoch: None, tx });
         let line = codec::encode_request(id, op, &params);
         // 惰性 spawn / 重启都在锁内做：并发首请求不会双重 spawn；hello 等待期间
         // 其它请求排队（它们本来也要等这条 sidecar 就绪）。
@@ -181,7 +203,15 @@ impl SidecarMgr {
                 self.shared.pending.lock().unwrap().remove(&id);
                 return Err(e);
             }
-            g.as_ref().expect("spawn ok ⇒ Some").tx.send(line)
+            let st = g.as_ref().expect("spawn ok ⇒ Some");
+            let r = st.tx.send(line);
+            if r.is_ok() {
+                // 投递成功：记录目标世代（持 inner 锁写 pending，与判死 drain 互斥）。
+                if let Some(p) = self.shared.pending.lock().unwrap().get_mut(&id) {
+                    p.epoch = Some(st.epoch);
+                }
+            }
+            r
         };
         if sent.is_err() {
             // 与判死竞态（writer 已随 state take 退出）：按 sidecar lost 处理。
@@ -224,6 +254,8 @@ impl SidecarMgr {
     /// 优雅关闭：关 stdin 写通道 → 写任务退出、stdin EOF → JVM 有序关闭全部 Connection
     /// 并退出（spec §5.1 EOF 契约）→ 等待 child 退出并报告状态。幂等。
     /// 等待有界：JVM 拒绝退出时升级 kill（进程杀不掉也不挂调用方）。
+    /// 刻意不 drain pending、不 bump 世代：生产路径 SidecarMgr 是 OnceLock 静态、永不
+    /// shutdown（进程退出即回收）；本方法仅测试/拆卸用，此时在途请求应为零。
     pub async fn shutdown(&self) -> Result<(), String> {
         self.shared.closing.store(true, Ordering::SeqCst);
         // tx 随 Running take 而 drop：writer recv None → stdin drop = EOF。
@@ -253,6 +285,8 @@ impl SidecarMgr {
         let cfg = &self.shared.cfg;
         // shutdown 后再 request（测试/非常规路径）：重置 closing，死亡路径恢复生效。
         self.shared.closing.store(false, Ordering::SeqCst);
+        // spawn 世代：单调不复用——判死比对依据（重启后迟到的旧判死不得误伤新 JVM）。
+        let epoch = self.shared.next_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         let java = resolve_java(cfg)?;
         let sep = if cfg!(windows) { ";" } else { ":" };
         // classpath 升级路径（jar 极多逼近 Windows ~32KB 命令行上限）：Java 9+ @argfile，v1 不做。
@@ -313,23 +347,27 @@ impl SidecarMgr {
         // hello 通过：起 stdin 写任务 + stdout 读任务，放行请求。
         let stdin = child.stdin.take().expect("piped stdin");
         let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(writer_loop(rx, stdin, self.shared.clone()));
-        tokio::spawn(reader_loop(lines, self.shared.clone()));
-        **g = Some(Running { tx, child });
+        tokio::spawn(writer_loop(rx, stdin, self.shared.clone(), epoch));
+        tokio::spawn(reader_loop(lines, self.shared.clone(), epoch));
+        **g = Some(Running { tx, child, epoch });
         Ok(())
     }
 }
 
-/// 判死（spec §5.1）：世代 +1；child 收割（reap，防僵尸）；在途 pending 全部投递
-/// sidecar-lost 信封（receiver 已 drop 的 send 失败静默——宿主 KillSwitch 丢弃
-/// JS runtime 时 await_ffi 被 drop 是正常路径）。幂等：第二次调用 state 已 None。
-async fn declare_dead(shared: &Arc<Shared>, why: &str) {
+/// 判死（spec §5.1）——**世代闸**：只有「发起本判死的那代 JVM」仍占据 inner 时才动手；
+/// state 已换代（重启完成）或已 None（同代另一管道先判死）→ 直接返回，不 bump、不
+/// drain（一次物理死亡只 +1 世代，且绝不误杀健康新 JVM）。竞态背景：writer 的 EPIPE
+/// 判死与 reader 的 EOF 判死是两次独立调用，其间在途请求可能已完成 JVM2 的 spawn+hello。
+async fn declare_dead(shared: &Arc<Shared>, why: &str, epoch: u64) {
     if shared.closing.load(Ordering::SeqCst) {
         return; // 优雅关闭中的 EOF 是预期退出
     }
-    shared.generation.fetch_add(1, Ordering::SeqCst);
     let child = {
         let mut g = shared.inner.lock().await;
+        if !matches!(g.as_ref(), Some(r) if r.epoch == epoch) {
+            return; // 世代不匹配：迟到的旧判死，或同代重复判死（幂等）
+        }
+        shared.generation.fetch_add(1, Ordering::SeqCst); // bump 纳入世代闸保护
         g.take().map(|r| r.child)
     };
     if let Some(mut c) = child {
@@ -339,9 +377,17 @@ async fn declare_dead(shared: &Arc<Shared>, why: &str) {
         });
     }
     // tx 随 Running take 而 drop → writer 收 None 退出 → stdin EOF（契约顺序的一部分）。
+    // 只清发给本代 JVM 的条目（epoch=None 未投递 / 其它 epoch 发给了新 JVM，均不动）。
     let mut pending = shared.pending.lock().unwrap();
-    for (_, tx) in pending.drain() {
-        let _ = tx.send(Err(lost_err(why))); // receiver 已 drop：静默丢弃
+    let dead_ids: Vec<u64> = pending
+        .iter()
+        .filter(|(_, p)| p.epoch == Some(epoch))
+        .map(|(id, _)| *id)
+        .collect();
+    for id in dead_ids {
+        if let Some(p) = pending.remove(&id) {
+            let _ = p.tx.send(Err(lost_err(why))); // receiver 已 drop：静默丢弃
+        }
     }
 }
 
@@ -354,31 +400,36 @@ fn frame_reason(fe: &FrameError) -> String {
     }
 }
 
-/// stdout 读任务：解帧 → 分派 pending；任何异常（IO/EOF/帧错）= sidecar 判死。
-async fn reader_loop(mut lines: tokio::io::BufReader<ChildStdout>, shared: Arc<Shared>) {
+/// stdout 读任务：解帧 → 分派 pending；任何异常（IO/EOF/帧错）= sidecar 判死
+/// （携带本代 epoch：世代闸只认发起判死的那代 JVM）。
+async fn reader_loop(
+    mut lines: tokio::io::BufReader<ChildStdout>,
+    shared: Arc<Shared>,
+    epoch: u64,
+) {
     let mut fr = FrameReader::new();
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         match lines.read(&mut buf).await {
             Err(e) => {
-                declare_dead(&shared, &format!("stdout read error: {e}")).await;
+                declare_dead(&shared, &format!("stdout read error: {e}"), epoch).await;
                 return;
             }
             Ok(0) => {
                 // EOF = 进程退出（崩溃或被杀），与协议死同路径判死。
-                declare_dead(&shared, "stdout EOF (sidecar process exited)").await;
+                declare_dead(&shared, "stdout EOF (sidecar process exited)", epoch).await;
                 return;
             }
             Ok(n) => match fr.push(&buf[..n]) {
                 Err(fe) => {
                     let why = frame_reason(&fe);
-                    declare_dead(&shared, &why).await;
+                    declare_dead(&shared, &why, epoch).await;
                     return;
                 }
                 Ok(chunk_lines) => {
                     for line in chunk_lines {
                         if let Err(why) = dispatch(&line, &shared) {
-                            declare_dead(&shared, &why).await;
+                            declare_dead(&shared, &why, epoch).await;
                             return;
                         }
                     }
@@ -419,21 +470,23 @@ fn dispatch(line: &str, shared: &Shared) -> Result<(), String> {
             )
         }
     };
-    if let Some(tx) = shared.pending.lock().unwrap().remove(&id) {
-        let _ = tx.send(result); // receiver 已 drop（宿主 KillSwitch）：静默丢弃
+    if let Some(p) = shared.pending.lock().unwrap().remove(&id) {
+        let _ = p.tx.send(result); // receiver 已 drop（宿主 KillSwitch）：静默丢弃
     }
     Ok(())
 }
 
-/// stdin 写任务：消费 unbounded 通道（非阻塞投递方是 request）；写失败 = sidecar 已死。
+/// stdin 写任务：消费 unbounded 通道（非阻塞投递方是 request）；写失败 = sidecar 已死
+/// （携带本代 epoch：世代闸只认发起判死的那代 JVM）。
 async fn writer_loop(
     mut rx: mpsc::UnboundedReceiver<String>,
     mut stdin: ChildStdin,
     shared: Arc<Shared>,
+    epoch: u64,
 ) {
     while let Some(line) = rx.recv().await {
         if stdin.write_all(line.as_bytes()).await.is_err() || stdin.flush().await.is_err() {
-            declare_dead(&shared, "stdin write failed (sidecar process gone)").await;
+            declare_dead(&shared, "stdin write failed (sidecar process gone)", epoch).await;
             return;
         }
     }
