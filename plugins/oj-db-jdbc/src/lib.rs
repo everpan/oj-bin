@@ -4,7 +4,9 @@
 //! T7：crate 骨架 + DSN 解析（`dsn`）；vtable 其余槽位 `ready_err("not implemented")`
 //! 占位（T10 sidecar 编排 / T11 类型映射时填充）。
 
+pub mod codec;
 pub mod dsn;
+pub mod errmap;
 
 use oj_plugin_ffi::{
     ABI_VERSION, DataAccessorVtable, FfiFuture, HostContext, PluginDescriptor, RArc, RResult,
@@ -138,3 +140,11 @@ oj_plugin_ffi::oj_plugin_entry!(init, config: "oj-db-jdbc", db => &DB_VTABLE);
 #[cfg(test)]
 #[path = "dsn_tests.rs"]
 mod dsn_tests;
+
+#[cfg(test)]
+#[path = "codec_tests.rs"]
+mod codec_tests;
+
+#[cfg(test)]
+#[path = "errmap_tests.rs"]
+mod errmap_tests;
