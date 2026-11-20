@@ -30,11 +30,14 @@ pub fn classify(sql_state: Option<&str>, _error_code: Option<i32>) -> Classified
 /// 换成 `***`，host/库名保留——排障要知道连的是哪个库，但日志/HTTP 响应里不该有密码。
 /// 非 URL 形态原样返回（裸密码无法可靠识别，不误伤普通文本）。
 pub fn redact(msg: &str) -> String {
-    let bytes = msg.as_bytes();
-    let mut i = 0;
-    while let Some(rel) = msg[i..].find("://") {
-        let start = i + rel + 3;
-        let mut j = start;
+    // 全程扫描不提前返回：同一行可能回显多个连接串（如「主库 X 失败回退 Y」），
+    // 只脱第一个会让第二个的凭据原样泄漏。
+    let mut out = String::with_capacity(msg.len());
+    let mut rest = msg;
+    while let Some(rel) = rest.find("://") {
+        let seg = rel + 3;
+        let bytes = rest.as_bytes();
+        let mut j = seg;
         // 凭据段：@ 之前不得出现 / 或空白（出现 = 已是路径，不是凭据）。
         let at = loop {
             match bytes.get(j) {
@@ -46,9 +49,14 @@ pub fn redact(msg: &str) -> String {
             }
         };
         if let Some(at) = at {
-            return format!("{}://***@{}", &msg[..start - 3], &msg[at + 1..]);
+            out.push_str(&rest[..rel]);
+            out.push_str("://***@");
+            rest = &rest[at + 1..];
+        } else {
+            out.push_str(&rest[..seg]);
+            rest = &rest[seg..];
         }
-        i = start;
     }
-    msg.to_string()
+    out.push_str(rest);
+    out
 }

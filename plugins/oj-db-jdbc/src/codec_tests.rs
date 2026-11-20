@@ -180,3 +180,14 @@ fn encode_request_roundtrip() {
     // 请求帧无 ok/err 键——parse_response 拒收，协议方向不自混。
     assert!(parse_response(&frames[0]).is_err());
 }
+
+/// 非 JSON 长行含多字节码点：bad() 截断按 char 切，不得在码点中间 panic
+/// （sidecar 是不可信输入源，不 panic 是红线）。
+#[test]
+fn malformed_multibyte_line_no_panic() {
+    let line = format!("{}🀄", "中文".repeat(40)); // >64 字节，多字节码点
+    match parse_response(&line) {
+        Err(FrameError::Json(m)) => assert!(m.contains("中文"), "snippet kept"),
+        other => panic!("expected Json error, got {other:?}"),
+    }
+}

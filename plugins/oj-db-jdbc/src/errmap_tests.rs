@@ -95,3 +95,15 @@ fn redact_embedded_in_message() {
         "Connection refused: jdbc:dm://***@host:5237 (IoException)"
     );
 }
+
+/// 同一行多个连接串全部脱敏（只脱第一个是安全控件覆盖缺口）。
+#[test]
+fn redact_multiple_urls_in_line() {
+    let msg = "primary jdbc:dm://u1:p1@h1:5237 failed, fallback jdbc:dm://u2:p2@h2:5237";
+    assert_eq!(
+        redact(msg),
+        "primary jdbc:dm://***@h1:5237 failed, fallback jdbc:dm://***@h2:5237"
+    );
+    // 第二个 URL 的凭据不得残留。
+    assert!(!redact(msg).contains("u2:p2") && !redact(msg).contains("u1:p1"));
+}

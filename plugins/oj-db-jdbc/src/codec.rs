@@ -98,7 +98,9 @@ pub enum Response {
 }
 
 fn bad(line: &str, why: &str) -> FrameError {
-    FrameError::Json(format!("{why}: {}", &line[..line.len().min(64)]))
+    // 按 char 截断：sidecar 是不可信输入源，按字节切多字节码点会 panic（不 panic 红线）。
+    let snippet: String = line.chars().take(64).collect();
+    FrameError::Json(format!("{why}: {snippet}"))
 }
 
 pub fn parse_response(line: &str) -> Result<Response, FrameError> {
