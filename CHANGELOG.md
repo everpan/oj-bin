@@ -16,11 +16,59 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
-## 下一版（未发布，v0.1.141 开发中）
+## v0.1.141（2026-11-20，未打标签）
 
-**泛型 JDBC 插件 `oj-db-jdbc`（规划中）**——参考 dbx 的 sidecar 适配，Java 桥
-（NDJSON over stdio）+ cdylib 插件，drop-in 驱动目录接入达梦/金仓/Oracle 等企业库；
-宿主仅一处 `db.import` 门控补漏。设计：`docs/superpowers/specs/2026-11-20-jdbc-generic-plugin-design.md`。
+**泛型 JDBC 插件 `oj-db-jdbc`——`jdbc:` DSN 接达梦/金仓/Oracle/H2 等企业库**，
+宿主唯一改动是一行 `db.import` 门控补漏（`require_known_dialect`，此前未知方言
+会在 detached import 任务内 panic 卡死 Running 态，现与其余生成 SQL 路径对齐报
+结构化 `OJ_DB_UNSUPPORTED`）。设计：
+`docs/superpowers/specs/2026-11-20-jdbc-generic-plugin-design.md`，
+交付手册：`docs/plugins/jdbc.md`。
+
+- **sidecar 架构**：cdylib 插件首次请求惰性 spawn Java 桥进程（Java 11+，
+  `java_bin` → `JAVA_HOME` → `PATH` 解析），stdin/stdout NDJSON 帧协议、stderr
+  常驻 drain（防 64KB 管道楔死）、行长 64 MiB 上限、hello 协议严格相等
+  （`.so` 与桥 jar 版本锁死，升级须整目录同换）。不选 JNI in-process：
+  崩溃域/信号处理器冲突/libjvm 耦合，sidecar 全维度胜出。
+- **DSN 两形态**：裸 JDBC URL 或 `jdbc:{json}` 信封（`props` 全量上送、
+  `driver_class` 逃生舱、`password: {"$env":...}` 运行时降级）；凭据范式 =
+  **config 静态 DSN 整串 `oj secret seal`**（信封内嵌 `ENC[...]` 不解密，
+  醒目框进 jdbc.md/SKILL 陷阱表）。厂商驱动 jar 投放插件 `jdbc/drivers/`
+  目录（drop-in，需重启——URLClassLoader 不可热替换；v1 单部署单厂商，
+  多厂商按厂商起多实例）。
+- **方言与门控**：`db.dialect()` 恒 `"jdbc"`，能力串
+  `placeholder_q + id_two_step + stream + cancel`；构造器/`listTables`/`nextSeq`/
+  migrate/seed/`db.import` 在 jdbc 后端结构化 `OJ_DB_UNSUPPORTED`（`e.data.capability`
+  点名），正面路径 = 裸 `db.query`/`db.exec`（`?` 直通）+ `db.stream` +
+  `db.export`（走流式泵，不受 known-dialect 门控，照常可用）。
+- **类型映射**（golden fixture 双向钉死）：DECIMAL/NUMERIC 按 `getScale()` 分流
+  （scale>0 → string 保精度；scale==0 → 整数族——达梦把 INT 上报 NUMERIC，不判
+  scale 整数列全变 string）；整数统一 `getBigDecimal` 判幅值（`$oj$i64`/`$oj$u64`
+  标记与 mysql 插件对齐）；null → `setNull(Types.VARCHAR)`（Oracle/达梦拒
+  `Types.NULL`）；TIME 单列 `getTime`；TZ 列 `OffsetDateTime` 保 offset；
+  BLOB → `"$blob:<base64>"` cellenv 信封；LOB 单列 16 MiB 上限结构化报错。
+- **错误面**：SQLState class 表镜像 oj-db-mysql（08/23/40/42/53/57），厂商码/
+  NULL SQLState 绝不硬套 MySQL 表后静默误判 retryable——直接 internal，
+  `vendor_code` 原样透传；连接串凭据 `://***@` 脱敏；connect 失败附 stderr
+  尾部 20 行。
+- **实测边界（达梦 DM8 / Dm8JdbcDriver18 8.1.1.49 远程 e2e 主腿 1.8s 全绿）**：
+  支持 LIMIT/OFFSET、OFFSET FETCH、TOP、MERGE INTO、序列、IDENTITY、@@IDENTITY、
+  TRUNCATE；**不支持** INSERT IGNORE / ON DUPLICATE KEY UPDATE / RETURNING；
+  `''` 原样保留不吞 NULL；CASE_SENSITIVE=1 引号/未引是不同对象；多行 values
+  组数必须与参数个数同构（否则「序列号无效」）；mid-fetch stream cancel 在该驱动
+  结构性不可达（接受、无效果，诚实登记）。金仓可选腿 env-gated 就绪即跑。
+- **xtask/CI**：第一方插件清单纳入 `oj-db-jdbc`，归置桥 jar 到
+  `bin/plugins/<triple>/jdbc/`（drivers/ 空投目录 + README），`--check` 缺 jar
+  预检报错点名修法；plugin-matrix/release 加 Java 腿（setup-java 21 + gradle
+  缓存；Windows 腿受 Rust 假 java 夹具保护，三平台可测）。Oracle 不在 v1 验证
+  范围（协议通用，接入路径与达梦同形）。
+- **sample**：`sample/src/dm/query/api.ts` 达梦参数查询样例（env-gated，
+  `db.dm` 未配置如实 500 不静默）+ `sample/config.yaml` 配方注释。
+- **文档**：`docs/plugins/jdbc.md` 新建（checklist/十分钟 H2 开箱全程/ENC 范式
+  醒目框/错误排障表/限制节含多实例配方与 .so+jar 锁死须知/db.export 正面说明/
+  达梦实测边界表）；devkit 四件套逐条对齐（api-manual 能力表 jdbc 列 + §13
+  限制表 jdbc 行、SKILL 陷阱表四行、scenarios 场景 82、README 版本同步）+
+  `sample/global.d.ts` 同源校验不变。
 
 ## v0.1.140（2026-11-18，未打标签）
 

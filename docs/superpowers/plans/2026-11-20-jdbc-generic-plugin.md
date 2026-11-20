@@ -54,7 +54,7 @@
 | 3 联调 | T12 | H2 真实 JVM 冒烟（env-gated jar） | ✅ |
 | 4 构建/CI | T13 | xtask 归置 + plugin-matrix Java 腿 | ✅ |
 | 5 e2e | T14 | 达梦远程主腿 + 金仓可选腿 | ✅ |
-| 6 文档/发版 | T15 | jdbc.md + SKILL 陷阱 + devkit 四件 + sample + CHANGELOG 定稿 | ⬜ |
+| 6 文档/发版 | T15 | jdbc.md + SKILL 陷阱 + devkit 四件 + sample + CHANGELOG 定稿 | ✅ |
 
 ---
 
@@ -331,8 +331,8 @@
 - Modify: `CHANGELOG.md`——「下一版（未发布）」改为 `v0.1.141（YYYY-MM-DD，未打标签）` 并充实条目
 - Run: `cargo xtask build`（归置 devkit）+ `cargo test --release -p xtask`（契约校验）
 
-- [ ] **Step 1: 写文档**。
-- [ ] **Step 2: `cargo xtask build && cargo test --release -p xtask` Expected: PASS**。
+- [x] **Step 1: 写文档**。
+- [x] **Step 2: `cargo xtask build && cargo test --release -p xtask` Expected: PASS**。
 - [ ] **Step 3: Commit**——`docs(jdbc): jdbc.md + devkit 四件 + CHANGELOG v0.1.141`。
 - [ ] **Step 4（发版点，需用户确认后执行）**: 打标签 `git tag -a v0.1.141 -m "v0.1.141: 泛型 JDBC 插件 oj-db-jdbc"` 并推送。
 
@@ -346,7 +346,7 @@
 - [x] **阶段 3 小结**（T12 后填）：H2 真 JVM 冒烟实跑绿，途中抓到并根因修复真 bug×1——spawn 原把 drivers 放上 -cp 且未传 args[0]，真 JVM 路径死路被假 java 腿掩盖（T2 复盘预言的假绿形态兑现）。fixture 纪律（driversDir-only）与 golden 往返（19 列+$oj$ 标记）落地。
 - [x] **阶段 4 小结**（T13 后填）：xtask 归置桥 jar + drivers 目录 README + --check jar 预检 + plugin-matrix/release Java 腿（1 修复轮：setup-java 11→21 因 Gradle 9 wrapper 需 JVM≥17——brief 规格错误，release.yml 步补 shell: bash）。CI yml 语义未经真实 runner 验证为残余不确定性，首轮矩阵跑需留意。
 - [x] **阶段 5 小结**（T14 后填）：达梦远程 e2e 主腿对真实例实跑绿（1.8s 零残留），金仓腿诚实 skip。旗舰裁决：真·在途 cancel 在 DM 8.1.1.49 结构性不可达（三重证据）→R7 信封保持 fake-java 覆盖、严格断言分支就位；err-吞咽分支源码裁决为死代码（Session.streamClose 唯一摘除者）。顺带钉死 DM 空串=AsEmpty、values 组数须同构。另完成方言验证侧记：DM 不支持 INSERT IGNORE/ON DUPLICATE KEY/RETURNING，支持 MERGE INTO/序列/@@IDENTITY——builder 级 dameng 方言是第四种真实形态，列未来工作。
-- [ ] **阶段 6 小结**（T15 后填）：
+- [x] **阶段 6 小结**（T15 后填）：文档定稿全量落地——`docs/plugins/jdbc.md` 按 spec §4 硬性清单成文（目标机 checklist/十分钟 H2 开箱全程/ENC 整串密封醒目框 + 信封内嵌不解密/错误文案排障表/限制节含多实例配方与 .so+jar 锁死须知/db.export 正面说明/达梦实测边界表），devkit 四件逐条对齐（api-manual 能力表 jdbc 列 + §13 限制表 jdbc 行、SKILL 陷阱表四行、scenarios 场景 82、README 版本同步），CHANGELOG 定版 `v0.1.141（2026-11-20，未打标签）`，xtask build 归置 + devkit 契约用例通过。打标签/推送留待用户确认（Step 4 未执行）。
 
 ## Self-Review 记录
 

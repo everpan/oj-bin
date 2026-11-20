@@ -5218,3 +5218,62 @@ export default {
 | broker 是集群却忘了开 | 只 WARN 不拒（向后兼容）——但本地广播跨不了实例，排查「B 实例收不到」先查这旗 |
 | 想给房间消息加全局 seq | 中继信封**无 seq**：跨实例定序/去重由上层协同库（oj-collab）负责，传输层刻意不承诺顺序 |
 | 同一集群多套环境 | 必须给每套配不同 `topic_prefix`，否则中继 topic 撞名互扇 |
+
+## 场景 82：接达梦（oj-db-jdbc 泛型 JDBC 插件）——连接 + 参数化查询（v0.1.141）
+
+> 何时抄我：业务库是达梦/金仓/Oracle 等只有 JDBC 驱动的企业库。`jdbc:` DSN 由
+> `oj-db-jdbc` 插件认领（sidecar 架构：插件 spawn Java 桥进程，目标机需 Java 11+，
+> 厂商驱动 jar 放进插件 `jdbc/drivers/`）。H2 开箱验证全程见仓库
+> `docs/plugins/jdbc.md`。
+
+### ① 配置
+
+```yaml
+# config.yaml —— 凭据整串 ENC 密封（信封内嵌 ENC[...] 不解密，别那样写）；
+# 运行时 db.client.register 场景才用 {"password":{"$env":"DB_PASS"}} 降级。
+db:
+  # 开发期可明文，生产必封：
+  #   echo -n 'jdbc:{"url":"jdbc:dm://127.0.0.1:5237",...}' | ./bin/oj secret seal -k pub.pem
+  dm: 'jdbc:{"url":"jdbc:dm://127.0.0.1:5237","user":"SYSDBA","password":"SYSDBA001","props":{"socketTimeout":"30000"}}'
+  # 形态 2 裸 URL（凭据在 URL 内）：dm: 'jdbc:oracle:thin:@//127.0.0.1:1521/FREEPDB1'
+# plugins 段一般不用动（drivers_dir/java_bin 有缺才配）；厂商 jar 放
+# <exe>/plugins/<host-triple>/jdbc/drivers/，放完重启进程（URLClassLoader 不可热替换）
+```
+
+### ② handler
+
+```ts
+// src/dm/query/api.ts —— jdbc 方言是「未知方言」：构造器被门控，一律裸 SQL + ? 绑参
+function get(): void {
+  const id = Number(http.param("id", 0));
+  const dm = DB("dm");                 // 未配置 db.dm 时返回 undefined——如实报错
+  if (!dm) { json.fail(500, "db.dm not configured"); return; }
+  dm.query("select id, name from account where id = ?", [id])   // 占位符恒 ?
+    .then((rows) => json.ok(rows))
+    .catch((e) => json.fail(500, String(e)));
+}
+```
+
+### ③ 验证
+
+```bash
+cargo xtask plugin db-jdbc   # 构建 + 归置桥 jar（缺 jar --check 直接报错）
+# 达梦 jar 放 bin/plugins/<triple>/jdbc/drivers/（DM 客户端 drivers/jdbc/，许可自负）
+./bin/oj serve -c config.yaml --api-path src
+curl 'http://localhost:9778/v1/api/dm/query/?id=1'   # → {"code":0,"msg":"ok","data":[...]}
+```
+
+验证口径：达梦 e2e 全链（connect→DDL→参数查询→事务回滚/提交→stream 批边界→export）
+对真·远程实例实跑 1.8s 全绿；`db.export`/`db.stream` 在 jdbc 后端照常可用。
+
+### ④ 常见坑
+
+| 坑 | 解 |
+|---|---|
+| 构造器/`db.import` 报 `OJ_DB_UNSUPPORTED` | 预期门控（方言恒 `"jdbc"`）。正解 = `DB("dm").query` + `?`；导出走 `db.export`（不受门控） |
+| connect 报 `No suitable driver` | `jdbc/drivers/` 为空或放错目录（报错尾部有实际扫描路径）；老旧 jar 缺服务条目 → 信封 `props.driver_class` 显式给驱动类名 |
+| 报 `proto mismatch … .so 与 jar 必须同版整目录拷贝` | 插件 `.so` 与桥 jar 版本锁死：升级时两者一起换，勿只换其一 |
+| 首个查询慢 | JVM 冷启动由首次 connect 承担（实测达梦全链 1.8s）——启动后先跑一次健康查询预热 |
+| DM 整数列回 string / DECIMAL 回 number | 按 scale 分流：scale>0 → string（保精度）；scale==0 → number。别 `Number()` 大数，用 `toBigInt` |
+| DM 幂等写撞墙 | DM 不支持 `INSERT IGNORE`/`ON DUPLICATE KEY`/`RETURNING`——用 MERGE INTO 或事务内先查后写；多行 values 组数必须与参数个数同构（否则「序列号无效」） |
+| 引号标识符对不上 | DM 默认 CASE_SENSITIVE=1：`"name"` ≠ `NAME`——裸 SQL 统一不引用或统一大写 |
