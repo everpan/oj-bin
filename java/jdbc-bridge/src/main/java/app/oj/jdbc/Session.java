@@ -20,6 +20,8 @@ final class Session {
 
     final int handle;
     private final Connection conn;
+    private long nextTxId = 1; // tx_id 从 1 递增；0 表示无活动事务
+    private long activeTx;
 
     private Session(int handle, Connection conn) {
         this.handle = handle;
@@ -71,6 +73,49 @@ final class Session {
             RowCodec.bind(ps, params == null ? null : params.toList());
             return ps.executeUpdate();
         }
+    }
+
+    /** 开事务：autoCommit 关闭；不支持嵌套（活动事务未收尾时再来 begin 即报错）。 */
+    long begin() throws Exception {
+        if (activeTx != 0) {
+            throw new IllegalStateException("nested begin not supported, active tx: " + activeTx);
+        }
+        conn.setAutoCommit(false);
+        activeTx = nextTxId++;
+        return activeTx;
+    }
+
+    JSONArray txQuery(long txId, String sql, JSONArray params) throws Exception {
+        checkTx(txId);
+        return query(sql, params);
+    }
+
+    int txExec(long txId, String sql, JSONArray params) throws Exception {
+        checkTx(txId);
+        return exec(sql, params);
+    }
+
+    void commit(long txId) throws Exception {
+        checkTx(txId);
+        conn.commit();
+        endTx();
+    }
+
+    void rollback(long txId) throws Exception {
+        checkTx(txId);
+        conn.rollback();
+        endTx();
+    }
+
+    private void checkTx(long txId) {
+        if (txId != activeTx) {
+            throw new IllegalStateException("unknown tx_id: " + txId);
+        }
+    }
+
+    private void endTx() throws Exception {
+        conn.setAutoCommit(true);
+        activeTx = 0;
     }
 
     void disconnect() {

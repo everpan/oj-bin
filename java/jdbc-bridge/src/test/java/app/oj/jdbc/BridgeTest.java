@@ -58,6 +58,75 @@ class BridgeTest {
     }
 
     @Test
+    void txCommitMakesRowVisible() throws Exception {
+        BufferedReader in = new BufferedReader(new StringReader(
+                "{\"id\":1,\"op\":\"connect\",\"url\":\"jdbc:h2:mem:txc\"}\n"
+                        + "{\"id\":2,\"op\":\"exec\",\"handle\":1,\"sql\":\"create table t (id int, name varchar(20))\"}\n"
+                        + "{\"id\":3,\"op\":\"begin\",\"handle\":1}\n"
+                        + "{\"id\":4,\"op\":\"tx_exec\",\"handle\":1,\"tx_id\":1,\"sql\":\"insert into t values (1, 'a')\"}\n"
+                        + "{\"id\":5,\"op\":\"tx_commit\",\"handle\":1,\"tx_id\":1}\n"
+                        + "{\"id\":6,\"op\":\"query\",\"handle\":1,\"sql\":\"select id, name from t\"}\n"));
+        StringWriter sw = new StringWriter();
+        Bridge.serve(in, new BufferedWriter(sw));
+        String[] lines = sw.toString().split("\n");
+        JSONObject begin = new JSONObject(lines[2]);
+        assertTrue(begin.has("ok"), "expect ok frame: " + begin);
+        assertEquals(1, begin.getJSONObject("ok").getLong("tx_id"));
+        JSONObject exec = new JSONObject(lines[3]);
+        assertTrue(exec.has("ok"), "expect ok frame: " + exec);
+        assertEquals(1, exec.getInt("ok"));
+        JSONObject commit = new JSONObject(lines[4]);
+        assertTrue(commit.has("ok"), "expect ok frame: " + commit);
+        JSONObject rows = new JSONObject(lines[5]);
+        assertEquals(1, rows.getJSONObject("ok").getJSONArray("rows").length());
+    }
+
+    @Test
+    void txRollbackUndoesInsert() throws Exception {
+        BufferedReader in = new BufferedReader(new StringReader(
+                "{\"id\":1,\"op\":\"connect\",\"url\":\"jdbc:h2:mem:txr\"}\n"
+                        + "{\"id\":2,\"op\":\"exec\",\"handle\":1,\"sql\":\"create table t (id int)\"}\n"
+                        + "{\"id\":3,\"op\":\"begin\",\"handle\":1}\n"
+                        + "{\"id\":4,\"op\":\"tx_exec\",\"handle\":1,\"tx_id\":1,\"sql\":\"insert into t values (1)\"}\n"
+                        + "{\"id\":5,\"op\":\"tx_rollback\",\"handle\":1,\"tx_id\":1}\n"
+                        + "{\"id\":6,\"op\":\"query\",\"handle\":1,\"sql\":\"select id from t\"}\n"));
+        StringWriter sw = new StringWriter();
+        Bridge.serve(in, new BufferedWriter(sw));
+        String[] lines = sw.toString().split("\n");
+        JSONObject rollback = new JSONObject(lines[4]);
+        assertTrue(rollback.has("ok"), "expect ok frame: " + rollback);
+        JSONObject rows = new JSONObject(lines[5]);
+        assertEquals(0, rows.getJSONObject("ok").getJSONArray("rows").length());
+    }
+
+    @Test
+    void nestedBeginReturnsErr() throws Exception {
+        BufferedReader in = new BufferedReader(new StringReader(
+                "{\"id\":1,\"op\":\"connect\",\"url\":\"jdbc:h2:mem:txn\"}\n"
+                        + "{\"id\":2,\"op\":\"begin\",\"handle\":1}\n"
+                        + "{\"id\":3,\"op\":\"begin\",\"handle\":1}\n"));
+        StringWriter sw = new StringWriter();
+        Bridge.serve(in, new BufferedWriter(sw));
+        String[] lines = sw.toString().split("\n");
+        JSONObject err = new JSONObject(lines[2]);
+        assertEquals(3, err.getLong("id"));
+        assertTrue(err.has("err"), "expect err frame: " + err);
+    }
+
+    @Test
+    void unknownTxIdReturnsErr() throws Exception {
+        BufferedReader in = new BufferedReader(new StringReader(
+                "{\"id\":1,\"op\":\"connect\",\"url\":\"jdbc:h2:mem:txu\"}\n"
+                        + "{\"id\":2,\"op\":\"tx_commit\",\"handle\":1,\"tx_id\":99}\n"));
+        StringWriter sw = new StringWriter();
+        Bridge.serve(in, new BufferedWriter(sw));
+        String[] lines = sw.toString().split("\n");
+        JSONObject err = new JSONObject(lines[1]);
+        assertEquals(2, err.getLong("id"));
+        assertTrue(err.has("err"), "expect err frame: " + err);
+    }
+
+    @Test
     void unknownOpReturnsErrAndServeContinues() throws Exception {
         BufferedReader in = new BufferedReader(new StringReader(
                 "{\"id\":1,\"op\":\"bogus\"}\n"

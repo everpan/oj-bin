@@ -101,6 +101,39 @@ public final class Bridge {
                 }
                 return s.exec(req.getString("sql"), req.optJSONArray("params"));
             }
+            case "begin": {
+                Session s = Session.byHandle(req.getInt("handle"));
+                if (s == null) {
+                    throw new IllegalStateException("unknown handle: " + req.getInt("handle"));
+                }
+                return new JSONObject().put("tx_id", s.begin());
+            }
+            case "tx_query":
+            case "tx_exec": {
+                Session s = Session.byHandle(req.getInt("handle"));
+                if (s == null) {
+                    throw new IllegalStateException("unknown handle: " + req.getInt("handle"));
+                }
+                long txId = req.getLong("tx_id");
+                if (op.equals("tx_query")) {
+                    return new JSONObject().put("rows", s.txQuery(txId, req.getString("sql"), req.optJSONArray("params")));
+                }
+                return s.txExec(txId, req.getString("sql"), req.optJSONArray("params"));
+            }
+            case "tx_commit":
+            case "tx_rollback": {
+                Session s = Session.byHandle(req.getInt("handle"));
+                if (s == null) {
+                    throw new IllegalStateException("unknown handle: " + req.getInt("handle"));
+                }
+                long txId = req.getLong("tx_id");
+                if (op.equals("tx_commit")) {
+                    s.commit(txId);
+                } else {
+                    s.rollback(txId);
+                }
+                return new JSONObject();
+            }
             default:
                 throw new IllegalArgumentException("unknown op: " + op);
         }
