@@ -29,6 +29,7 @@ const PLUGINS: &[&str] = &[
     "es",
     "db-mysql",
     "db-postgres",
+    "db-jdbc",
     "blob-s3",
     "bus-kafka",
     "bus-rabbitmq",
@@ -577,7 +578,7 @@ mod tests {
     #[test]
     fn given_first_party_plugins_when_listed_then_covers_all_axes() {
         // 业务约定：10 个第一方插件 = es/db×2/blob/bus×2/kv/auth/mail/ldap 全轴覆盖。
-        assert_eq!(PLUGINS.len(), 10);
+        assert_eq!(PLUGINS.len(), 11);
         assert!(PLUGINS.contains(&"auth"));
         assert!(PLUGINS.contains(&"bus-kafka"));
         assert!(PLUGINS.contains(&"mail"));

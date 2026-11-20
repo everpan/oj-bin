@@ -1,0 +1,24 @@
+[package]
+name = "oj-db-jdbc"
+version = "0.1.141"
+edition = "2024"
+description = "db 轴通用 JDBC 插件：Java sidecar 桥接任意 JDBC 驱动（spec §5）"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+oj-plugin-ffi = { path = "../../oj-plugin-ffi" }
+serde_json = "1"
+# T10 sidecar：spawn java 子进程 + stdin/stdout 管道帧读写。
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "sync",
+    "process",
+    "io-util",
+    "time",
+] }
+# T10：dladdr 定位插件 .dylib → 缺省 drivers_dir = <插件目录>/jdbc/drivers。
+libc = "0.2"
+# T11：二进制列（BLOB/RAW/LONGVARBINARY）走 cellenv base64 信封。
+base64 = "0.23"

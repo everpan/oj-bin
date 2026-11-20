@@ -4408,6 +4408,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "oj-db-jdbc"
+version = "0.1.141"
+dependencies = [
+ "base64 0.23.1",
+ "libc",
+ "oj-plugin-ffi",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "oj-db-mysql"
 version = "0.1.3"
 dependencies = [
