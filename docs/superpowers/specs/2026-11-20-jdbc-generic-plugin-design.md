@@ -188,9 +188,12 @@ op 与 vtable 一一映射：`connect → {"handle":1}`；`query → 行数组`�
   也会以 `SQLException` 返回——两条路径抢同一 id 的响应帧。每请求一个 claimed 标志，
   先赢者写帧，败者丢弃。
 - **驱动加载**：建 URLClassLoader 装载 drivers 目录全部 jar 后
-  `Thread.currentThread().setContextClassLoader(ucl)`（ServiceLoader 读 TCCL，不设连
-  扫描都扫不到）；信封给了 `driver_class` 则显式 Class.forName。DriverManager 按 URL
-  自动选型，**无需 driver_class 配置**（缺省路径）。
+  `Thread.currentThread().setContextClassLoader(ucl)`（ServiceLoader 读 TCCL）；TCCL 设置
+  **不足以**让 DriverManager 选用 UCL 驱动——`DriverManager.getConnection` 的
+  `isDriverAllowed` 要求调用方类加载器可见驱动类，必须再用 **DriverShim**（app 类加载器
+  的 `Driver` 实现，包装 UCL 加载的驱动实例）`registerDriver` 后走 DriverManager
+  （T2 评审实测复现：仅 TCCL 时 connect 恒报 "No suitable driver"）；信封给了
+  `driver_class` 则显式 Class.forName 作为缺服务条目 jar 的逃生舱。
 - `SQLFeatureNotSupportedException` 必须翻译成结构化「unsupported」帧（含能力名与
   驱动版本），不得落成 generic err——否则 stream/cancel 在驱动缺实现时定位不到原因。
 
