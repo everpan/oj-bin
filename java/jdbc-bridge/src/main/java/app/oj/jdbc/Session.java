@@ -1,7 +1,14 @@
 package app.oj.jdbc;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
+import java.util.Base64;
 import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.ConcurrentHashMap;
@@ -37,6 +44,42 @@ final class Session {
 
     Connection conn() {
         return conn;
+    }
+
+    /** 查询：RowCodec 绑参，行 = {列标签: getObject 原始值}；类型分流 T4 定型。 */
+    JSONArray query(String sql, JSONArray params) throws Exception {
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            RowCodec.bind(ps, params == null ? null : params.toList());
+            try (ResultSet rs = ps.executeQuery()) {
+                ResultSetMetaData md = rs.getMetaData();
+                int n = md.getColumnCount();
+                JSONArray rows = new JSONArray();
+                while (rs.next()) {
+                    JSONObject row = new JSONObject();
+                    for (int i = 1; i <= n; i++) {
+                        Object v = rs.getObject(i);
+                        // byte[]/Blob 先按 cellenv 信封占位出帧，T4 定型完整类型分流
+                        if (v instanceof java.sql.Blob) {
+                            v = ((java.sql.Blob) v).getBinaryStream().readAllBytes();
+                        }
+                        if (v instanceof byte[]) {
+                            v = RowCodec.BLOB_PREFIX + Base64.getEncoder().encodeToString((byte[]) v);
+                        }
+                        row.put(md.getColumnLabel(i), v == null ? JSONObject.NULL : v);
+                    }
+                    rows.put(row);
+                }
+                return rows;
+            }
+        }
+    }
+
+    /** 执行：RowCodec 绑参，回受影响行数。 */
+    int exec(String sql, JSONArray params) throws Exception {
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            RowCodec.bind(ps, params == null ? null : params.toList());
+            return ps.executeUpdate();
+        }
     }
 
     void disconnect() {

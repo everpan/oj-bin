@@ -59,7 +59,7 @@ public final class Bridge {
         }
     }
 
-    private static JSONObject dispatch(JSONObject req) throws Exception {
+    private static Object dispatch(JSONObject req) throws Exception {
         String op = req.getString("op");
         switch (op) {
             case "connect": {
@@ -86,6 +86,20 @@ public final class Bridge {
                 }
                 s.disconnect();
                 return new JSONObject();
+            }
+            case "query": {
+                Session s = Session.byHandle(req.getInt("handle"));
+                if (s == null) {
+                    throw new IllegalStateException("unknown handle: " + req.getInt("handle"));
+                }
+                return new JSONObject().put("rows", s.query(req.getString("sql"), req.optJSONArray("params")));
+            }
+            case "exec": {
+                Session s = Session.byHandle(req.getInt("handle"));
+                if (s == null) {
+                    throw new IllegalStateException("unknown handle: " + req.getInt("handle"));
+                }
+                return s.exec(req.getString("sql"), req.optJSONArray("params"));
             }
             default:
                 throw new IllegalArgumentException("unknown op: " + op);
