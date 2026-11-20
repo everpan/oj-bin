@@ -93,7 +93,7 @@ db:
   # 形态 1：裸 JDBC URL（凭据须在 URL 内）
   legacy: 'jdbc:oracle:thin:@//127.0.0.1:1521/FREEPDB1'
   # 形态 2：JSON 信封（企业驱动普遍要额外连接属性，这是唯一入口）
-  dm: 'jdbc:{"url":"jdbc:dm://127.0.0.1:5237","user":"SYSDBA","password":"SYSDBA001","props":{"compatibleMode":"mysql","socketTimeout":"30000"}}'
+  dm: 'jdbc:{"url":"jdbc:dm://127.0.0.1:5237","user":"SYSDBA","password":"<your-password>","props":{"compatibleMode":"mysql","socketTimeout":"30000"}}'
 ```
 
 - 信封 `props` 全量上送 JDBC（`socketTimeout` 建议显式给，见「限制」）。
@@ -117,7 +117,7 @@ db:
 > 早于 connect，零插件支持：
 >
 > ```bash
-> echo -n 'jdbc:{"url":"jdbc:dm://127.0.0.1:5237","user":"SYSDBA","password":"SYSDBA001"}' \
+> echo -n 'jdbc:{"url":"jdbc:dm://127.0.0.1:5237","user":"SYSDBA","password":"<your-password>"}' \
 >   | ./bin/oj secret seal -k keys/secrets-public.pem
 > # config.yaml:
 > #   dm: 'ENC[...]'

@@ -115,10 +115,20 @@ public final class Bridge {
         }
     }
 
-    static String errMsg(Throwable t) {
+    /** err 帧载荷：SQLException 走 §5.8 结构化形态 `{message,sql_state,error_code}`，
+     *  其余 throwable 仍回裸串（codec 两种形态都认）。org.json 语义：put null 值 = 删键，
+     *  故驱动不给 SQLState 时 key 天然缺席（Rust 侧 None → internal，不硬套）。 */
+    static Object errMsg(Throwable t) {
         String msg = t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName();
         if (t instanceof SQLFeatureNotSupportedException) {
             msg = "unsupported: " + msg; // 驱动缺实现时结构化可辨（spec §5.3）
+        }
+        if (t instanceof java.sql.SQLException) {
+            java.sql.SQLException e = (java.sql.SQLException) t;
+            return new JSONObject()
+                    .put("message", msg)
+                    .put("sql_state", e.getSQLState()) // null → key 缺席（org.json put-null 删键）
+                    .put("error_code", Integer.valueOf(e.getErrorCode()));
         }
         return msg;
     }

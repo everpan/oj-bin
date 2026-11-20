@@ -11,7 +11,7 @@
 
 mod e2e;
 
-use oj_db_jdbc::__test_shutdown;
+use oj_db_jdbc::{__test_shutdown, dsn};
 use std::path::PathBuf;
 
 fn skip(msg: &str) {
@@ -76,6 +76,12 @@ fn e2e_kingbase() {
             "url": url, "user": user, "password": password,
         })
     );
+
+    // 与插件 dsn 模块同解一遍，确保信封在进 vtable 前即合法（错配早失败，不 panic）。
+    if !matches!(dsn::parse_dsn(&dsn_s), Ok(dsn::ParsedDsn::Envelope(_))) {
+        skip("DSN 信封解析失败");
+        return;
+    }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

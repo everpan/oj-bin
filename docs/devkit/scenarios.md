@@ -5234,7 +5234,7 @@ export default {
 db:
   # 开发期可明文，生产必封：
   #   echo -n 'jdbc:{"url":"jdbc:dm://127.0.0.1:5237",...}' | ./bin/oj secret seal -k pub.pem
-  dm: 'jdbc:{"url":"jdbc:dm://127.0.0.1:5237","user":"SYSDBA","password":"SYSDBA001","props":{"socketTimeout":"30000"}}'
+  dm: 'jdbc:{"url":"jdbc:dm://127.0.0.1:5237","user":"SYSDBA","password":"<your-password>","props":{"socketTimeout":"30000"}}'
   # 形态 2 裸 URL（凭据在 URL 内）：dm: 'jdbc:oracle:thin:@//127.0.0.1:1521/FREEPDB1'
 # plugins 段一般不用动（drivers_dir/java_bin 有缺才配）；厂商 jar 放
 # <exe>/plugins/<host-triple>/jdbc/drivers/，放完重启进程（URLClassLoader 不可热替换）

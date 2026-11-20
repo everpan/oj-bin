@@ -16,7 +16,7 @@ fn sqlstate_class_table() {
         ("42601", "syntax", false, "keep"),
         ("53300", "capacity", true, "keep"),
         ("57014", "cancelled", false, "keep"),
-        ("0A000", "internal", false, "keep"), // 未收录类 → internal
+        ("0A000", "unsupported", false, "keep"), // SQLFeatureNotSupportedException 标准类
     ];
     for (state, cat, retryable, disp) in cases {
         assert_eq!(

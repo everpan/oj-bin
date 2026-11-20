@@ -125,13 +125,18 @@ pub async fn run_chain(in_: &ChainInput) -> Result<Vec<String>, String> {
     println!("e2e: describe = {d}");
 
     // ---- 探活 1：connect 失败脱敏（计划钉：错误信封不得回显 user:pass@）----
-    let bad = in_.dsn.replace(&in_.password, "OJ_E2E_WRONG_PW");
-    let mut f = vt::connect(RString::from(bad.as_str()));
-    let e = drive(&mut f).await.expect_err("错口令 connect 必须失败");
-    assert2(
-        !e.contains(&in_.password) && !e.contains("OJ_E2E_WRONG_PW"),
-        &format!("connect 错误不得回显口令: {e}"),
-    )?;
+    // 空口令时 replace("",…)/contains("") 无意义（处处命中），跳过该子用例。
+    if in_.password.is_empty() {
+        println!("e2e: 空口令——跳过 connect 脱敏子用例（replace/contains 对空串恒真）");
+    } else {
+        let bad = in_.dsn.replace(&in_.password, "OJ_E2E_WRONG_PW");
+        let mut f = vt::connect(RString::from(bad.as_str()));
+        let e = drive(&mut f).await.expect_err("错口令 connect 必须失败");
+        assert2(
+            !e.contains(&in_.password) && !e.contains("OJ_E2E_WRONG_PW"),
+            &format!("connect 错误不得回显口令: {e}"),
+        )?;
+    }
 
     // ---- connect（真远程实例）----
     let mut f = vt::connect(RString::from(in_.dsn.as_str()));

@@ -339,6 +339,20 @@ async fn smoke(bridge: &Path, drivers: &Path) -> Result<(), String> {
         "post-cancel close ok",
     )?;
 
+    // ---- F1 回归钉：唯一键冲突 → 错误归类 constraint（Java 桥结构化 err 帧 →
+    //      codec sql_state → errmap 全链路真实连通；s250 主键 n 已含 0）----
+    let mut f = vt::exec(
+        h,
+        RString::from("insert into s250 values (0)"),
+        RString::from("[]"),
+    );
+    let e = drive(&mut f).await.expect_err("重复主键 insert 必须失败");
+    let env: Value = serde_json::from_str(&e).map_err(|_| format!("错误信封非 JSON: {e}"))?;
+    assert2(
+        env["category"] == json!("constraint"),
+        &format!("唯一键冲突须归类 constraint（非 internal），实际 {e}"),
+    )?;
+
     // ---- close 连接：同步槽非阻塞；后续查询报 unknown handle ----
     vt::close(h);
     let mut f = vt::query(h, RString::from("select 1"), RString::from("[]"));

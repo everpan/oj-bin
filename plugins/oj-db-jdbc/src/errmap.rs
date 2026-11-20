@@ -10,6 +10,7 @@ fn sqlstate_class(code: Option<&str>) -> Option<Classified> {
     let class = code?.get(..2)?;
     Some(match class {
         "08" => ("connection", true, "close"),
+        "0A" => ("unsupported", false, "keep"), // SQLFeatureNotSupportedException 标准类
         "23" => ("constraint", false, "keep"),
         "40" => ("timeout", true, "keep"),
         "42" => ("syntax", false, "keep"),

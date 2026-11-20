@@ -194,11 +194,38 @@ public class BridgeTest {
     }
 
     @Test
-    void featureNotSupportedErrHasUnsupportedPrefix() {
-        assertEquals("unsupported: no cubes",
-                Bridge.errMsg(new java.sql.SQLFeatureNotSupportedException("no cubes")));
-        assertEquals("boom", Bridge.errMsg(new java.sql.SQLException("boom")));
+    void featureNotSupportedErrIsStructuredWithUnsupportedMessage() {
+        JSONObject fns = (JSONObject) Bridge.errMsg(new java.sql.SQLFeatureNotSupportedException("no cubes"));
+        assertEquals("unsupported: no cubes", fns.getString("message"));
+        assertEquals(0, fns.getInt("error_code"));
+        // SQLFeatureNotSupportedException 不带 SQLState → key 缺席（org.json put-null 删键）。
+        assertFalse(fns.has("sql_state"));
+        // 非 SQLException 仍回裸串（codec 两种形态都认）。
         assertEquals("IllegalStateException", Bridge.errMsg(new IllegalStateException()));
+    }
+
+    @Test
+    void sqlExceptionErrCarriesSqlStateAndErrorCode() {
+        JSONObject err = (JSONObject) Bridge.errMsg(new java.sql.SQLException("dup", "23505", 1234));
+        assertEquals("dup", err.getString("message"));
+        assertEquals("23505", err.getString("sql_state"));
+        assertEquals(1234, err.getInt("error_code"));
+    }
+
+    @Test
+    void realH2UniqueViolationErrFrameIsStructured() throws Exception {
+        java.util.List<JSONObject> f = serveFrames(
+                "{\"id\":1,\"op\":\"connect\",\"url\":\"jdbc:h2:mem:uverr\"}",
+                "{\"id\":2,\"op\":\"exec\",\"handle\":1,\"sql\":\"create table t (id int primary key)\"}",
+                "{\"id\":3,\"op\":\"exec\",\"handle\":1,\"sql\":\"insert into t values (1)\"}",
+                "{\"id\":4,\"op\":\"exec\",\"handle\":1,\"sql\":\"insert into t values (1)\"}");
+        JSONObject err = f.get(3);
+        assertTrue(err.has("err"), "唯一键冲突须为 err 帧: " + err);
+        JSONObject e = err.getJSONObject("err");
+        assertEquals("23505", e.getString("sql_state"), "H2 唯一键冲突 SQLState: " + e);
+        assertTrue(e.getInt("error_code") != 0, "H2 唯一键冲突 vendor code: " + e);
+        // 帧间解析往返：err 值是对象而非裸串。
+        assertTrue(err.toString().contains("\"sql_state\":\"23505\""), "线上形态为结构化对象: " + err);
     }
 
     /** H2 CREATE ALIAS 反射入口：cond 为真则睡眠 ms（cancel 测试用慢查询），恒返回 true。 */
