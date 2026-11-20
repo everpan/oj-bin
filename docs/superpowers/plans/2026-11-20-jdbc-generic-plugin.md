@@ -40,19 +40,19 @@
 
 | 阶段 | 任务 | 内容 | 状态 |
 |---|---|---|---|
-| 0 宿主补漏 | T1 | db.import 门控 | ⬜ |
-| 1 Java 桥 | T2 | Bridge 骨架 + 驱动加载 + connect/disconnect + EOF 退出 | ⬜ |
-| 1 Java 桥 | T3 | query/exec + 参数绑定 RowCodec | ⬜ |
-| 1 Java 桥 | T4 | 结果集 RowCodec + golden fixture | ⬜ |
-| 1 Java 桥 | T5 | 事务 op | ⬜ |
-| 1 Java 桥 | T6 | 流式 op + cancel 唯一性 + per-conn 队列 | ⬜ |
-| 2 Rust 插件 | T7 | crate 骨架 + vtable 常量 + dsn.rs | ⬜ |
-| 2 Rust 插件 | T8 | codec.rs + errmap.rs | ⬜ |
-| 2 Rust 插件 | T9 | SidecarMgr + 假 java 夹具 | ⬜ |
-| 2 Rust 插件 | T10 | vtable 胶水：connect/query/exec/close/tx | ⬜ |
-| 2 Rust 插件 | T11 | vtable 胶水：stream 四槽 | ⬜ |
-| 3 联调 | T12 | H2 真实 JVM 冒烟（env-gated jar） | ⬜ |
-| 4 构建/CI | T13 | xtask 归置 + plugin-matrix Java 腿 | ⬜ |
+| 0 宿主补漏 | T1 | db.import 门控 | ✅ |
+| 1 Java 桥 | T2 | Bridge 骨架 + 驱动加载 + connect/disconnect + EOF 退出 | ✅ |
+| 1 Java 桥 | T3 | query/exec + 参数绑定 RowCodec | ✅ |
+| 1 Java 桥 | T4 | 结果集 RowCodec + golden fixture | ✅ |
+| 1 Java 桥 | T5 | 事务 op | ✅ |
+| 1 Java 桥 | T6 | 流式 op + cancel 唯一性 + per-conn 队列 | ✅ |
+| 2 Rust 插件 | T7 | crate 骨架 + vtable 常量 + dsn.rs | ✅ |
+| 2 Rust 插件 | T8 | codec.rs + errmap.rs | ✅ |
+| 2 Rust 插件 | T9 | SidecarMgr + 假 java 夹具 | ✅ |
+| 2 Rust 插件 | T10 | vtable 胶水：connect/query/exec/close/tx | ✅ |
+| 2 Rust 插件 | T11 | vtable 胶水：stream 四槽 | ✅ |
+| 3 联调 | T12 | H2 真实 JVM 冒烟（env-gated jar） | ✅ |
+| 4 构建/CI | T13 | xtask 归置 + plugin-matrix Java 腿 | ✅ |
 | 5 e2e | T14 | 达梦远程主腿 + 金仓可选腿 | ⬜ |
 | 6 文档/发版 | T15 | jdbc.md + SKILL 陷阱 + devkit 四件 + sample + CHANGELOG 定稿 | ⬜ |
 
@@ -340,12 +340,12 @@
 
 ## 阶段小结（执行时逐阶段填写）
 
-- [ ] **阶段 0 小结**（T1 后填）：
-- [ ] **阶段 1 小结**（T2-6 后填）：
-- [ ] **阶段 2 小结**（T7-11 后填）：
-- [ ] **阶段 3 小结**（T12 后填）：
-- [ ] **阶段 4 小结**（T13 后填）：
-- [ ] **阶段 5 小结**（T14 后填）：
+- [x] **阶段 0 小结**（T1 后填）：T1 一行门控 + 防回归测例落地。RED 阶段实测 panic 形态为进程级 SIGABRT（V8 不可 unwinding 回调），比设计预估的「任务卡死」更严重，证实补漏优先级正确；Cargo.lock 同步漏纳已在 3edb444 闭环。
+- [x] **阶段 1 小结**（T2-6 后填）：Java 桥 T2-T6 全绿。骨架→绑定→类型映射→事务→流式/并发逐任务 TDD+评审（T2/T4 各 1 修复轮：DriverShim 假绿修复、浮点截断+fixture 边界）。帧契约、golden fixture（含整数边界/u64/负数行）、per-conn FIFO、cancel 唯一性落地；H2 下 next-cancelled 分支不可达的局限已登记待 T14 达梦腿覆盖。
+- [x] **阶段 2 小结**（T7-11 后填）：Rust 插件 T7-T11 全绿（T9 1 修复轮：判死世代闸竞态——opus 复审逐点核毕）。crate 骨架→编解码/错误映射→SidecarMgr（惰性 spawn/三路管道/世代失效/跨平台假 java 夹具）→vtable 五族胶水+jsint 双端大整数通道→stream 四槽。T10/T11 一次过各挂账 Minor；cancelled 映射取向经评审亲读宿主 ffi.rs 验证为正确方向。
+- [x] **阶段 3 小结**（T12 后填）：H2 真 JVM 冒烟实跑绿，途中抓到并根因修复真 bug×1——spawn 原把 drivers 放上 -cp 且未传 args[0]，真 JVM 路径死路被假 java 腿掩盖（T2 复盘预言的假绿形态兑现）。fixture 纪律（driversDir-only）与 golden 往返（19 列+$oj$ 标记）落地。
+- [x] **阶段 4 小结**（T13 后填）：xtask 归置桥 jar + drivers 目录 README + --check jar 预检 + plugin-matrix/release Java 腿（1 修复轮：setup-java 11→21 因 Gradle 9 wrapper 需 JVM≥17——brief 规格错误，release.yml 步补 shell: bash）。CI yml 语义未经真实 runner 验证为残余不确定性，首轮矩阵跑需留意。
+- [x] **阶段 5 小结**（T14 后填）：达梦远程 e2e 主腿对真实例实跑绿（1.8s 零残留），金仓腿诚实 skip。旗舰裁决：真·在途 cancel 在 DM 8.1.1.49 结构性不可达（三重证据）→R7 信封保持 fake-java 覆盖、严格断言分支就位；err-吞咽分支源码裁决为死代码（Session.streamClose 唯一摘除者）。顺带钉死 DM 空串=AsEmpty、values 组数须同构。另完成方言验证侧记：DM 不支持 INSERT IGNORE/ON DUPLICATE KEY/RETURNING，支持 MERGE INTO/序列/@@IDENTITY——builder 级 dameng 方言是第四种真实形态，列未来工作。
 - [ ] **阶段 6 小结**（T15 后填）：
 
 ## Self-Review 记录
