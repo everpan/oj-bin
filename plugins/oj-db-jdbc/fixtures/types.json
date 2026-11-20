@@ -1,6 +1,10 @@
 [
   {"jdbc_type": "INTEGER", "scale": 0, "input": 42, "expect": 42},
   {"jdbc_type": "BIGINT", "scale": 0, "input": 9007199254740993, "expect": "$oj$i64:9007199254740993"},
+  {"jdbc_type": "BIGINT", "scale": 0, "input": 9007199254740991, "expect": 9007199254740991},
+  {"jdbc_type": "BIGINT", "scale": 0, "input": -9007199254740993, "expect": "$oj$i64:-9007199254740993"},
+  {"jdbc_type": "DECIMAL", "scale": 0, "ddl": "DECIMAL(20,0)", "input": 9223372036854775807, "expect": "$oj$i64:9223372036854775807"},
+  {"jdbc_type": "DECIMAL", "scale": 0, "ddl": "DECIMAL(20,0)", "input": "9223372036854775808", "expect": "$oj$u64:9223372036854775808"},
   {"jdbc_type": "DECIMAL", "scale": 0, "ddl": "DECIMAL(18,0)", "input": 123456789012345678, "expect": "$oj$i64:123456789012345678"},
   {"jdbc_type": "DECIMAL", "scale": 2, "ddl": "DECIMAL(12,2)", "input": "1234.56", "expect": "1234.56"},
   {"jdbc_type": "DOUBLE", "scale": 0, "input": 1.25, "expect": 1.25},
@@ -12,5 +16,6 @@
   {"jdbc_type": "TIMESTAMP_WITH_TIMEZONE", "scale": 0, "ddl": "TIMESTAMP WITH TIME ZONE", "input": "2026-11-20 13:14:15+08:00", "expect": "2026-11-20T13:14:15+08:00"},
   {"jdbc_type": "BLOB", "scale": 0, "input": "$blob:aGVsbG8=", "expect": "$blob:aGVsbG8="},
   {"jdbc_type": "NULL", "scale": 0, "ddl": "INTEGER", "input": null, "expect": null},
-  {"jdbc_type": "CLOB", "scale": 0, "input": "clob text", "expect": "clob text"}
+  {"jdbc_type": "CLOB", "scale": 0, "input": "clob text", "expect": "clob text"},
+  {"jdbc_type": "ARRAY", "scale": 0, "ddl": "DOUBLE ARRAY", "input_sql": "ARRAY[1.5, 2.5]", "expect": [1.5, 2.5]}
 ]

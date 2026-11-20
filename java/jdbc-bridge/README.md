@@ -14,7 +14,8 @@
 Test 工作目录 = 本目录；即仓库根 `plugins/oj-db-jdbc/fixtures/types.json`），与 Rust
 侧（oj-db-jdbc crate）共用同一份类型映射契约，schema
 `[{"jdbc_type","scale","input","expect"}, ...]`，可选 `ddl` 字段给列定义（H2 方言，
-如 `"TIMESTAMP WITH TIME ZONE"`；缺省 = `jdbc_type`）。
+如 `"TIMESTAMP WITH TIME ZONE"`；缺省 = `jdbc_type`）；可选 `input_sql` 字段以 SQL
+字面量代替参数绑定插入（ARRAY 等无法经 JSON 参数真绑的类型）。
 
 运行：`java -jar oj-jdbc-bridge.jar <driversDir>`（driversDir 缺省 `./drivers`，
 目录下全部 `*.jar` 由 URLClassLoader 装载并设为 TCCL）。启动先打印一行

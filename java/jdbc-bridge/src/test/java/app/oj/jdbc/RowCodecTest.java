@@ -56,10 +56,18 @@ class RowCodecTest {
                 st.execute("drop table if exists cell_t");
                 st.execute("create table cell_t(v " + ddl + ")");
             }
-            Object input = entry.isNull("input") ? null : entry.get("input");
-            try (PreparedStatement ps = conn.prepareStatement("insert into cell_t values(?)")) {
-                RowCodec.bind(ps, Arrays.asList(input));
-                assertEquals(1, ps.executeUpdate(), entry.getString("jdbc_type") + " 插入");
+            String inputSql = entry.optString("input_sql", null);
+            if (inputSql != null) {
+                // ARRAY 等无法用 JSON 参数真绑的类型：SQL 字面量插入（fixture 显式声明）
+                try (Statement st = conn.createStatement()) {
+                    assertEquals(1, st.executeUpdate("insert into cell_t values(" + inputSql + ")"));
+                }
+            } else {
+                Object input = entry.isNull("input") ? null : entry.get("input");
+                try (PreparedStatement ps = conn.prepareStatement("insert into cell_t values(?)")) {
+                    RowCodec.bind(ps, Arrays.asList(input));
+                    assertEquals(1, ps.executeUpdate(), entry.getString("jdbc_type") + " 插入");
+                }
             }
             Session s = Session.connect("jdbc:h2:mem:codec", new Properties());
             try {

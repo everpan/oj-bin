@@ -223,6 +223,9 @@ final class RowCodec {
             BigDecimal d = (BigDecimal) o;
             return d.scale() <= 0 ? intFamily(d) : d.toPlainString();
         }
+        if (o instanceof Double || o instanceof Float) {
+            return ((Number) o).doubleValue();
+        }
         if (o instanceof Number) {
             return ((Number) o).longValue();
         }
