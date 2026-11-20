@@ -8,7 +8,6 @@ import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
-import java.util.Base64;
 import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.ConcurrentHashMap;
@@ -46,7 +45,7 @@ final class Session {
         return conn;
     }
 
-    /** 查询：RowCodec 绑参，行 = {列标签: getObject 原始值}；类型分流 T4 定型。 */
+    /** 查询：RowCodec 绑参 + 逐 cell 按 spec §5.4 类型分流。 */
     JSONArray query(String sql, JSONArray params) throws Exception {
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
             RowCodec.bind(ps, params == null ? null : params.toList());
@@ -57,15 +56,7 @@ final class Session {
                 while (rs.next()) {
                     JSONObject row = new JSONObject();
                     for (int i = 1; i <= n; i++) {
-                        Object v = rs.getObject(i);
-                        // byte[]/Blob 先按 cellenv 信封占位出帧，T4 定型完整类型分流
-                        if (v instanceof java.sql.Blob) {
-                            v = ((java.sql.Blob) v).getBinaryStream().readAllBytes();
-                        }
-                        if (v instanceof byte[]) {
-                            v = RowCodec.BLOB_PREFIX + Base64.getEncoder().encodeToString((byte[]) v);
-                        }
-                        row.put(md.getColumnLabel(i), v == null ? JSONObject.NULL : v);
+                        row.put(md.getColumnLabel(i), RowCodec.cell(rs, i, md));
                     }
                     rows.put(row);
                 }

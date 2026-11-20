@@ -37,4 +37,6 @@ tasks.register('shadowJar', Jar) {
 
 tasks.withType(Test).configureEach {
     useJUnitPlatform()
+    // 时区口径契约的一部分（spec §5.1：sidecar 启动必带 -Duser.timezone=UTC）
+    systemProperty 'user.timezone', 'UTC'
 }

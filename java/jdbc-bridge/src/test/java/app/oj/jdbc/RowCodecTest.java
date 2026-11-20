@@ -1,5 +1,6 @@
 package app.oj.jdbc;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -8,6 +9,8 @@ import java.io.BufferedReader;
 import java.io.BufferedWriter;
 import java.io.StringReader;
 import java.io.StringWriter;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
@@ -17,10 +20,12 @@ import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class RowCodecTest {
@@ -35,6 +40,82 @@ class RowCodecTest {
             st.execute("drop table if exists t");
             st.execute("create table t(a int, b varchar, c double, d boolean, e blob)");
         }
+    }
+
+    /** golden fixture 双侧共用契约：Rust 侧（Task 7/10）消费同一份文件。 */
+    private static final Path FIXTURE =
+            Path.of("../../plugins/oj-db-jdbc/fixtures/types.json");
+
+    @Test
+    void mapsResultSetCells() throws Exception {
+        JSONArray fixture = new JSONArray(Files.readString(FIXTURE));
+        for (int k = 0; k < fixture.length(); k++) {
+            JSONObject entry = fixture.getJSONObject(k);
+            String ddl = entry.optString("ddl", entry.getString("jdbc_type"));
+            try (Statement st = conn.createStatement()) {
+                st.execute("drop table if exists cell_t");
+                st.execute("create table cell_t(v " + ddl + ")");
+            }
+            Object input = entry.isNull("input") ? null : entry.get("input");
+            try (PreparedStatement ps = conn.prepareStatement("insert into cell_t values(?)")) {
+                RowCodec.bind(ps, Arrays.asList(input));
+                assertEquals(1, ps.executeUpdate(), entry.getString("jdbc_type") + " 插入");
+            }
+            Session s = Session.connect("jdbc:h2:mem:codec", new Properties());
+            try {
+                JSONArray rows = s.query("select v from cell_t", null);
+                assertEquals(1, rows.length(), entry.getString("jdbc_type"));
+                // JSON 序列化形态对齐比较（Integer/Long、null/JSONObject.NULL 归一）
+                Object actual = rows.getJSONObject(0).get("V");
+                assertEquals(new JSONArray().put(entry.get("expect")).toString(),
+                        new JSONArray().put(actual).toString(),
+                        entry.getString("jdbc_type") + " cell 映射");
+            } finally {
+                s.disconnect();
+            }
+        }
+    }
+
+    @Test
+    void oversizedClobThrowsCellTooLarge() throws Exception {
+        String big = "x".repeat(RowCodec.CELL_MAX_CHARS + 1);
+        try (Statement st = conn.createStatement()) {
+            st.execute("drop table if exists big_t");
+            st.execute("create table big_t(v clob)");
+        }
+        try (PreparedStatement ps = conn.prepareStatement("insert into big_t values(?)")) {
+            RowCodec.bind(ps, List.of(big));
+            assertEquals(1, ps.executeUpdate());
+        }
+        Session s = Session.connect("jdbc:h2:mem:codec", new Properties());
+        try {
+            CellTooLargeException ex = assertThrows(CellTooLargeException.class,
+                    () -> s.query("select v from big_t", null));
+            assertTrue(ex.getMessage().contains("cell_too_large"), "err 帧须含结构化标记");
+        } finally {
+            s.disconnect();
+        }
+    }
+
+    /** T3 遗留负向用例：绑参数目不匹配只回 err 帧，serve 循环不中断。 */
+    @Test
+    void paramCountMismatchReturnsErrAndLoopSurvives() throws Exception {
+        BufferedReader in = new BufferedReader(new StringReader(String.join("\n",
+                "{\"id\":1,\"op\":\"connect\",\"url\":\"jdbc:h2:mem:mismatch\"}",
+                "{\"id\":2,\"op\":\"query\",\"handle\":1,\"sql\":\"select ?\",\"params\":[1,2]}",
+                "{\"id\":3,\"op\":\"query\",\"handle\":1,\"sql\":\"select 1 as x\"}")
+                + "\n"));
+        StringWriter sw = new StringWriter();
+        Bridge.serve(in, new BufferedWriter(sw));
+
+        String[] lines = sw.toString().split("\n");
+        assertEquals(3, lines.length);
+        JSONObject bad = new JSONObject(lines[1]);
+        assertEquals(2, bad.getLong("id"));
+        assertTrue(bad.has("err"), "参数不匹配须回 err 帧: " + bad);
+        JSONObject good = new JSONObject(lines[2]);
+        assertEquals(3, good.getLong("id"));
+        assertTrue(good.has("ok"), "err 帧后循环须存活: " + good);
     }
 
     @Test

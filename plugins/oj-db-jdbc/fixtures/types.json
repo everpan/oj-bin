@@ -1,0 +1,16 @@
+[
+  {"jdbc_type": "INTEGER", "scale": 0, "input": 42, "expect": 42},
+  {"jdbc_type": "BIGINT", "scale": 0, "input": 9007199254740993, "expect": "$oj$i64:9007199254740993"},
+  {"jdbc_type": "DECIMAL", "scale": 0, "ddl": "DECIMAL(18,0)", "input": 123456789012345678, "expect": "$oj$i64:123456789012345678"},
+  {"jdbc_type": "DECIMAL", "scale": 2, "ddl": "DECIMAL(12,2)", "input": "1234.56", "expect": "1234.56"},
+  {"jdbc_type": "DOUBLE", "scale": 0, "input": 1.25, "expect": 1.25},
+  {"jdbc_type": "BOOLEAN", "scale": 0, "input": true, "expect": true},
+  {"jdbc_type": "VARCHAR", "scale": 0, "input": "hello", "expect": "hello"},
+  {"jdbc_type": "DATE", "scale": 0, "input": "2026-11-20", "expect": "2026-11-20T00:00:00Z"},
+  {"jdbc_type": "TIME", "scale": 0, "input": "13:14:15", "expect": "13:14:15"},
+  {"jdbc_type": "TIMESTAMP", "scale": 0, "input": "2026-11-20 13:14:15", "expect": "2026-11-20T13:14:15Z"},
+  {"jdbc_type": "TIMESTAMP_WITH_TIMEZONE", "scale": 0, "ddl": "TIMESTAMP WITH TIME ZONE", "input": "2026-11-20 13:14:15+08:00", "expect": "2026-11-20T13:14:15+08:00"},
+  {"jdbc_type": "BLOB", "scale": 0, "input": "$blob:aGVsbG8=", "expect": "$blob:aGVsbG8="},
+  {"jdbc_type": "NULL", "scale": 0, "ddl": "INTEGER", "input": null, "expect": null},
+  {"jdbc_type": "CLOB", "scale": 0, "input": "clob text", "expect": "clob text"}
+]
