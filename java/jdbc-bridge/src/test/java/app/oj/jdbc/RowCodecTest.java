@@ -144,6 +144,29 @@ class RowCodecTest {
         assertBlobContent(row.get("E"));
     }
 
+    /** 帧契约（u64 通道）："$oj$u64:<十进制>" 字符串参数剥前缀 setBigDecimal 精确承载
+     *  （任意厂商 NUMERIC 列），读回走 intFamily 的 $oj$u64 标记形态。 */
+    @Test
+    void bindsU64MarkerAsBigDecimal() throws Exception {
+        try (Statement st = conn.createStatement()) {
+            st.execute("drop table if exists u64_t");
+            st.execute("create table u64_t(v numeric(20,0))");
+        }
+        try (PreparedStatement ps = conn.prepareStatement("insert into u64_t values(?)")) {
+            RowCodec.bind(ps, List.of("$oj$u64:18446744073709551615"));
+            assertEquals(1, ps.executeUpdate());
+        }
+        Session s = Session.connect("jdbc:h2:mem:codec", new Properties());
+        try {
+            JSONArray rows = s.query("select v from u64_t", null);
+            assertEquals(1, rows.length());
+            assertEquals("$oj$u64:18446744073709551615",
+                    rows.getJSONObject(0).getString("V"), "u64 标记形态读回");
+        } finally {
+            s.disconnect();
+        }
+    }
+
     @Test
     void longStringSwitchesToClob() throws Exception {
         String big = "x".repeat(RowCodec.CLOB_THRESHOLD + 1);

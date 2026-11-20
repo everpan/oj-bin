@@ -16,6 +16,14 @@ name = "sidecar"
 path = "tests/sidecar.rs"
 harness = false
 
+[[test]]
+# T10 vtable 帧序列（spec §5.3）：同款自重现假 java（OJ_FAKE_JAVA=vtable），收发帧
+# 记 OJ_FAKE_LOG，本侧驱动 vtable 槽位后断言帧序列 / jsint 通道 / 在途 close /
+# 崩溃世代失效。单场景单例（OnceLock SIDECAR 一个进程只注入一次）。
+name = "vtable"
+path = "tests/vtable.rs"
+harness = false
+
 [dependencies]
 oj-plugin-ffi = { path = "../../oj-plugin-ffi" }
 serde_json = "1"

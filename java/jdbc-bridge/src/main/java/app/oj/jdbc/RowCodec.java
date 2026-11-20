@@ -32,6 +32,13 @@ final class RowCodec {
     static final int CELL_MAX_CHARS = 16 * 1024 * 1024;
     static final int CELL_MAX_BYTES = 16 * 1024 * 1024;
     static final String BLOB_PREFIX = "$blob:";
+    /**
+     * 帧契约（u64 通道）：Rust 侧把 u64 值（jsint {@code $oj$u64} 标记，或 JS 直传的
+     * 超 i64 裸整数——org.json 会解析成 BigInteger，setLong 静默回绕）预字符串化为
+     * "{@code $oj$u64:<十进制>}" 形态过协议；bindString 剥前缀按整数字面量
+     * setBigDecimal 精确承载（任意厂商 NUMERIC/DECIMAL/BIGINT 列，不经 setLong）。
+     */
+    static final String U64_PREFIX = "$oj$u64:";
 
     /** f64 安全整数边界：|v|≤2^53-1 直接出 JSON number，与宿主 JS number 语义对齐 */
     private static final BigInteger MAX_SAFE_INT = new BigInteger("9007199254740991");
@@ -54,8 +61,12 @@ final class RowCodec {
             ps.setNull(i, Types.VARCHAR);
         } else if (v instanceof Boolean) {
             ps.setBoolean(i, (Boolean) v);
-        } else if (v instanceof Double || v instanceof Float || v instanceof java.math.BigDecimal) {
+        } else if (v instanceof Double || v instanceof Float) {
             ps.setDouble(i, ((Number) v).doubleValue());
+        } else if (v instanceof BigDecimal) {
+            // org.json 把 JSON 小数字面量解析成 BigDecimal：精确承载（setBigDecimal），
+            // 不降级 setDouble（精度挂账对齐）；整数字面量不走这里（Integer/Long 形态）。
+            ps.setBigDecimal(i, (BigDecimal) v);
         } else if (v instanceof Number) {
             ps.setLong(i, ((Number) v).longValue());
         } else if (v instanceof String) {
@@ -68,7 +79,10 @@ final class RowCodec {
     }
 
     private static void bindString(PreparedStatement ps, int i, String s) throws Exception {
-        if (s.startsWith(BLOB_PREFIX)) {
+        if (s.startsWith(U64_PREFIX)) {
+            // 帧契约（u64 通道）：剥前缀按整数字面量 BigDecimal 精确绑，不经 setLong。
+            ps.setBigDecimal(i, new BigDecimal(s.substring(U64_PREFIX.length())));
+        } else if (s.startsWith(BLOB_PREFIX)) {
             ps.setBytes(i, Base64.getDecoder().decode(s.substring(BLOB_PREFIX.length())));
         } else if (s.length() > CLOB_THRESHOLD) {
             ps.setClob(i, new StringReader(s));

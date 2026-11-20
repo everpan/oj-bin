@@ -251,6 +251,25 @@ impl SidecarMgr {
             .collect()
     }
 
+    /// 非阻塞 disconnect（T10 close 槽）：只投帧不等响应。不注册 pending——调用方
+    /// 不等待，响应帧由 dispatch 查表落空静默丢弃；Java per-conn FIFO 队列保证
+    /// disconnect 落在在途 op 之后（Session.disconnect 先 drain 再关连接）。
+    pub async fn disconnect_nowait(&self, handle: u64) {
+        let id = self.shared.next_req.fetch_add(1, Ordering::SeqCst) + 1;
+        let params = serde_json::json!({ "handle": handle });
+        let line = codec::encode_request(
+            id,
+            "disconnect",
+            params.as_object().expect("json! 字面量恒为对象"),
+        );
+        let g = self.shared.inner.lock().await;
+        // sidecar 已死/未 spawn：连接已随 JVM（或从未建立的进程）消亡，无可投递。
+        let Some(st) = g.as_ref() else {
+            return;
+        };
+        let _ = st.tx.send(line);
+    }
+
     /// 优雅关闭：关 stdin 写通道 → 写任务退出、stdin EOF → JVM 有序关闭全部 Connection
     /// 并退出（spec §5.1 EOF 契约）→ 等待 child 退出并报告状态。幂等。
     /// 等待有界：JVM 拒绝退出时升级 kill（进程杀不掉也不挂调用方）。

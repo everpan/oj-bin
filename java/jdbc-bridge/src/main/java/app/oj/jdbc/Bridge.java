@@ -18,6 +18,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /**
  * NDJSON 桥：stdin 读请求帧，stdout 写响应帧。
  * 请求 {"id":u64,"op":"...",...}；响应 {"id":u64,"ok":{...}} / {"id":u64,"err":"..."}。
+ * 帧契约（u64 通道）：params 中以 "$oj$u64:<十进制>" 字符串形态出现的值 = u64 整数
+ * （Rust 侧 jsint 标记 / 超 i64 裸整数预字符串化），RowCodec.bindString 剥前缀按
+ * 整数字面量 setBigDecimal 精确承载。
  */
 public final class Bridge {
     static final String HELLO = "{\"hello\":{\"proto\":1,\"bridge\":\"0.1.0\"}}";
