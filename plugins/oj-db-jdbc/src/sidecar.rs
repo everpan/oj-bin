@@ -47,9 +47,9 @@ pub struct SidecarCfg {
     pub java_bin: Option<String>,
     /// 附加 JVM 参数（如 `-Xmx512m`）。UTC/file.encoding 由本模块强制前置，不在这里给。
     pub java_opts: Vec<String>,
-    /// bridge jar（classpath 第一項）。dladdr 缺省定位是 T10 的职责；T9 只透传显式值。
+    /// bridge jar（-cp 唯一项）。dladdr 缺省定位是 T10 的职责；T9 只透传显式值。
     pub bridge_jar: PathBuf,
-    /// JDBC 驱动目录（classpath `<dir>/*`）。
+    /// JDBC 驱动目录：Bridge args[0]，经 URLClassLoader 装载（不进 -cp，见 spawn）。
     pub drivers_dir: PathBuf,
     /// hello 行有界等待上限。
     pub hello_timeout: Duration,
@@ -307,14 +307,10 @@ impl SidecarMgr {
         // spawn 世代：单调不复用——判死比对依据（重启后迟到的旧判死不得误伤新 JVM）。
         let epoch = self.shared.next_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         let java = resolve_java(cfg)?;
-        let sep = if cfg!(windows) { ";" } else { ":" };
-        // classpath 升级路径（jar 极多逼近 Windows ~32KB 命令行上限）：Java 9+ @argfile，v1 不做。
-        let cp = format!(
-            "{}{}{}/*",
-            cfg.bridge_jar.display(),
-            sep,
-            cfg.drivers_dir.display()
-        );
+        // 驱动仅放 driversDir、不经 -cp：否则 DriverManager 走系统类加载器 ServiceLoader
+        // 注册真驱动，DriverShim/UCL 路径被旁路成假绿（T2 复盘裁决：真进程腿保持
+        // driversDir-only 形态）。Bridge 经 args[0] 拿驱动目录。
+        let cp = cfg.bridge_jar.display().to_string();
         let mut cmd = Command::new(java);
         cmd.arg("-Duser.timezone=UTC") // §5.4 时区口径契约，缺省必带
             .arg("-Dfile.encoding=UTF-8")
@@ -322,6 +318,7 @@ impl SidecarMgr {
             .arg("-cp")
             .arg(cp)
             .arg("app.oj.jdbc.Bridge")
+            .arg(&cfg.drivers_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
