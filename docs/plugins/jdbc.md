@@ -186,6 +186,7 @@ oj-db-mysql：
 | `42xxx` | syntax | false | keep |
 | `53xxx` | capacity | true | keep |
 | `57xxx` | cancelled | false | keep |
+| `0Axxx` | unsupported | false | keep |
 | 其他/厂商码/NULL | internal | false | keep |
 
 达梦/金仓部分错误只给厂商码或 null SQLState——拿不到标准类时**绝不硬套 MySQL

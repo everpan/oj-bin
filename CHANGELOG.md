@@ -47,7 +47,8 @@
   标记与 mysql 插件对齐）；null → `setNull(Types.VARCHAR)`（Oracle/达梦拒
   `Types.NULL`）；TIME 单列 `getTime`；TZ 列 `OffsetDateTime` 保 offset；
   BLOB → `"$blob:<base64>"` cellenv 信封；LOB 单列 16 MiB 上限结构化报错。
-- **错误面**：SQLState class 表镜像 oj-db-mysql（08/23/40/42/53/57），厂商码/
+- **错误面**：SQLState class 表镜像 oj-db-mysql（08/23/40/42/53/57 + 0A→
+  unsupported），厂商码/
   NULL SQLState 绝不硬套 MySQL 表后静默误判 retryable——直接 internal，
   `vendor_code` 原样透传；连接串凭据 `://***@` 脱敏；connect 失败附 stderr
   尾部 20 行。
