@@ -17,7 +17,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-class BridgeTest {
+public class BridgeTest {
 
     @BeforeEach
     void resetSessions() {
@@ -124,6 +124,107 @@ class BridgeTest {
         JSONObject err = new JSONObject(lines[1]);
         assertEquals(2, err.getLong("id"));
         assertTrue(err.has("err"), "expect err frame: " + err);
+    }
+
+    @Test
+    void streamBatchesAt100() throws Exception {
+        java.util.List<JSONObject> f = serveFrames(
+                "{\"id\":1,\"op\":\"connect\",\"url\":\"jdbc:h2:mem:s100\"}",
+                "{\"id\":2,\"op\":\"exec\",\"handle\":1,\"sql\":\"create table t (id int)\"}",
+                "{\"id\":3,\"op\":\"exec\",\"handle\":1,\"sql\":\"insert into t select x from system_range(1,250)\"}",
+                "{\"id\":4,\"op\":\"stream_open\",\"handle\":1,\"sql\":\"select id from t\"}",
+                "{\"id\":5,\"op\":\"stream_next\",\"handle\":1,\"stream_id\":1}",
+                "{\"id\":6,\"op\":\"stream_next\",\"handle\":1,\"stream_id\":1}",
+                "{\"id\":7,\"op\":\"stream_next\",\"handle\":1,\"stream_id\":1}",
+                "{\"id\":8,\"op\":\"stream_next\",\"handle\":1,\"stream_id\":1}",
+                "{\"id\":9,\"op\":\"stream_close\",\"handle\":1,\"stream_id\":1}");
+        assertEquals(9, f.size());
+        assertEquals(1, f.get(3).getJSONObject("ok").getLong("stream_id"));
+        assertEquals(100, f.get(4).getJSONObject("ok").getJSONArray("rows").length());
+        assertEquals(100, f.get(5).getJSONObject("ok").getJSONArray("rows").length());
+        assertEquals(50, f.get(6).getJSONObject("ok").getJSONArray("rows").length());
+        assertTrue(f.get(7).getJSONObject("ok").getBoolean("done"));
+        assertTrue(f.get(8).has("ok"), "expect ok frame: " + f.get(8));
+    }
+
+    @Test
+    void cancelProducesExactlyOneResponse() throws Exception {
+        java.util.List<JSONObject> f = serveFrames(
+                "{\"id\":1,\"op\":\"connect\",\"url\":\"jdbc:h2:mem:cancel\"}",
+                "{\"id\":2,\"op\":\"exec\",\"handle\":1,\"sql\":\"create alias sleep_if"
+                        + " for \\\"app.oj.jdbc.BridgeTest.sleepIf(boolean, int)\\\"\"}",
+                // H2 embedded 在 executeQuery 即全量求值（生产驱动的 setFetchSize 流式下慢在
+                // next），故慢查询在途窗口落在 stream_open；cancel 须能取消执行中的 open。
+                // H2 在扫描循环里高频检查 cancel 标志：2M 行扫描 + 第 1M 行 sleep 2s，
+                // cancel 必然落在在途窗口内并在睡眠返回后的检查点中止（实测 3 行小查询
+                // 无检查点，跑完才被 cancel，测不到中止）。
+                "{\"id\":3,\"op\":\"stream_open\",\"handle\":1,\"sql\":\"select x as id"
+                        + " from system_range(1,2000000) where sleep_if(mod(x,1000000)=0, 2000)\"}",
+                "{\"id\":4,\"op\":\"stream_cancel\",\"handle\":1,\"stream_id\":1}",
+                "{\"id\":5,\"op\":\"stream_close\",\"handle\":1,\"stream_id\":1}");
+        assertEquals(5, f.size(), "每请求恰好一帧: " + f);
+        java.util.Map<Long, JSONObject> byId = new java.util.HashMap<>();
+        for (JSONObject fr : f) {
+            long fid = fr.getLong("id");
+            assertFalse(byId.containsKey(fid), "同一 id 恰好一帧（claimed 唯一性）: " + f);
+            byId.put(fid, fr);
+        }
+        // cancel 帧绕过队列，可能与 open 帧乱序——按 id 匹配，不按位置
+        JSONObject open = byId.get(3L);
+        assertEquals("cancelled", open.getJSONObject("ok").getString("error"));
+        assertTrue(byId.get(4L).has("ok") || byId.get(4L).has("err"), "cancel 帧须唯一: " + f);
+        assertTrue(byId.get(5L).has("ok") || byId.get(5L).has("err"), "close 在取消后须单帧收尾: " + f);
+    }
+
+    @Test
+    void sameConnOpsAreOrdered() throws Exception {
+        java.util.List<JSONObject> f = serveFrames(
+                "{\"id\":1,\"op\":\"connect\",\"url\":\"jdbc:h2:mem:order\"}",
+                "{\"id\":2,\"op\":\"exec\",\"handle\":1,\"sql\":\"create alias sleep_if"
+                        + " for \\\"app.oj.jdbc.BridgeTest.sleepIf(boolean, int)\\\"\"}",
+                // 慢查询 1.5s：若并发执行，后面的快查询帧会先落地；FIFO 队列下响应序==请求序
+                "{\"id\":3,\"op\":\"query\",\"handle\":1,\"sql\":\"select x from"
+                        + " system_range(1,1) where sleep_if(true, 1500)\"}",
+                "{\"id\":4,\"op\":\"query\",\"handle\":1,\"sql\":\"select 1 as v\"}",
+                "{\"id\":5,\"op\":\"query\",\"handle\":1,\"sql\":\"select 2 as v\"}");
+        assertEquals(5, f.size());
+        for (int i = 0; i < 5; i++) {
+            assertEquals(i + 1, f.get(i).getLong("id"), "响应序须与请求序一致: " + f);
+        }
+    }
+
+    @Test
+    void featureNotSupportedErrHasUnsupportedPrefix() {
+        assertEquals("unsupported: no cubes",
+                Bridge.errMsg(new java.sql.SQLFeatureNotSupportedException("no cubes")));
+        assertEquals("boom", Bridge.errMsg(new java.sql.SQLException("boom")));
+        assertEquals("IllegalStateException", Bridge.errMsg(new IllegalStateException()));
+    }
+
+    /** H2 CREATE ALIAS 反射入口：cond 为真则睡眠 ms（cancel 测试用慢查询），恒返回 true。 */
+    @SuppressWarnings("unused")
+    public static boolean sleepIf(boolean cond, int ms) {
+        if (cond) {
+            try {
+                Thread.sleep(ms);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        return true;
+    }
+
+    private static java.util.List<JSONObject> serveFrames(String... reqs) throws Exception {
+        BufferedReader in = new BufferedReader(new StringReader(String.join("\n", reqs) + "\n"));
+        StringWriter sw = new StringWriter();
+        Bridge.serve(in, new BufferedWriter(sw));
+        java.util.List<JSONObject> frames = new java.util.ArrayList<>();
+        for (String l : sw.toString().split("\n")) {
+            if (!l.isEmpty()) {
+                frames.add(new JSONObject(l));
+            }
+        }
+        return frames;
     }
 
     @Test

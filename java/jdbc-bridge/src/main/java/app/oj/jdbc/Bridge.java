@@ -11,7 +11,9 @@ import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Paths;
+import java.sql.SQLFeatureNotSupportedException;
 import java.util.Properties;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * NDJSON 桥：stdin 读请求帧，stdout 写响应帧。
@@ -36,27 +38,86 @@ public final class Bridge {
         Session.shutdownAll();
     }
 
-    /** 逐行读请求直至 EOF；任何单请求异常（含 Error）只回 err 帧，不杀循环。 */
+    /** 逐行读请求直至 EOF；任何单请求异常（含 Error）只回 err 帧，不杀循环。
+     *  除 connect/disconnect（dispatcher 线程执行）与 stream_cancel（独立线程执行 cancel，
+     *  唯一绕过 per-conn 队列者）外，请求按 handle 投递到对应 Session 的单线程队列严格 FIFO。 */
     static void serve(BufferedReader in, BufferedWriter out) throws IOException {
+        Object lock = new Object(); // 多 Session 执行线程并发写帧的互斥（不同 conn 的帧可交错）
         String line;
         while ((line = in.readLine()) != null) {
             if (line.isEmpty()) {
                 continue;
             }
             long id = -1; // 帧 id 不可解析时的哨兵（契约 id:u64 之外的容错值）
-            JSONObject resp;
             try {
                 JSONObject req = new JSONObject(line);
                 id = req.optLong("id", -1);
-                resp = new JSONObject().put("id", id).put("ok", dispatch(req));
+                String op = req.optString("op");
+                if ("connect".equals(op) || "disconnect".equals(op)) {
+                    writeFrame(out, lock, null, new JSONObject().put("id", id).put("ok", dispatch(req)));
+                    continue;
+                }
+                Session s = Session.byHandle(req.optInt("handle", -1));
+                if (s == null) {
+                    writeFrame(out, lock, null,
+                            new JSONObject().put("id", id).put("err", "unknown handle: " + req.optInt("handle", -1)));
+                    continue;
+                }
+                if ("stream_cancel".equals(op)) {
+                    dispatchStreamCancel(req, s, out, lock, id);
+                    continue;
+                }
+                final long fid = id;
+                s.submit(() -> {
+                    JSONObject resp;
+                    try {
+                        resp = new JSONObject().put("id", fid).put("ok", dispatch(req));
+                    } catch (Throwable t) {
+                        resp = new JSONObject().put("id", fid).put("err", errMsg(t));
+                    }
+                    writeFrame(out, lock, null, resp);
+                });
             } catch (Throwable t) {
-                String msg = t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName();
-                resp = new JSONObject().put("id", id).put("err", msg);
+                writeFrame(out, lock, null, new JSONObject().put("id", id).put("err", errMsg(t)));
             }
-            out.write(resp.toString());
-            out.newLine();
-            out.flush();
         }
+        Session.drainAll(); // EOF：等在途任务收尾，响应全部落盘后再返回
+    }
+
+    /** cancel 的 Statement.cancel() 由独立线程执行；cancel 线程与 dispatcher 路径
+     *  抢同一 id 的响应帧，claimed 先赢者写，败者丢弃。 */
+    private static void dispatchStreamCancel(JSONObject req, Session s, BufferedWriter out, Object lock, long id) {
+        AtomicBoolean claimed = new AtomicBoolean();
+        try {
+            s.streamCancel(req.getLong("stream_id"),
+                    e -> writeFrame(out, lock, claimed, new JSONObject().put("id", id).put("err", errMsg(e))));
+            writeFrame(out, lock, claimed, new JSONObject().put("id", id).put("ok", new JSONObject()));
+        } catch (Throwable t) {
+            writeFrame(out, lock, claimed, new JSONObject().put("id", id).put("err", errMsg(t)));
+        }
+    }
+
+    private static void writeFrame(BufferedWriter out, Object lock, AtomicBoolean claimed, JSONObject resp) {
+        if (claimed != null && !claimed.compareAndSet(false, true)) {
+            return; // 败者丢弃：cancel 响应唯一性
+        }
+        synchronized (lock) {
+            try {
+                out.write(resp.toString());
+                out.newLine();
+                out.flush();
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        }
+    }
+
+    static String errMsg(Throwable t) {
+        String msg = t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName();
+        if (t instanceof SQLFeatureNotSupportedException) {
+            msg = "unsupported: " + msg; // 驱动缺实现时结构化可辨（spec §5.3）
+        }
+        return msg;
     }
 
     private static Object dispatch(JSONObject req) throws Exception {
@@ -132,6 +193,28 @@ public final class Bridge {
                 } else {
                     s.rollback(txId);
                 }
+                return new JSONObject();
+            }
+            case "stream_open": {
+                Session s = Session.byHandle(req.getInt("handle"));
+                if (s == null) {
+                    throw new IllegalStateException("unknown handle: " + req.getInt("handle"));
+                }
+                return s.streamOpen(req.getString("sql"), req.optJSONArray("params"));
+            }
+            case "stream_next": {
+                Session s = Session.byHandle(req.getInt("handle"));
+                if (s == null) {
+                    throw new IllegalStateException("unknown handle: " + req.getInt("handle"));
+                }
+                return s.streamNext(req.getLong("stream_id"));
+            }
+            case "stream_close": {
+                Session s = Session.byHandle(req.getInt("handle"));
+                if (s == null) {
+                    throw new IllegalStateException("unknown handle: " + req.getInt("handle"));
+                }
+                s.streamClose(req.getLong("stream_id"));
                 return new JSONObject();
             }
             default:
