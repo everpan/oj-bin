@@ -53,7 +53,7 @@
 | 2 Rust 插件 | T11 | vtable 胶水：stream 四槽 | ✅ |
 | 3 联调 | T12 | H2 真实 JVM 冒烟（env-gated jar） | ✅ |
 | 4 构建/CI | T13 | xtask 归置 + plugin-matrix Java 腿 | ✅ |
-| 5 e2e | T14 | 达梦远程主腿 + 金仓可选腿 | ⬜ |
+| 5 e2e | T14 | 达梦远程主腿 + 金仓可选腿 | ✅ |
 | 6 文档/发版 | T15 | jdbc.md + SKILL 陷阱 + devkit 四件 + sample + CHANGELOG 定稿 | ⬜ |
 
 ---
