@@ -5,7 +5,16 @@ edition = "2024"
 description = "db 轴通用 JDBC 插件：Java sidecar 桥接任意 JDBC 驱动（spec §5）"
 
 [lib]
-crate-type = ["cdylib"]
+# cdylib = 插件产物；rlib = sidecar 集成测试需链接本 crate（sidecar/dsn/codec/errmap）。
+crate-type = ["cdylib", "rlib"]
+
+[[test]]
+# 假 java 夹具（spec §6）：harness=false 自有 main——env `OJ_FAKE_JAVA=<场景>` 时
+# 本二进制自重现为假 java（spawn current_exe()，跨平台含 Windows CI）；
+# 否则顺序跑 SidecarMgr 场景。不用 shell 脚本。
+name = "sidecar"
+path = "tests/sidecar.rs"
+harness = false
 
 [dependencies]
 oj-plugin-ffi = { path = "../../oj-plugin-ffi" }
@@ -17,6 +26,7 @@ tokio = { version = "1", features = [
     "process",
     "io-util",
     "time",
+    "macros",
 ] }
 # T10：dladdr 定位插件 .dylib → 缺省 drivers_dir = <插件目录>/jdbc/drivers。
 libc = "0.2"
