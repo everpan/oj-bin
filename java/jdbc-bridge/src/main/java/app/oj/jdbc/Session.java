@@ -26,9 +26,9 @@ final class Session {
             DriverLoader.ensureDriver((String) driverClass);
         }
         Connection conn = DriverManager.getConnection(url, info);
-        int handle = NEXT.getAndIncrement();
-        REGISTRY.put(handle, new Session(handle, conn));
-        return REGISTRY.get(handle);
+        Session s = new Session(NEXT.getAndIncrement(), conn);
+        REGISTRY.put(s.handle, s);
+        return s;
     }
 
     static Session byHandle(int handle) {

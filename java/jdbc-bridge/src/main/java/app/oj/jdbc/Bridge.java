@@ -43,7 +43,7 @@ public final class Bridge {
             if (line.isEmpty()) {
                 continue;
             }
-            long id = -1;
+            long id = -1; // 帧 id 不可解析时的哨兵（契约 id:u64 之外的容错值）
             JSONObject resp;
             try {
                 JSONObject req = new JSONObject(line);
