@@ -353,7 +353,7 @@ extern "C" fn schemes() -> RVec<RString> {
     )
 }
 
-extern "C" fn describe() -> RString {
+pub extern "C" fn describe() -> RString {
     // `id_two_step` 而非 `id_returning`：id 组恰好一枚（宿主 caps_from_json 已核实），
     // 且 getGeneratedKeys 各厂支持参差（Oracle 历来不可靠），未逐厂验证前不声明 returning。
     RString::from(
@@ -549,8 +549,8 @@ pub async fn __test_shutdown() -> Result<(), String> {
 #[doc(hidden)]
 pub mod vt {
     pub use super::{
-        begin, close, connect, exec, query, stream_cancel, stream_close, stream_next, stream_open,
-        tx_commit, tx_exec, tx_query, tx_rollback,
+        begin, close, connect, describe, exec, query, stream_cancel, stream_close, stream_next,
+        stream_open, tx_commit, tx_exec, tx_query, tx_rollback,
     };
 }
 
