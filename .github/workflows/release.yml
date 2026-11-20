@@ -171,6 +171,20 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      # 见 plugin-matrix.yml 同名步骤：`cargo xtask build` 归置 oj-db-jdbc 桥 jar 是发行
+      # 门禁，缺 jar 即失败——发版打包必须含桥 jar，故三平台腿都先构建它（不跑 h2_smoke：
+      # 未注入 OJ_JDBC_*_JAR，该腿诚实 skip）。
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '11'
+          cache: gradle
+          cache-dependency-path: java/jdbc-bridge/**
+
+      - name: build jdbc bridge jar (oj-db-jdbc sidecar)
+        working-directory: java/jdbc-bridge
+        run: ./gradlew --no-daemon shadowJar
+
       # Windows 上 rdkafka-sys（oj-bus-kafka 的依赖）经 cmake 从源码编 librdkafka。
       # 镜像只装 VS2026，cmake 3.29 不认识其 "Visual Studio 18 2026" 生成器；若改钉
       # VS2022 又找不到实例。故改用 NMake Makefiles 生成器（与 VS 版本解耦），并由

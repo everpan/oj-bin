@@ -192,6 +192,36 @@ jobs:
       # - run: rustup target add x86_64-unknown-linux-musl
       #   且构建以 `cargo build -p oj-<name> --release --target x86_64-unknown-linux-musl`。
 
+      # oj-db-jdbc 发行门禁：`cargo xtask build` 归置桥 jar 时要求
+      # java/jdbc-bridge/build/libs/oj-jdbc-bridge.jar 已存在（缺即失败并提示先 shadowJar）。
+      # 字节码 --release 11（见 java/jdbc-bridge/build.gradle），故钉 Java 11；
+      # `cache: gradle` 缓 ~/.gradle 省 wrapper/依赖下载。
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '11'
+          cache: gradle
+          cache-dependency-path: java/jdbc-bridge/**
+
+      - name: build jdbc bridge jar (oj-db-jdbc sidecar)
+        working-directory: java/jdbc-bridge
+        shell: bash
+        run: |
+          ./gradlew --no-daemon shadowJar
+          # h2_smoke（plugins/oj-db-jdbc/tests/h2_smoke.rs）env-gated 读取。
+          echo "OJ_JDBC_BRIDGE_JAR=$GITHUB_WORKSPACE/java/jdbc-bridge/build/libs/oj-jdbc-bridge.jar" >> "$GITHUB_ENV"
+
+      # 尽力而为拉 H2 驱动 jar（Maven 中央）：成功则 h2_smoke 真跑，网络失败降级为
+      # skip（env 缺失即诚实 skip，不挡矩阵）。continue-on-error 只兜下载失败。
+      - name: fetch H2 driver jar for h2_smoke (best-effort)
+        id: h2jar
+        continue-on-error: true
+        shell: bash
+        run: |
+          h2="$RUNNER_TEMP/h2-2.3.232.jar"
+          curl -fsSL -o "$h2" "https://repo1.maven.org/maven2/com/h2database/h2/2.3.232/h2-2.3.232.jar"
+          echo "OJ_JDBC_H2_JAR=$h2" >> "$GITHUB_ENV"
+
       # 先构建并归置全部插件，再跑 workspace 测试：oj/tests/oidc_e2e.rs 等 e2e 在
       # 运行期从 bin/plugins/<triple>/ dlopen oj-auth——fresh checkout 上若先跑测试，
       # 装配层会 fail-fast（"config declares [auth] but no auth plugin loaded"）。
@@ -278,6 +308,19 @@ jobs:
       - name: typecheck — tsc (src + tests + unit)
         working-directory: sample/unit
         run: npm run typecheck
+
+      # 见 matrix job 同名步骤：`cargo xtask build` 归置 oj-db-jdbc 桥 jar 是发行门禁，
+      # 缺 jar 即失败——本 job 也跑 xtask build，故同样先构建桥 jar（不跑 h2_smoke）。
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '11'
+          cache: gradle
+          cache-dependency-path: java/jdbc-bridge/**
+
+      - name: build jdbc bridge jar (oj-db-jdbc sidecar)
+        working-directory: java/jdbc-bridge
+        run: ./gradlew --no-daemon shadowJar
 
       # 必须经 workspace 构建：`cargo build -p oj` 与 `--workspace` 的 feature 归一化不同，
       # 会让 rusty_v8 按不同 fingerprint 重编并找不到静态库（见 tools/xtask/src/main.rs:95）。

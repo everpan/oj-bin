@@ -171,8 +171,60 @@ fn build_and_copy(name: &str) -> Result<(), String> {
         .join(build_artifact_name(name));
     let dst = dst_dir.join(plugin_file_name(name));
     copy_bin(&src, &dst)?;
+    if name == "db-jdbc" {
+        stage_jdbc_bridge(&dst_dir)?;
+    }
     Ok(())
 }
+
+/// oj-db-jdbc 的桥 jar 源（gradle shadowJar 产物）。
+fn jdbc_bridge_src_jar() -> PathBuf {
+    root()
+        .join("java")
+        .join("jdbc-bridge")
+        .join("build")
+        .join("libs")
+        .join("oj-jdbc-bridge.jar")
+}
+
+/// 归置 oj-db-jdbc 的 Java 桥：bridge jar -> `<dst>/jdbc/`，并备好 `jdbc/drivers/` 空投
+/// 目录（T12 spawn 契约：jar 独占 `-cp`，`drivers_dir` 以 args[0] 透传给 Bridge，由
+/// Bridge 的 URLClassLoader 加载驱动——驱动 jar 不进 -cp）。缺 jar 是发行门禁失败，
+/// 清晰报错指向 gradlew 构建，不做静默跳过。
+fn stage_jdbc_bridge(dst_dir: &Path) -> Result<(), String> {
+    stage_jdbc_bridge_at(&jdbc_bridge_src_jar(), dst_dir)
+}
+
+fn stage_jdbc_bridge_at(src: &Path, dst_dir: &Path) -> Result<(), String> {
+    if !src.is_file() {
+        return Err(format!(
+            "oj-db-jdbc 需要 Java 桥 jar：{} 不存在——先 `cd java/jdbc-bridge && ./gradlew shadowJar`",
+            src.display()
+        ));
+    }
+    let jdbc_dir = dst_dir.join("jdbc");
+    let drivers_dir = jdbc_dir.join("drivers");
+    fs::create_dir_all(&drivers_dir)
+        .map_err(|e| format!("mkdir {}: {e}", drivers_dir.display()))?;
+    copy_bin(src, &jdbc_dir.join("oj-jdbc-bridge.jar"))?;
+    let readme = drivers_dir.join("README.md");
+    if !readme.exists() {
+        fs::write(&readme, JDBC_DRIVERS_README)
+            .map_err(|e| format!("write {}: {e}", readme.display()))?;
+    }
+    Ok(())
+}
+
+const JDBC_DRIVERS_README: &str = "\
+# JDBC drivers（drop-in）
+
+把目标数据库的 JDBC 驱动 jar 放进本目录（如达梦 DmJdbcDriver、MySQL
+mysql-connector-j）。插件配置里 `drivers_dir` 指向本目录；桥进程经独立
+URLClassLoader 加载驱动，驱动 jar 不要放进 -cp。
+
+桥 jar 本体与构建方式见 `java/jdbc-bridge/README.md`
+（`cd java/jdbc-bridge && ./gradlew shadowJar`）。
+";
 
 /// 递归拷贝目录（std 的 `fs::copy_dir_all` 尚未稳定，此处最小实现）。
 fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -278,6 +330,13 @@ fn write_plugins_lock() -> Result<(), String> {
 /// 服务器装配层做，此处只验证可加载性）。
 fn check(name: &str) -> Result<(), String> {
     let dir = bin_dir().join("plugins").join(host_triple());
+    // db-jdbc 预检：除 cdylib 可加载性外，Java 桥 jar 必须已归置（与 build 同一落点）。
+    if name == "db-jdbc" && !dir.join("jdbc").join("oj-jdbc-bridge.jar").is_file() {
+        return Err(format!(
+            "桥 jar 未归置：{} 不存在——先 `cargo xtask plugin db-jdbc`（其内部要求 java/jdbc-bridge 已 `./gradlew shadowJar`）",
+            dir.join("jdbc").join("oj-jdbc-bridge.jar").display()
+        ));
+    }
     let manifest = vec![PluginManifestEntry {
         name: name.to_string(),
         semver_pin: None,
@@ -758,5 +817,26 @@ mod tests {
         // 版本未命中 → None。
         assert_eq!(find_crate_dir(&home, "fake-crate", "0.0.0"), None);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn given_bridge_jar_when_staged_then_jar_drivers_dir_and_readme_placed() {
+        let base = std::env::temp_dir().join(format!("oj-xtask-jdbc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("oj-jdbc-bridge.jar");
+        let dst = base.join("plugins/triple");
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::write(&src, "jar-bytes").unwrap();
+        stage_jdbc_bridge_at(&src, &dst).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dst.join("jdbc/oj-jdbc-bridge.jar")).unwrap(),
+            "jar-bytes"
+        );
+        assert!(dst.join("jdbc/drivers").is_dir());
+        assert!(dst.join("jdbc/drivers/README.md").is_file());
+        // 缺 jar：清晰报错并指向 gradlew 构建（发行门禁，不静默跳过）。
+        let e = stage_jdbc_bridge_at(&base.join("no-such.jar"), &dst).unwrap_err();
+        assert!(e.contains("gradlew"), "{e}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
