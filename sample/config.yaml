@@ -72,6 +72,11 @@ db:
   # 多库混用（v0.2）：mysql/postgres DSN 原样透传，按名 DB("name") 取用。
   # analytics: "mysql://user:pass@127.0.0.1:3306/app"
   # warehouse: "postgres://127.0.0.1:5432/app"
+  # 达梦（oj-db-jdbc 插件，env-gated）：装好 bin/plugins/<triple>/oj-db-jdbc 插件
+  # + 驱动 jar 进其 jdbc/drivers/ 后，取消注释即可（样例见 src/dm/query/）。
+  # 凭据建议 oj secret seal 成 ENC[...]；jdbc 方言是未知方言，db.table 构造器被门控，
+  # 一律走 DB("dm").query 原始 SQL + 绑参。
+  # dm: 'jdbc:{"url":"jdbc:dm://127.0.0.1:5237","user":"SYSDBA","password":"SYSDBA001"}'
 
 # db_query:   # v0.1.20：构造器查询的 LIMIT 策略（仅顶层查询；硬顶 100000）
 #   default_limit: 100   # 未显式 .limit() 时的隐式上限（默认 100；0 或 >max_limit 启动报错）
