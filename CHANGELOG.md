@@ -16,7 +16,7 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
-## v0.1.141（2026-11-20，未打标签）
+## v0.1.141（2026-11-20）
 
 **泛型 JDBC 插件 `oj-db-jdbc`——`jdbc:` DSN 接达梦/金仓/Oracle/H2 等企业库**，
 宿主唯一改动是一行 `db.import` 门控补漏（`require_known_dialect`，此前未知方言
