@@ -16,6 +16,12 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## 下一版（未发布，v0.1.141 开发中）
+
+**泛型 JDBC 插件 `oj-db-jdbc`（规划中）**——参考 dbx 的 sidecar 适配，Java 桥
+（NDJSON over stdio）+ cdylib 插件，drop-in 驱动目录接入达梦/金仓/Oracle 等企业库；
+宿主仅一处 `db.import` 门控补漏。设计：`docs/superpowers/specs/2026-11-20-jdbc-generic-plugin-design.md`。
+
 ## v0.1.140（2026-11-18，未打标签）
 
 **WS 五钩子与房间跨实例中继（REF-02 / REF-04 / REQ-02a）**——下游第二轮 issue
