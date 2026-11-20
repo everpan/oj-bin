@@ -1,0 +1,40 @@
+plugins {
+    id 'java'
+    id 'application'
+}
+
+group = 'app.oj'
+version = '0.1.0'
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'org.json:json:20240303'
+    testRuntimeOnly 'com.h2database:h2:2.3.232'
+    testImplementation platform('org.junit:junit-bom:5.11.4')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+// 本机仅 JDK 25；--release 11 将字节码与 API 面钉到 Java 11（等价工具链意图，免 JDK 供给）
+tasks.withType(JavaCompile).configureEach {
+    options.release = 11
+}
+
+application {
+    mainClass = 'app.oj.jdbc.Bridge'
+}
+
+tasks.register('shadowJar', Jar) {
+    archiveFileName = 'oj-jdbc-bridge.jar'
+    from sourceSets.main.output
+    from { configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) } }
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    manifest { attributes 'Main-Class': 'app.oj.jdbc.Bridge' }
+}
+
+tasks.withType(Test).configureEach {
+    useJUnitPlatform()
+}
