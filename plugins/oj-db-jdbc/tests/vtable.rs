@@ -172,6 +172,83 @@ async fn vtable_frame_sequence() -> Result<(), String> {
         "重启后查询恢复",
     )?;
 
+    // ---- stream 四槽（T11）：250 行 = 100/100/50 + done；open/next 取消的
+    //      ok 值 {"error":"cancelled"} → Err 映射（R7）；close 幂等（含 after-cancel
+    //      的 Java "unknown stream_id" err 帧按成功收口）；die 后旧 stream 报 reconnect ----
+    let mut f = vt::stream_open(h3, RString::from("select big"), RString::from("[9]"));
+    let sid = v(&drive(&mut f).await?)["stream_id"]
+        .as_u64()
+        .ok_or("stream_open ok 缺 stream_id")?;
+    assert2(sid == 1, "首个插件 stream_id = 1")?;
+    // 批循环：100/100/50 + done（done 帧不自动关——显式 close 是唯一回收口）。
+    let mut got = 0usize;
+    let mut batches = 0usize;
+    loop {
+        let mut f = vt::stream_next(h3, sid);
+        let env = v(&drive(&mut f).await?);
+        if env.get("done").and_then(Value::as_bool) == Some(true) {
+            break;
+        }
+        let rows = env["rows"].as_array().ok_or("next 信封缺 rows")?;
+        batches += 1;
+        got += rows.len();
+        assert2(rows.len() <= 100, "单批 ≤100 行")?;
+        if batches > 10 {
+            return Err("批循环未收敛".into());
+        }
+    }
+    assert2(
+        batches == 3 && got == 250,
+        &format!("100/100/50 + done，实际 {batches} 批 {got} 行"),
+    )?;
+    let mut f = vt::stream_close(h3, sid);
+    assert2(v(&drive(&mut f).await?) == json!({}), "stream_close ok")?;
+    // close 幂等：插件侧条目已摘，重入 Ok 且不再发帧。
+    let mut f = vt::stream_close(h3, sid);
+    assert2(v(&drive(&mut f).await?) == json!({}), "stream_close 幂等")?;
+
+    // open 在途被取消：Java 回 ok 值 {"error":"cancelled"}（非 err 帧）→ Err 映射。
+    let mut f = vt::stream_open(h3, RString::from("__scancel__"), RString::from("[]"));
+    let e = drive(&mut f).await.expect_err("open 被取消须报 cancelled");
+    assert2(
+        e.contains("cancelled") && e.contains(r#""category":"cancelled""#),
+        &format!("实际: {e}"),
+    )?;
+
+    // cancel → next 报 cancelled；after-cancel 的 close 收 Java "unknown stream_id"
+    // err 帧（流已拆）按幂等成功收口。
+    let mut f = vt::stream_open(h3, RString::from("select big"), RString::from("[]"));
+    let sid2 = v(&drive(&mut f).await?)["stream_id"]
+        .as_u64()
+        .ok_or("open2 缺 stream_id")?;
+    assert2(sid2 == 2, "stream_id 单调递增")?;
+    let mut f = vt::stream_cancel(h3, sid2);
+    assert2(v(&drive(&mut f).await?) == json!({}), "stream_cancel ok")?;
+    let mut f = vt::stream_next(h3, sid2);
+    let e = drive(&mut f)
+        .await
+        .expect_err("cancel 后 next 须报 cancelled");
+    assert2(
+        e.contains("cancelled") && e.contains(r#""category":"cancelled""#),
+        &format!("实际: {e}"),
+    )?;
+    let mut f = vt::stream_close(h3, sid2);
+    assert2(
+        v(&drive(&mut f).await?) == json!({}),
+        "after-cancel close 幂等收口",
+    )?;
+
+    // 世代失效：die 后旧 stream 报 reconnect（绝不把旧 JVM 的流号落到新 JVM）。
+    let mut f = vt::stream_open(h3, RString::from("select big"), RString::from("[]"));
+    let _sid3 = v(&drive(&mut f).await?)["stream_id"]
+        .as_u64()
+        .ok_or("open3 缺 stream_id")?;
+    let mut f = vt::query(h3, RString::from("__die__"), RString::from("[]"));
+    drive(&mut f).await.expect_err("die 必须在途报错");
+    let mut f = vt::stream_next(h3, _sid3);
+    let e = drive(&mut f).await.expect_err("旧世代 stream 须拒绝");
+    assert2(e.contains("reconnect"), &format!("实际: {e}"))?;
+
     // ---- 帧序列总断言（spec §5.3）：请求帧逐个比形 + id 单调 + 响应齐套 + FIFO 序 ----
     assert_frames(&log).await
 }
@@ -211,6 +288,19 @@ async fn assert_frames(log: &Path) -> Result<(), String> {
         json!({"id":10,"op":"query","handle":11,"sql":"__die__","params":[]}),
         json!({"id":11,"op":"connect","url":"jdbc:h2:mem:u3"}),
         json!({"id":12,"op":"query","handle":11,"sql":"select 3","params":[]}),
+        json!({"id":13,"op":"stream_open","handle":11,"sql":"select big","params":[9]}),
+        json!({"id":14,"op":"stream_next","handle":11,"stream_id":7}),
+        json!({"id":15,"op":"stream_next","handle":11,"stream_id":7}),
+        json!({"id":16,"op":"stream_next","handle":11,"stream_id":7}),
+        json!({"id":17,"op":"stream_next","handle":11,"stream_id":7}),
+        json!({"id":18,"op":"stream_close","handle":11,"stream_id":7}),
+        json!({"id":19,"op":"stream_open","handle":11,"sql":"__scancel__","params":[]}),
+        json!({"id":20,"op":"stream_open","handle":11,"sql":"select big","params":[]}),
+        json!({"id":21,"op":"stream_cancel","handle":11,"stream_id":8}),
+        json!({"id":22,"op":"stream_next","handle":11,"stream_id":8}),
+        json!({"id":23,"op":"stream_close","handle":11,"stream_id":8}),
+        json!({"id":24,"op":"stream_open","handle":11,"sql":"select big","params":[]}),
+        json!({"id":25,"op":"query","handle":11,"sql":"__die__","params":[]}),
     ];
     assert2(
         reqs == expect,
@@ -220,16 +310,20 @@ async fn assert_frames(log: &Path) -> Result<(), String> {
             json!(expect)
         ),
     )?;
-    // 除 die（id=10，JVM 随其死亡无响应）外，每个请求都有同 id 响应帧。
-    for id in [1u64, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12] {
+    // 除 die（id=10/25，JVM 随其死亡无响应）外，每个请求都有同 id 响应帧。
+    for id in [
+        1u64, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+    ] {
         assert2(
             resps.iter().any(|r| r["id"] == json!(id)),
             &format!("缺 id={id} 的响应帧"),
         )?;
     }
     assert2(
-        !resps.iter().any(|r| r["id"] == json!(10)),
-        "die 帧（id=10）不得有响应",
+        !resps
+            .iter()
+            .any(|r| r["id"] == json!(10) || r["id"] == json!(25)),
+        "die 帧（id=10/25）不得有响应",
     )?;
     // FIFO 序：disconnect 收到（id=8）→ hold 查询响应（id=7）→ disconnect 响应（id=8）。
     // （帧内键序按 serde_json 排序，位置匹配用键值子串，不假设序。）
@@ -306,6 +400,11 @@ fn fake_java_main() -> ! {
 /// 协议形状响应：connect→{"handle":11}；query→{"rows":[{"n":1}]}；exec→3；
 /// begin→{"tx_id":5}；tx_* 同形；__hold__ 挂起至 disconnect（per-conn FIFO 语义：
 /// disconnect 先等在途 op 收尾）；__die__ 直接 exit(1) 模拟 JVM 猝死。
+/// stream（T11）：假 java 持有 250 行（n=0..249），每 next 帧 ≤100 行，取尽回
+/// {"done":true}（不自动关——显式 stream_close 回收）；__scancel__ 的 open 回
+/// ok 值 {"error":"cancelled"}（R7：取消是 ok 值非 err 帧）；cancel 置标志，被取消
+/// 的 next 回 {"error":"cancelled"} 并拆流（镜像 Session 取消后流已拆：close 将收
+/// "unknown stream_id" err 帧）。
 fn fake_vtable() -> ! {
     use std::io::{BufRead, Write};
     println!("{{\"hello\":{{\"proto\":1,\"bridge\":\"0.1.0\"}}}}");
@@ -317,6 +416,11 @@ fn fake_vtable() -> ! {
         .open(&log_path)
         .expect("open OJ_FAKE_LOG");
     let mut held: Option<u64> = None;
+    // T11：假 java 侧流状态。cursor = 已发下行数；cancelled = cancel 帧置位。
+    let mut next_java_stream_id: u64 = 7; // 镜像 java_handle=11 的固定分配形态
+    let mut streams: std::collections::HashMap<u64, (usize, bool)> = Default::default();
+    const TOTAL: usize = 250;
+    const BATCH: usize = 100;
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
@@ -340,6 +444,66 @@ fn fake_vtable() -> ! {
             "exec" | "tx_exec" => respond(&mut log, &json!({"id": id, "ok": 3})),
             "begin" => respond(&mut log, &json!({"id": id, "ok": {"tx_id": 5}})),
             "tx_commit" | "tx_rollback" => respond(&mut log, &json!({"id": id, "ok": {}})),
+            "stream_open" if v["sql"].as_str() == Some("__scancel__") => {
+                // R7：open 在途被取消 → ok 值 {"error":"cancelled"}（非 err 帧）。
+                respond(&mut log, &json!({"id": id, "ok": {"error": "cancelled"}}))
+            }
+            "stream_open" => {
+                let sid = next_java_stream_id;
+                next_java_stream_id += 1;
+                streams.insert(sid, (0, false));
+                respond(&mut log, &json!({"id": id, "ok": {"stream_id": sid}}))
+            }
+            "stream_next" => {
+                let sid = v["stream_id"].as_u64().unwrap_or(0);
+                match streams.get_mut(&sid) {
+                    None => respond(
+                        &mut log,
+                        &json!({"id": id, "err": format!("unknown stream_id: {sid}")}),
+                    ),
+                    Some((_, true)) => {
+                        // 被取消：ok 值 {"error":"cancelled"}，且流已拆（close 收 unknown）。
+                        streams.remove(&sid);
+                        respond(&mut log, &json!({"id": id, "ok": {"error": "cancelled"}}))
+                    }
+                    Some((cursor, false)) => {
+                        let take = (TOTAL - *cursor).min(BATCH);
+                        if take == 0 {
+                            respond(&mut log, &json!({"id": id, "ok": {"done": true}}))
+                        } else {
+                            let start = *cursor;
+                            *cursor += take;
+                            let rows: Vec<Value> =
+                                (start..start + take).map(|n| json!({"n": n})).collect();
+                            respond(&mut log, &json!({"id": id, "ok": {"rows": rows}}))
+                        }
+                    }
+                }
+            }
+            "stream_cancel" => {
+                let sid = v["stream_id"].as_u64().unwrap_or(0);
+                match streams.get_mut(&sid) {
+                    Some((_, cancelled)) => {
+                        *cancelled = true;
+                        respond(&mut log, &json!({"id": id, "ok": {}}))
+                    }
+                    None => respond(
+                        &mut log,
+                        &json!({"id": id, "err": format!("unknown stream_id: {sid}")}),
+                    ),
+                }
+            }
+            "stream_close" => {
+                let sid = v["stream_id"].as_u64().unwrap_or(0);
+                if streams.remove(&sid).is_some() {
+                    respond(&mut log, &json!({"id": id, "ok": {}}))
+                } else {
+                    respond(
+                        &mut log,
+                        &json!({"id": id, "err": format!("unknown stream_id: {sid}")}),
+                    )
+                }
+            }
             "disconnect" => {
                 if let Some(hid) = held.take() {
                     // FIFO：在途 op 先行收尾，disconnect 响应排最后。

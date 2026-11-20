@@ -2,8 +2,9 @@
 //! 形态：Rust cdylib 插件 + Java sidecar（`java/jdbc-bridge/`，NDJSON 帧协议 §5.3）：
 //! drivers_dir 全部 jar 经 URLClassLoader 装载，DriverShim 过 DriverManager 类加载器白名单。
 //! T7 crate 骨架 + DSN 解析（`dsn`）；T10：vtable connect/query/exec/tx/close 胶水
-//! 经 SidecarMgr 编排（jsint 大整数通道见 `prep_params`）。
-//! 仍占位：stream 四槽与 JDBC→JSON 类型映射细化是 T11。
+//! 经 SidecarMgr 编排（jsint 大整数通道见 `prep_params`）；T11：stream 四槽
+//! （stream 注册表 + cancelled ok 值归一 Err 映射）。
+//! 仍占位：JDBC→JSON 类型映射细化是 T12。
 //!
 //! 假 java 夹具（spec §6）：`tests/sidecar.rs` 是 harness=false 集成测试——自有 main 按
 //! env `OJ_FAKE_JAVA=<场景>` 自重现为假 java（spawn `current_exe()`，跨平台含 Windows CI），
@@ -146,7 +147,7 @@ fn init(host: RArc<HostContext>, cfg: RString) -> RResult<PluginDescriptor, RStr
     RResult::Ok(descriptor())
 }
 
-// ---- vtable（T10 sidecar 胶水；stream 四槽与类型映射是 T11）----
+// ---- vtable（T10 sidecar 胶水 + T11 stream 四槽；类型映射细化是 T12）----
 
 pub extern "C" fn connect(cfg: RString) -> FfiFuture {
     oj_plugin_ffi::catch_future(|| {
@@ -324,6 +325,12 @@ pub extern "C" fn close(handle: u64) {
         let Some(e) = handles().lock().unwrap().remove(&handle) else {
             return;
         };
+        // T11：连接关闭连带摘除其 stream 条目（插件侧回收，防悬挂；
+        // Java 侧流随 disconnect 的 Session 消亡一并失效）。
+        streams()
+            .lock()
+            .unwrap()
+            .retain(|_, se| se.java_handle != e.java_handle);
         let Ok(sc) = sc() else {
             return;
         };
@@ -373,20 +380,149 @@ static DB_VTABLE: DataAccessorVtable = DataAccessorVtable {
     describe,
 };
 
-extern "C" fn stream_open(_handle: u64, _sql: RString, _params: RString) -> FfiFuture {
-    oj_plugin_ffi::ready_err("not implemented")
+// ---- stream 注册表（T11）：插件 stream_id → Java 侧寻址 + 连接时的世代快照 ----
+
+#[derive(Clone)]
+struct StreamEntry {
+    /// Java Session handle（协议键 "handle"）。
+    java_handle: u64,
+    /// Java 侧 stream_id（stream_open ok.stream_id 快照；后续三槽按它寻址）。
+    java_stream_id: u64,
+    /// stream_open 时的 sidecar 世代；每次 stream 槽调用前 check_generation——
+    /// 与 handle 闸同纪律（spec §5.1：绝不把旧 JVM 的流号落到新 JVM）。
+    generation: u64,
 }
 
-extern "C" fn stream_next(_handle: u64, _stream_id: u64) -> FfiFuture {
-    oj_plugin_ffi::ready_err("not implemented")
+static STREAMS: OnceLock<Mutex<HashMap<u64, StreamEntry>>> = OnceLock::new();
+static NEXT_STREAM: AtomicU64 = AtomicU64::new(0);
+
+fn streams() -> &'static Mutex<HashMap<u64, StreamEntry>> {
+    STREAMS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-extern "C" fn stream_cancel(_handle: u64, _stream_id: u64) -> FfiFuture {
-    oj_plugin_ffi::ready_err("not implemented")
+/// 取 stream 条目并过世代闸（Mutex 守卫不跨 await，随返回的 owned 条目释放）。
+fn stream_entry(stream_id: u64) -> Result<StreamEntry, String> {
+    let e = streams()
+        .lock()
+        .unwrap()
+        .get(&stream_id)
+        .cloned()
+        .ok_or_else(|| format!("db: unknown stream {stream_id}"))?;
+    sc()?.check_generation(e.generation)?;
+    Ok(e)
 }
 
-extern "C" fn stream_close(_handle: u64, _stream_id: u64) -> FfiFuture {
-    oj_plugin_ffi::ready_err("not implemented")
+/// R7（T6 评审钉）：Java 把取消归一为 **ok 值** `{"error":"cancelled"}`（非 err 帧）。
+/// 映射层归一为 Err——载荷与 err 帧同构的宿主信封（宿主 parse_raw 单点落 cancelled 类）。
+fn cancelled_envelope() -> String {
+    json!({
+        "category": "cancelled",
+        "retryable": false,
+        "session_disposition": "keep",
+        "message": "cancelled",
+        "data": {},
+    })
+    .to_string()
+}
+
+pub extern "C" fn stream_open(handle: u64, sql: RString, params: RString) -> FfiFuture {
+    oj_plugin_ffi::catch_future(|| {
+        oj_plugin_ffi::spawn_ffi_future(rt(), async move {
+            let e = entry(handle)?;
+            let params = prep_params(&params[..])?;
+            let ok = sc()?
+                .request(
+                    "stream_open",
+                    json!({"handle": e.java_handle, "sql": &sql[..], "params": params}),
+                )
+                .await?;
+            // R7：取消是 ok 值 {"error":"cancelled"} → 归一 Err；其余 ok 错误值同理
+            // 转 Err（宿主 stream_open 不读 ok 信封错误，只认 stream_id/unsupported）。
+            if let Some(err) = ok.get("error") {
+                return Err(if err == "cancelled" {
+                    cancelled_envelope()
+                } else {
+                    err.to_string()
+                });
+            }
+            let java_stream_id = ok.get("stream_id").and_then(Value::as_u64).ok_or_else(|| {
+                r#"sidecar stream_open: response missing "stream_id""#.to_string()
+            })?;
+            let stream_id = NEXT_STREAM.fetch_add(1, Ordering::SeqCst) + 1;
+            streams().lock().unwrap().insert(
+                stream_id,
+                StreamEntry {
+                    java_handle: e.java_handle,
+                    java_stream_id,
+                    generation: e.generation,
+                },
+            );
+            Ok(format!(r#"{{"stream_id":{stream_id}}}"#).into_bytes())
+        })
+    })
+}
+
+pub extern "C" fn stream_next(_handle: u64, stream_id: u64) -> FfiFuture {
+    oj_plugin_ffi::catch_future(|| {
+        oj_plugin_ffi::spawn_ffi_future(rt(), async move {
+            let se = stream_entry(stream_id)?;
+            let ok = sc()?
+                .request(
+                    "stream_next",
+                    json!({"handle": se.java_handle, "stream_id": se.java_stream_id}),
+                )
+                .await?;
+            // R7：被取消的 next 回 ok 值 {"error":"cancelled"} → 归一 Err。
+            // 其余信封（{"rows":[...]}/{"done":true}）原样透传，宿主逐帧解释。
+            if ok.get("error") == Some(&Value::String("cancelled".to_string())) {
+                return Err(cancelled_envelope());
+            }
+            Ok(ok.to_string().into_bytes())
+        })
+    })
+}
+
+pub extern "C" fn stream_cancel(_handle: u64, stream_id: u64) -> FfiFuture {
+    oj_plugin_ffi::catch_future(|| {
+        oj_plugin_ffi::spawn_ffi_future(rt(), async move {
+            let se = stream_entry(stream_id)?;
+            let ok = sc()?
+                .request(
+                    "stream_cancel",
+                    json!({"handle": se.java_handle, "stream_id": se.java_stream_id}),
+                )
+                .await?;
+            Ok(ok.to_string().into_bytes())
+        })
+    })
+}
+
+pub extern "C" fn stream_close(_handle: u64, stream_id: u64) -> FfiFuture {
+    oj_plugin_ffi::catch_future(|| {
+        oj_plugin_ffi::spawn_ffi_future(rt(), async move {
+            // 本地未知 = 已关：幂等 Ok（资源契约：close 是唯一回收口，重入须安全）。
+            let Some(se) = streams().lock().unwrap().remove(&stream_id) else {
+                return Ok(b"{}".to_vec());
+            };
+            // 世代已死：流随旧 JVM 消亡，close 无从投递也不必投递（同 T10 close 纪律）。
+            if sc()?.check_generation(se.generation).is_err() {
+                return Ok(b"{}".to_vec());
+            }
+            match sc()?
+                .request(
+                    "stream_close",
+                    json!({"handle": se.java_handle, "stream_id": se.java_stream_id}),
+                )
+                .await
+            {
+                Ok(ok) => Ok(ok.to_string().into_bytes()),
+                // cancelled-close 是正常路径：Java 已把取消的流拆掉，
+                // "unknown stream_id" err 帧按幂等成功收口，不向上传播。
+                Err(e) if e.contains("unknown stream_id") => Ok(b"{}".to_vec()),
+                Err(e) => Err(e),
+            }
+        })
+    })
 }
 
 oj_plugin_ffi::oj_plugin_entry!(init, config: "oj-db-jdbc", db => &DB_VTABLE);
@@ -413,7 +549,8 @@ pub async fn __test_shutdown() -> Result<(), String> {
 #[doc(hidden)]
 pub mod vt {
     pub use super::{
-        begin, close, connect, exec, query, tx_commit, tx_exec, tx_query, tx_rollback,
+        begin, close, connect, exec, query, stream_cancel, stream_close, stream_next, stream_open,
+        tx_commit, tx_exec, tx_query, tx_rollback,
     };
 }
 
