@@ -173,16 +173,19 @@ jobs:
 
       # 见 plugin-matrix.yml 同名步骤：`cargo xtask build` 归置 oj-db-jdbc 桥 jar 是发行
       # 门禁，缺 jar 即失败——发版打包必须含桥 jar，故三平台腿都先构建它（不跑 h2_smoke：
-      # 未注入 OJ_JDBC_*_JAR，该腿诚实 skip）。
+      # 未注入 OJ_JDBC_*_JAR，该腿诚实 skip）。gradle-wrapper 声明 gradle-9.9.2（Gradle 9
+      # daemon 要求 JVM ≥17），故钉 21；字节码仍 --release 11。
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '11'
+          java-version: '21'
           cache: gradle
           cache-dependency-path: java/jdbc-bridge/**
 
+      # shell: bash 必显式：matrix 含 windows-latest，默认 pwsh 跑无扩展名 ./gradlew 必红。
       - name: build jdbc bridge jar (oj-db-jdbc sidecar)
         working-directory: java/jdbc-bridge
+        shell: bash
         run: ./gradlew --no-daemon shadowJar
 
       # Windows 上 rdkafka-sys（oj-bus-kafka 的依赖）经 cmake 从源码编 librdkafka。

@@ -194,12 +194,12 @@ jobs:
 
       # oj-db-jdbc 发行门禁：`cargo xtask build` 归置桥 jar 时要求
       # java/jdbc-bridge/build/libs/oj-jdbc-bridge.jar 已存在（缺即失败并提示先 shadowJar）。
-      # 字节码 --release 11（见 java/jdbc-bridge/build.gradle），故钉 Java 11；
-      # `cache: gradle` 缓 ~/.gradle 省 wrapper/依赖下载。
+      # gradle-wrapper 声明 gradle-9.9.2，Gradle 9 daemon 要求 JVM ≥17，故钉 21；
+      # 字节码仍 --release 11（build.gradle 已钉死），运行时要求不变。
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '11'
+          java-version: '21'
           cache: gradle
           cache-dependency-path: java/jdbc-bridge/**
 
@@ -314,7 +314,7 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '11'
+          java-version: '21'
           cache: gradle
           cache-dependency-path: java/jdbc-bridge/**
 
