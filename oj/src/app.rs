@@ -1252,11 +1252,21 @@ impl GateLike for config::RpcCfg {
     }
 }
 
+/// rooms_cluster 的 KV 后端判据：目标 redis profile 是否真的配置了。
+///
+/// 不能用 `registries.kv.is_some()`（那只是插件加载态）：本门禁之前的 `connect_kv`
+/// 已把「redis 未配置」回落成内置 InMemoryKV——插件在位但 cfg.redis 没配目标
+/// profile 时，真实后端仍是进程本地锁/CAS，跨实例协调会假成功（评审 finding）。
+/// 反过来，配置存在却无 kv 插件会更早在 `connect_kv` fail-fast，故此处只需看配置。
+fn kv_is_distributed(cfg: &Config, redis_key: &str) -> bool {
+    cfg.redis.contains_key(redis_key)
+}
+
 #[allow(clippy::too_many_arguments)]
 /// rooms_cluster 装配门禁（REF-04，v0.1.140）：两个「假集群」悬崖——本地 broker 中继
 /// 永远出不了进程；内存 KV 的 lock/CAS 进程本地，跨实例协调假成功。缺一启动拒绝，
 /// 错误信息点名条件 + 修法 + 单实例提示（供 `rooms_cluster_gate` 单测断言文案）。
-fn rooms_cluster_gate(broker_kind: &str, kv_plugin_present: bool) -> Result<(), String> {
+fn rooms_cluster_gate(broker_kind: &str, kv_backed_by_redis: bool) -> Result<(), String> {
     if broker_kind == "local" {
         return Err(
             "ws.rooms_cluster: broker is the in-process Bus — the relay would never \
@@ -1265,7 +1275,7 @@ fn rooms_cluster_gate(broker_kind: &str, kv_plugin_present: bool) -> Result<(), 
                 .to_string(),
         );
     }
-    if !kv_plugin_present {
+    if !kv_backed_by_redis {
         return Err(
             "ws.rooms_cluster: kv is the builtin InMemoryKV — its lock/CAS are \
              process-local, cross-instance coordination would fake-succeed\n  下一步：\
@@ -1517,16 +1527,14 @@ pub async fn assemble_backend(
     // 下开旗是「假集群」（中继空转 / 锁与 CAS 进程本地假单飞）——启动拒绝，错误信息点名
     // 两个条件与修法；broker 已配集群而旗未开 = 回到静默单实例（原始故障模式）→ 告警不无声。
     let _relay = if cfg.ws.rooms_cluster {
-        rooms_cluster_gate(bus.kind(), registries.kv.is_some())?;
+        rooms_cluster_gate(bus.kind(), kv_is_distributed(cfg, redis_key))?;
         let (relay, probe) = only_js::bridge::relay::spawn_relay(bus.clone())
             .await
             .map_err(|e| format!("ws.rooms_cluster: {e}"))?;
+        // wait 内部周期性重发探针（每轮 250ms）直到自回声或 10s 预算耗尽——
+        // 消费组 join / 队列绑定期间的首帧丢弃不再误判为启动失败。
         probe
-            .ping(&relay)
-            .await
-            .map_err(|e| format!("ws.rooms_cluster boot probe: {e}"))?;
-        probe
-            .wait(std::time::Duration::from_secs(10))
+            .wait(&relay, std::time::Duration::from_secs(10))
             .await
             .map_err(|e| format!("ws.rooms_cluster: {e}"))?;
         eprintln!(

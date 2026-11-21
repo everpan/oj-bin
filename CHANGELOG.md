@@ -16,6 +16,25 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## 下一版（未发布）
+
+**代码评审（v0.1.138..v0.1.141，high）三项修复**（无 ABI / JS API 变化，仅行为纠正）：
+
+- **`ws.rooms_cluster` boot 探针改为周期性重发**（`src/bridge/relay.rs`）：
+  旧实现订阅后只发一次探针帧，kafka 显式组 group-join / rabbit 队列绑定期间首帧被
+  丢弃会让健康 broker 上的启动被偶发误拒。现 `Probe::wait(&relay, timeout)` 每 250ms
+  重发 nonce 直到自回声或预算耗尽；回归用例模拟「首帧丢弃」验证重发补发成功。
+- **`ws.rooms_cluster` KV 门禁改判真实后端**（`oj/src/app.rs`）：
+  旧门禁拿 `registries.kv.is_some()`（插件加载态）当分布式 KV 判据——插件在位但
+  `cfg.redis` 未配目标 profile 时 `connect_kv` 实际回落 InMemoryKV，跨实例锁/CAS
+  假成功。现判据为 `kv_is_distributed(cfg, redis_key)` = 目标 redis profile 确已配置；
+  回归用例覆盖空 redis / 选错 profile 两种假集群形态。
+- **JDBC 错误脱敏覆盖含 `/` 的密码**（`plugins/oj-db-jdbc`，插件 version
+  `0.1.141` → `0.1.142`）：旧 `redact()` 见 `/` 即停，`jdbc:mysql://user:p/ass@host/db`
+  的密码 `p/ass` 原样泄漏进日志/HTTP 响应。现扫到分隔符取最后一个 `@`，仅当
+  `@` 前段含 `:`（user:password 形态）才脱敏——含 `/` 或 `@` 的密码整段进 `***`，
+  同时保留 `a://b/c@d` 这类「路径先于 @」的原样语义。
+
 ## v0.1.141（2026-11-20）
 
 **泛型 JDBC 插件 `oj-db-jdbc`——`jdbc:` DSN 接达梦/金仓/Oracle/H2 等企业库**，

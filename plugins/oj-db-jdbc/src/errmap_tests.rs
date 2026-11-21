@@ -86,6 +86,37 @@ fn redact_url_credentials() {
     }
 }
 
+/// 回归（review finding）：密码含 `/` 必须脱敏——旧实现见 `/` 即停，
+/// `jdbc:mysql://user:p/ass@host:3306/db` 的密码 `p/ass` 会原样泄漏进日志/HTTP 响应。
+#[test]
+fn redact_password_containing_slash() {
+    let cases: &[(&str, &str)] = &[
+        (
+            "jdbc:mysql://user:p/ass@host:3306/db",
+            "jdbc:mysql://***@host:3306/db",
+        ),
+        // 密码同时含 @ 与 /：取最后一个 @ 作为终止符，整段密码进 ***。
+        (
+            "jdbc:mysql://user:p@ss/word@dbhost:3306/x",
+            "jdbc:mysql://***@dbhost:3306/x",
+        ),
+        // 无 user:password（无 `:`）的路径先于 @ → 不误脱敏（保留既有语义）。
+        ("a://b/c@d", "a://b/c@d"),
+        // 无凭据 / 非 URL 原样返回。
+        (
+            "jdbc:mysql://host:3306/db?useSSL=false",
+            "jdbc:mysql://host:3306/db?useSSL=false",
+        ),
+        (
+            "connection refused: password=hunter2",
+            "connection refused: password=hunter2",
+        ),
+    ];
+    for (input, want) in cases {
+        assert_eq!(redact(input), *want, "input={input}");
+    }
+}
+
 /// 消息中间夹带连接串也脱敏（驱动报错消息回显完整 JDBC URL）。
 #[test]
 fn redact_embedded_in_message() {

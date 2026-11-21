@@ -15,9 +15,11 @@
 //! 发送者实例的其他成员已由本地直投覆盖（`ws.broadcast` 除己语义不变），
 //! 发送者自身协议上无需回发（客户端发送前已本地 apply）。
 //!
-//! boot 自回声探针（零 ABI）：subscribe → publish 探针帧 → 等自己收到。kafka 惰性
-//! producer 骗不过「等接收」（broker 不可达 ⇒ 永远收不到 ⇒ 启动拒绝）、rabbit 交换机/
-//! 权限错误在 publish 即爆、消费循环未起同样收不到——一个探针覆盖全部装配期悬崖。
+//! boot 自回声探针（零 ABI）：subscribe → **周期性重发**探针帧 → 等自己收到，
+//! 直到自回声或启动预算耗尽。重发覆盖「消费组 join / 队列绑定期间首帧被丢弃」
+//! 的窗口：kafka 惰性 producer 骗不过「等接收」（broker 不可达 ⇒ 永远收不到 ⇒
+//! 启动拒绝）、rabbit 交换机/权限错误在 publish 即爆、消费循环未起同样收不到——
+//! 一个探针覆盖全部装配期悬崖，又不会在健康 broker 上偶发误拒。
 
 use std::sync::{Arc, RwLock};
 
@@ -98,29 +100,55 @@ impl Relay {
     }
 }
 
-/// boot 自回声探针句柄：spawn_relay 后 publish 探针帧，`wait` 等自己收到。
+/// boot 自回声探针句柄：spawn_relay 后周期性重发探针帧，`wait` 等自己收到。
 pub struct Probe {
     nonce: String,
     rx: tokio::sync::oneshot::Receiver<()>,
 }
 
 impl Probe {
-    /// publish 探针帧（room = PROBE_ROOM，载荷 = nonce）。
+    /// publish 一帧探针（room = PROBE_ROOM，载荷 = nonce）。一次性；生产路径的
+    /// `wait` 自带重发循环，本方法供单测手动打帧用。
     pub async fn ping(&self, relay: &Relay) -> Result<(), String> {
         relay
             .publish(PROBE_ROOM, &WsSend::Text(self.nonce.clone()))
             .await
     }
 
-    /// 等自回声落地；超时 = 中继链路断（broker 不可达/权限/消费未起）。探针一次性消费。
-    pub async fn wait(self, timeout: std::time::Duration) -> Result<(), String> {
-        match tokio::time::timeout(timeout, self.rx).await {
-            Ok(Ok(())) => Ok(()),
-            _ => Err(format!(
-                "rooms_cluster boot probe: relay self-echo not received within {timeout:?} — \
-                 broker unreachable, topic permission denied, or relay consumer not running"
-            )),
+    /// 等自回声落地；**周期内周期性重发探针**直到收到自己的 nonce 或超时。
+    ///
+    /// 重发是必要的：kafka 显式组订阅后 group join / rabbit 队列绑定都要时间，
+    /// 订阅刚返回就发的首帧会被 broker 丢弃（消费组尚未就绪）——单发一次会让
+    /// `ws.rooms_cluster` 在健康 broker 上偶发启动被拒（真实踩坑：oj-bus-kafka
+    /// 测试曾须 `sleep(700ms)` 才能收到首帧）。每轮重发间隔 250ms，总预算 = timeout。
+    pub async fn wait(self, relay: &Relay, timeout: std::time::Duration) -> Result<(), String> {
+        const RETRY: std::time::Duration = std::time::Duration::from_millis(250);
+        let Probe { nonce, rx } = self;
+        let mut rx = rx;
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            relay
+                .publish(PROBE_ROOM, &WsSend::Text(nonce.clone()))
+                .await
+                .map_err(|e| format!("rooms_cluster boot probe publish: {e}"))?;
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining.min(RETRY), &mut rx).await {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(_)) => {
+                    return Err(
+                        "rooms_cluster boot probe: relay consumer dropped before echo".to_string(),
+                    );
+                }
+                Err(_) => continue, // 本轮未等到，重发再试
+            }
         }
+        Err(format!(
+            "rooms_cluster boot probe: relay self-echo not received within {timeout:?} — \
+             broker unreachable, topic permission denied, or relay consumer not running"
+        ))
     }
 }
 
@@ -238,17 +266,67 @@ mod tests {
         set_relay(None);
     }
 
-    /// boot 自回声探针：broker 活着 ⇒ publish 的探针帧经消费循环回到自己 ⇒ wait 过。
+    /// boot 自回声探针：broker 活着 ⇒ 重发的探针帧经消费循环回到自己 ⇒ wait 过。
     #[tokio::test(flavor = "current_thread")]
     async fn given_alive_broker_when_self_echo_probe_then_probe_passes() {
         set_relay(None);
         let bus = bus_broker();
         let (relay, probe) = spawn_relay(bus.clone()).await.unwrap();
-        probe.ping(&relay).await.unwrap();
         probe
-            .wait(std::time::Duration::from_secs(2))
+            .wait(&relay, std::time::Duration::from_secs(2))
             .await
             .expect("self-echo should arrive via local bus");
+        set_relay(None);
+    }
+
+    /// 模拟「订阅已注册但消费尚未就绪」：首帧被丢弃，后续透传给真实 Bus。
+    struct DropsFirstPublish {
+        inner: Bus,
+        drop_next: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl EventBroker for DropsFirstPublish {
+        async fn publish(
+            &self,
+            topic: &str,
+            data: &BusPayload,
+        ) -> crate::bridge::BridgeResult<usize> {
+            if self
+                .drop_next
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Ok(0); // 消费组尚未就绪 → 首帧静默丢弃
+            }
+            Ok(Bus::publish(&self.inner, topic, data))
+        }
+        async fn subscribe(
+            &self,
+            topic: &str,
+            group: Option<&str>,
+            tx: tokio::sync::mpsc::UnboundedSender<WsSend>,
+        ) -> crate::bridge::BridgeResult<()> {
+            EventBroker::subscribe(&self.inner, topic, group, tx).await
+        }
+        fn kind(&self) -> &'static str {
+            self.inner.kind()
+        }
+    }
+
+    /// 回归（review finding）：首帧被丢弃（kafka group-join / rabbit 队列绑定）时，
+    /// 单点 ping+wait 会误判启动失败；重发循环应在下一轮补发并收到自回声。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_first_publish_dropped_when_probe_waits_then_retry_succeeds() {
+        set_relay(None);
+        let broker = Arc::new(DropsFirstPublish {
+            inner: Bus::new(),
+            drop_next: std::sync::atomic::AtomicBool::new(true),
+        });
+        let (relay, probe) = spawn_relay(broker).await.unwrap();
+        probe
+            .wait(&relay, std::time::Duration::from_secs(2))
+            .await
+            .expect("retry must recover from a single dropped first publish");
         set_relay(None);
     }
 }

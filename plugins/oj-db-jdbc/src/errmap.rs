@@ -27,9 +27,15 @@ pub fn classify(sql_state: Option<&str>, _error_code: Option<i32>) -> Classified
     sqlstate_class(sql_state).unwrap_or(("internal", false, "keep"))
 }
 
-/// 错误消息凭据脱敏（spec §5.8 硬性）：`://` 与 `@` 之间的凭据段（不得含 `/` 或空白）
-/// 换成 `***`，host/库名保留——排障要知道连的是哪个库，但日志/HTTP 响应里不该有密码。
+/// 错误消息凭据脱敏（design spec §5.8）：`://` 与 `@` 之间的凭据段换成 `***`，
+/// host/库名保留——排障要知道连的是哪个库，但日志/HTTP 响应里不该有密码。
 /// 非 URL 形态原样返回（裸密码无法可靠识别，不误伤普通文本）。
+///
+/// 凭据段里允许出现 `/`（`jdbc:mysql://user:p/ass@host:3306/db` 的密码是 `p/ass`）：
+/// 不能见 `/` 就停，否则密码原样泄漏。做法——从 `://` 起扫到分隔符（空白/引号/
+/// 逗号/尖括号/括号）为止，取区间内**最后一个** `@` 作为凭据终止符（密码本身也可能
+/// 含 `@`，取最后一个才能把整段密码吃进 `***`）；且仅当 `@` 前的段含 `:`（user:password
+/// 形态）才判为凭据——否则 `a://b/c@d` 这类「路径先于 @」会被误脱敏。非 URL 形态原样返回。
 pub fn redact(msg: &str) -> String {
     // 全程扫描不提前返回：同一行可能回显多个连接串（如「主库 X 失败回退 Y」），
     // 只脱第一个会让第二个的凭据原样泄漏。
@@ -38,18 +44,24 @@ pub fn redact(msg: &str) -> String {
     while let Some(rel) = rest.find("://") {
         let seg = rel + 3;
         let bytes = rest.as_bytes();
-        let mut j = seg;
-        // 凭据段：@ 之前不得出现 / 或空白（出现 = 已是路径，不是凭据）。
-        let at = loop {
-            match bytes.get(j) {
-                Some(b'@') => break Some(j),
-                Some(b'/') | Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n') | None => {
-                    break None;
-                }
-                _ => j += 1,
+        // 终止于分隔符（URL 边界）；不可见 '/' 即停——那正是本修复的要点。
+        let mut end = seg;
+        while let Some(b) = bytes.get(end) {
+            if matches!(
+                b,
+                b' ' | b'\t' | b'\r' | b'\n' | b'"' | b'\'' | b',' | b'<' | b'>' | b'(' | b')'
+            ) {
+                break;
             }
-        };
-        if let Some(at) = at {
+            end += 1;
+        }
+        let at = bytes[seg..end]
+            .iter()
+            .rposition(|&b| b == b'@')
+            .map(|p| seg + p);
+        // 仅 user:password 形态才算凭据：无 `:` 时 `a://b/c@d` 是路径先于 @，
+        // 误脱敏会破坏 host/路径（且无密码可藏）。
+        if let Some(at) = at.filter(|&at| bytes[seg..at].contains(&b':')) {
             out.push_str(&rest[..rel]);
             out.push_str("://***@");
             rest = &rest[at + 1..];

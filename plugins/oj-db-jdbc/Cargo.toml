@@ -1,6 +1,6 @@
 [package]
 name = "oj-db-jdbc"
-version = "0.1.141"
+version = "0.1.142"
 edition = "2024"
 description = "db 轴通用 JDBC 插件：Java sidecar 桥接任意 JDBC 驱动（spec §5）"
 

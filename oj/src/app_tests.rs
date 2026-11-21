@@ -1097,7 +1097,7 @@ fn given_local_broker_when_rooms_cluster_gate_then_rejected_with_broker_hint() {
     assert!(e.contains("rooms_cluster"), "{e}");
 }
 
-// Given 内存 KV（无 kv 插件）且开旗
+// Given 未配置 redis（目标 profile 缺省 → 真实后端 = 内置 InMemoryKV）且开旗
 // When rooms_cluster_gate
 // Then Err 且文案点名 InMemoryKV 与 redis.default 修法
 #[test]
@@ -1107,11 +1107,29 @@ fn given_inmemory_kv_when_rooms_cluster_gate_then_rejected_with_redis_hint() {
     assert!(e.contains("redis.default"), "{e}");
 }
 
-// Given 集群 broker + kv 插件在位
+// Given 集群 broker + redis KV 已配置
 // When rooms_cluster_gate
 // Then Ok（两臂：kafka / rabbitmq）
 #[test]
-fn given_cluster_broker_and_kv_plugin_when_gate_then_passes() {
+fn given_cluster_broker_and_redis_kv_when_gate_then_passes() {
     assert!(rooms_cluster_gate("kafka", true).is_ok());
     assert!(rooms_cluster_gate("rabbitmq", true).is_ok());
+}
+
+// 回归（review finding）：门禁曾拿 registries.kv.is_some()（插件加载态）当 KV 后端
+// 判据——插件在位但 cfg.redis 未配目标 profile 时真实后端仍是 InMemoryKV。真实后端
+// 判据必须来自配置本身。
+#[test]
+fn given_kv_plugin_but_no_redis_config_when_kv_is_distributed_then_false() {
+    // 空 redis 段（等价于 kv 插件可能在位、但 connect_kv 回落到 InMemoryKV）。
+    let cfg = Config::default();
+    assert!(!kv_is_distributed(&cfg, "default"));
+
+    let mut cfg = Config::default();
+    cfg.redis
+        .insert("cache".into(), "redis://:pw@h:6379/1".into());
+    // 选中的 profile 未配置（--redis default 不存在）→ 仍非分布式。
+    assert!(!kv_is_distributed(&cfg, "default"));
+    // 真正配置了目标 profile → 分布式 KV。
+    assert!(kv_is_distributed(&cfg, "cache"));
 }
