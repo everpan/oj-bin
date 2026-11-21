@@ -1,3 +1,5 @@
 name: "dm"
 desc: "达梦 JDBC 查询样例（oj-db-jdbc 插件，env-gated，见 config.yaml db.dm 注释）"
 version: "0.1.0"
+deps:              # query/api.ts 裸 SQL 读 user.account（§3-D2；S003 静态校验依据）
+  user: "^0.1.0"
