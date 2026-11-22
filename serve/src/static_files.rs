@@ -797,23 +797,20 @@ pub(crate) async fn compressed_body_or_cache(
     if let Some(b) = cached(dir, &key).await {
         return Some(b);
     }
-    let wait = {
+    // 登记与判同锁一次完成：插入者即 leader。旧版先取 sender 再 ptr_eq 复查，
+    // 但 follower 的 sender 本就是表内同一 Arc 的 clone——ptr_eq 对所有人恒真，
+    // 并发请求全部冒充 leader（共用 tmp 路径互相 remove/rename，Windows CI 实 flake）。
+    let (wait, is_leader) = {
         let mut m = INFLIGHT.lock().unwrap();
         match m.get(&key) {
-            Some(n) => n.clone(),
+            Some(n) => (n.clone(), false),
             None => {
                 let (tx, _) = tokio::sync::watch::channel(());
                 let tx = std::sync::Arc::new(tx);
                 m.insert(key.clone(), tx.clone());
-                tx
+                (tx, true)
             }
         }
-    };
-    let is_leader = {
-        let m = INFLIGHT.lock().unwrap();
-        m.get(&key)
-            .map(|n| std::sync::Arc::ptr_eq(n, &wait))
-            .unwrap_or(false)
     };
     if !is_leader {
         // follower：循环「查缓存 → 领导者在否 → watch 等收尾」。watch 版本号语义
