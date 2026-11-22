@@ -223,31 +223,34 @@ impl RoutePool {
                 conn: 0,
             };
         }
-        // 退役竞态：linger 线程的 sched.close() 只代表「复查时无会话」，close 落地时
-        // Worker 可能尚未退出（live 未归零）。若只按 live==0 决定 reopen，此窗口内新
-        // 连接的 fire 会直接吃 PoolClosed（客户端首帧即 Close）。唯一可靠信号是
-        // closed 本身：见 closed 即 reopen + 无条件补员——垂死 Worker 若已见到 closed
-        // 会照常退出，补员覆盖其容量；若尚未见到则继续服务，短暂超配无害。
-        let spawn = {
-            let mut g = self.sched.inner.lock().unwrap_or_else(|e| e.into_inner());
-            if g.closed {
-                g.closed = false;
-                true
-            } else {
-                self.live.load(Ordering::SeqCst) == 0
-            }
-        };
+        // 退役竞态（两边互斥靠「同持 sessions 锁」）：attach 的「查 closed→补员决策
+        // + 插会话」与 retire 线程的「查空→close」（detach 内）必须串行——否则
+        // attach 决策后、插会话前 retire 落地 close，该连接首帧即 PoolClosed
+        // （上层静默回无码 Close 帧，Windows CI 实 flake）。锁序 sessions→sched，
+        // 与 detach 一致，无死锁。closed 本身仍是唯一可靠信号：见 closed 即 reopen
+        // + 无条件补员——垂死 Worker 若已见到 closed 会照常退出，补员覆盖其容量；
+        // 若尚未见到则继续服务，短暂超配无害。
         let conn = self.conn_seq.fetch_add(1, Ordering::Relaxed) + 1;
-        self.sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(
+        let spawn = {
+            let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            let spawn = {
+                let mut g = self.sched.inner.lock().unwrap_or_else(|e| e.into_inner());
+                if g.closed {
+                    g.closed = false;
+                    true
+                } else {
+                    self.live.load(Ordering::SeqCst) == 0
+                }
+            };
+            sessions.insert(
                 conn,
                 SessEntry {
                     state: serde_json::Value::Null,
                     bus_tx,
                 },
             );
+            spawn
+        };
         if spawn {
             for _ in 0..self.workers_max.max(1) {
                 self.spawn_worker();
@@ -545,14 +548,15 @@ impl ConnHandle {
                 .name("ws-retire".into())
                 .spawn(move || {
                     std::thread::sleep(Duration::from_millis(pool.linger_ms));
-                    // 复查仍空才退役：linger 期间来了新连接则继续服务。
-                    if pool
-                        .sessions
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .is_empty()
+                    // 复查与 close 必须同持 sessions 锁原子完成：与 attach 的
+                    // 「查 closed + 插会话」互斥——要么本线程先 close、attach 见
+                    // closed 即 reopen+补员；要么 attach 先注册、此处见非空不 close。
+                    // 分两步持锁的旧代码会把刚注册的连接瞬关（fire 得 PoolClosed）。
                     {
-                        pool.sched.close();
+                        let g = pool.sessions.lock().unwrap_or_else(|e| e.into_inner());
+                        if g.is_empty() {
+                            pool.sched.close();
+                        }
                     }
                     pool.retiring.store(false, Ordering::SeqCst);
                 })

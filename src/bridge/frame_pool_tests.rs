@@ -314,6 +314,46 @@ async fn pool_retires_when_idle_after_linger() {
     h2.detach();
 }
 
+/// 退役竞态钉（v0.1.141 Windows CI 实 flake：ws_close_app_code 收到无码 Close）：
+/// linger=0 时每次空 detach 立即起 retire 线程；若 attach 的「查 closed→补员决策 +
+/// 插会话」不与 retire 的「查空→close」互斥，连接注册后池被瞬关、fire 得
+/// PoolClosed。多线程并发 attach/fire/detach 压测：任何一次 fire 都不许吃到
+/// PoolClosed（旧代码在压测下间歇复现）。
+#[test]
+fn attach_racing_retire_never_gets_pool_closed() {
+    let dir = pool_dir("retire-race");
+    let ws_file = dir.join("ws.js");
+    std::fs::write(
+        &ws_file,
+        r#"export default { message() { json.ok({ ok: 1 }); } };"#,
+    )
+    .unwrap();
+    let pool = RoutePool::new(ws_file, ws_test_bridge(&dir), Duration::from_secs(5), 1, 0);
+    let mut hs = Vec::new();
+    for _ in 0..4 {
+        let pool = pool.clone();
+        hs.push(std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                for _ in 0..100 {
+                    let (btx, _) = mpsc::unbounded_channel();
+                    let h = pool.attach(btx);
+                    if let Err(e) = h.fire("message", vec![], false).await {
+                        panic!("attach 竞态 retire：注册成功的连接 fire 得 {e}");
+                    }
+                    h.detach();
+                }
+            });
+        }));
+    }
+    for h in hs {
+        h.join().unwrap();
+    }
+}
+
 /// 预载失败锁存：fire 得 PoolClosed 后，后续 attach 不再反复起 Worker。
 #[tokio::test(flavor = "current_thread")]
 async fn pool_preload_failure_latches_closed() {
