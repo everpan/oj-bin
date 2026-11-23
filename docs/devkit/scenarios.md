@@ -535,23 +535,28 @@ db: analytics        # ★ 该模块里字面 db.* 的调用落到 analytics（�
 ### ② 运行
 
 ```bash
-# 所有模块都在 default：逐库各跑一遍
-./bin/oj migrate -c config.yaml -d dist                     # → db "default"
-./bin/oj migrate -c config.yaml -d dist --db analytics      # → db "analytics"
+# 一条命令全覆盖：每个模块的迁移/fixtures/seed/对账自动落到它 manifest db: 绑定的库
+./bin/oj migrate -c config.yaml -d dist
+# 收尾按组打印，用它核对：oj migrate: 3 migration(s) across 1 module(s) → db "analytics"
+#                                                     5 migration(s) across 2 module(s) → db "default"
 
-# 模块绑了不同库（上面 manifest.db: analytics）：必须带 --module 逐组合跑
-./bin/oj migrate -c config.yaml -d dist --db default   --module user
-./bin/oj migrate -c config.yaml -d dist --db analytics --module order
+# 只跑某一个库上的绑定模块（不会误跑其它模块）
+./bin/oj migrate -c config.yaml -d dist --db analytics
 
-# 演示数据与漂移门禁同旗标，也要逐库跑
-./bin/oj test fixture -c config.yaml -d src --db analytics --module order
-./bin/oj schema diff -c config.yaml -d dist --db analytics
+# 演示数据与漂移门禁同源——同样按绑定路由
+./bin/oj test fixture -c config.yaml -d src
+./bin/oj schema diff -c config.yaml -d dist
 ```
 
-- `--db <name>` 的 `name` **就是 config `db:` 段的键**，缺省 `default`。
-- 账本 `_oj_migrations`、`schema.yaml` 收敛、`--baseline` 都**各库独立**：
-  A 库迁过了不等于 B 库迁过。
-- `oj migrate` 收尾行会打印目标库（`… → db "analytics"`），多库跑批时用它核对。
+- `--db <name>` 的 `name` **就是 config `db:` 段的键**；从 v0.1.142 起它是**过滤器**：
+  只跑 `manifest.yaml` 的 `db:` 段绑定到该库的模块——不再把全部模块灌进指定库。
+  已声明但无绑定模块时报 `--db "x" 无绑定模块`，**不会**误跑其它模块。
+- 模块绑定库未在 config `db:` 段声明 → 装配期 fail-fast（点名模块与库名），绝不静默回落 default。
+- 账本 `_oj_migrations`、`schema.yaml` 收敛、`--baseline`、`--with-seed` 都**各库独立**且随绑定路由：
+  A 库迁过了不等于 B 库迁过，一个都不能漏。
+- 注意：`server.migrate_on_start`（dev auto / release verify 启动门禁）与启动期 seed 重放
+  **尚不读** `db:` 绑定（仍只作用 default 库）——绑定模块在 serve 启动前需先跑过
+  `oj migrate`；启动门禁的绑定路由见后续版本（SKILL.md 陷阱速查）。
 
 ### ③ 验证
 

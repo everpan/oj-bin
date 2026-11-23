@@ -322,8 +322,10 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `toBigInt` 抛 `not a safe integer` | 传进去的是已坍缩的 number（多为 `Number(...)` 的产物）——传 DB 原样给出的**十进制字符串** |
 | PG 报 `column "x" is of type bigint but expression is of type text` | 回写用了字符串——字符串是文本意图，整数要用 `toBigInt(...)`（PG 不做隐式转换；MySQL/SQLite 会转换但别依赖） |
 | 同一 SQL 混合参数类型后报 `invalid byte sequence for encoding "UTF8": 0x00` / `insufficient data left in message` | **v0.1.24 起平台自动按参数形态分缓存键，无需再规避**（PG 插件给 SQL 前置 `/*oj:<形态>*/` 签名；MySQL 无此问题）。若仍出现，检查 PG 插件是否随宿主重建 |
-| 多库项目只有 `default` 迁了 / 某库启动报 M004 | `oj migrate` 缺省只作用 `default`——命名库要 `oj migrate -c config.yaml -d dist --db <name>` 逐库各跑一遍（`test fixture` / `schema diff` 同旗标） |
-| `oj migrate --db X` 把别的模块的表也建进了 X | `--db` 是**整轮**目标库，不读模块级 `manifest.yaml` 的 `db:` 绑定（那只是运行期路由）——模块绑不同库时用 `--db X --module M` 逐组合跑（`scenarios.md` 场景 6） |
+| 多库项目只有 `default` 迁了 / 某库启动报 M004 | v0.1.142 起 `oj migrate` 按模块 `manifest.yaml` 的 `db:` 绑定逐组路由——**一条命令全覆盖**，命名库的模块要在 manifest 写 `db: <profile>`（绑定库未声明会 fail-fast 点名，不会静默回落 default） |
+| `--db "x" 无绑定模块（…只作用于 manifest.yaml db: 段绑定到该库的模块）` | v0.1.142 起 `--db` 是**过滤器**只跑绑定模块，不再是整轮目标库。报这个 = 没有任何模块 `db:` 绑定到 x（常见于只声明了库、忘了在 manifest 写绑定）；想全量跑就不带 `--db` |
+| 模块写了 `db:` 绑定、serve 启动（dev auto / release verify）却把迁移打到 default / verify 报 M004 | **已知缺口（v0.1.142）**：`server.migrate_on_start` 启动门禁与启动期 seed 重放尚不读 `db:` 绑定，只作用 default 库。serve 前先手动 `oj migrate -c config.yaml -d <dir>` 一次（它已按绑定路由）；启动门禁的绑定路由在后续版本跟进 |
+| `oj migrate --db X` 把别的模块的表也建进了 X | v0.1.141 及更早的 `--db` 是**整轮**目标库、不读 `db:` 绑定——**v0.1.142 起已修复**（过滤器语义），升级即可；老版本 workaround 是 `--db X --module M` 逐组合跑 |
 | 生产看 logs 看不到 SQL / 信封里没有 `_sql` | SQL 追踪 dev 默认开、release 默认关（`v0.1.51`）。生产要开就在 config 加 `db_trace.enabled: true`；dev 模式（无 `dist/manifests.yaml`）直接就有，看 `target="oj::sql"` 的日志或响应信封 `_sql` 字段 |
 | 追踪日志/画像里 `params` 是 `"3 params"` 看不到真实值 | `db_trace.redact_params` 默认 `true`（防密码/手机号泄漏）。本地排障关掉脱敏：`db_trace.redact_params: false`（值经 JSON 序列化）；**切勿在生产开明文** |
 | `db.sqlProfile()` 返回空对象 `{}` | 追踪未开启（release 默认 / `enabled:false`）——dev 模式或 `db_trace.enabled: true` 下才有数据；同一请求内调用，跨请求重置 |

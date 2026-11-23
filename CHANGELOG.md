@@ -18,6 +18,23 @@
 
 ## 下一版（未发布）
 
+**REQ-HNSW Phase 1：数据命令按 `manifest.yaml` 的 `db:` 绑定路由到命名连接**（下游
+oj-wiki-docs 平台能力需求；devkit 四件已同步，`--db` 语义变更是用户可见变更）：
+
+- `oj migrate` / `--with-seed` / `oj test fixture` / `oj schema diff` 逐组落库：每模块的
+  迁移、schema 收敛、baseline、seed、fixtures、对账落到其 `db:` 绑定的 config `db:` 段
+  profile（无绑定 = default）。多库项目一条命令全覆盖，收尾按组打印 `→ db "<name>"`。
+- `--db <name>` 语义收窄为**过滤器**：只跑绑定到该库的模块；已声明但无绑定模块报
+  `--db "x" 无绑定模块`，不再把全部模块灌进指定库；未声明库名照旧 fail-fast 并列出可用键。
+- 模块绑定库未在 config `db:` 段声明 → 装配期 fail-fast，点名模块与库名，绝不静默回落 default。
+- **已知缺口**：`server.migrate_on_start` 启动门禁（dev auto / release verify）与启动期
+  seed 重放仍只作用 default 库、不读 `db:` 绑定——绑定模块在 serve 前需先跑一次
+  `oj migrate`；启动门禁的绑定路由在后续版本跟进（SKILL.md 陷阱速查已登记）。
+- 测试：双 sqlite 命名库夹具新增路由/失败语义用例 11 条（含跨组部分失败、reconcile 路由、
+  baseline/seed/fixture 落库点、dist 产物 manifest 形态固化）。
+
+## v0.1.142（2026-11-24，未打标签）
+
 **代码评审（v0.1.138..v0.1.141，high）三项修复**（无 ABI / JS API 变化，仅行为纠正）：
 
 - **`ws.rooms_cluster` boot 探针改为周期性重发**（`src/bridge/relay.rs`）：

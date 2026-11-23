@@ -318,7 +318,7 @@ tables:
 | 命令 | 用途 |
 |---|---|
 | `oj migrate -c config.yaml -d <dir>` | 应用待执行迁移（`--baseline`：存量库接入，≤head 记为已应用不执行） |
-| `oj migrate --with-seed -c config.yaml -d <dir> [module]` | （v0.1.125）迁移成功后，对同一批模块（含 `--module` 过滤）紧接着重放各自 `seed.sql`，严格 migrate→seed、同一目标库连接；opt-in，与 `--baseline` 互斥，详见下节 |
+| `oj migrate --with-seed -c config.yaml -d <dir> [module]` | （v0.1.125）迁移成功后，对同一批模块（含 `--module` 过滤）紧接着重放各自 `seed.sql`，严格 migrate→seed；v0.1.142 起 seed 随 `manifest.yaml` 的 `db:` 绑定逐组落到各绑定库；opt-in，与 `--baseline` 互斥，详见下节 |
 | `oj schema diff -c config.yaml -d <dir>` | 声明 vs 实库对账（D001 漂移 / D002 未声明表），只读，漂移 exit 1 |
 | `oj test fixture -c config.yaml -d <dir>` | 灌 `fixtures/*.sql` 演示数据（dev/test 用，不进 release 产物）。v0.1.52 起有**幂等门禁**：非幂等 INSERT（判据同 S006）灌入前报错，改 `INSERT OR IGNORE` / `ON CONFLICT DO NOTHING` 写法即可重复灌 |
 | `oj openapi -c config.yaml [-d dir] [--base B] [-o out.json]` | 从路由表生成 OpenAPI 3.1（dev 内省 `.route` / release 读 `dist/routes.js`），打印或落盘（v0.1.43）；v0.1.52 起 dev 分支内省失败同样 fail-fast（对齐 release，不再静默缺路由）；**v0.1.70 起补齐响应侧**：`.schema.response`（v0.1.72 起亦可写平级 `.response`，优先级 动词 `.response` > 组 `.response` > 动词 `.schema.response` > 组 `.schema.response`）→ `responses.200`（外裹 `{code,msg,data}` 信封）、每个 operation 与 spec 根带 **`tags: [<module>]`**、生成前审计全部 `.schema`（非法契约不再原样进 spec）、`operationId` 重复即报错、**v0.1.73 起 `del` 动词归一为 `delete` 操作键**（OpenAPI 3.x 只认标准 HTTP 方法） |
@@ -326,11 +326,13 @@ tables:
 | `oj openapi -c config.yaml --check` | 生成物与已提交 `openapi.json` 比对，键序规范化后不一致即非零退出（CI 漂移门禁，v0.1.43）；`--check` 时 `-o` 为待比对文件，缺省 `<dir>/openapi.json` |
 | `oj mcp -c config.yaml [-d dir \| --module-root root] [--base B] [-o mcp/mcp-server.js]` | （v0.1.110）离线生成零依赖 Node.js stdio MCP server（内嵌 tool 数组 + dispatch 表 + spec_hash）；运行时 env：`OJ_BASE`（必）、`OJ_TOKEN`（Bearer，选）、`OJ_TENANT`（租户值，config 声明租户头时）；路由变更须重新生成 |
 
-三条数据类命令（`migrate` / `test fixture` / `schema diff`）都接受 `--db <name>`（v0.1.21）：
-`name` 即 config `db:` 段的键，缺省 `default`；**未声明的库名直接报错**并列出可用键，
-不会静默回落 `default`。注意它是**整轮目标库**：会把全部模块的迁移灌进该库，不读模块级
-`manifest.yaml` 的 `db:` 绑定（那只是运行期路由）。所以模块绑不同库的项目，要
-`--db <profile> --module <M>` 逐组合各跑一遍（`scenarios.md` 场景 6）。
+三条数据类命令（`migrate` / `test fixture` / `schema diff`）都按模块 `manifest.yaml`
+的 `db:` 绑定路由（v0.1.142；`db:` 段此前只是运行期路由）：每个模块的迁移 / fixtures /
+schema 收敛 / `--baseline` / `--with-seed` 落到它绑定的 config `db:` 段 profile，
+无绑定 = `default`；绑定库未声明 → 装配期 fail-fast 点名模块与库名。`--db <name>`
+（v0.1.21）从 v0.1.142 起是**过滤器**：只跑绑定到该库的模块（未声明的库名照旧报错；
+已声明但无绑定模块报 `--db "x" 无绑定模块`——**不再**把全部模块灌进指定库）。
+多库项目一条 `oj migrate` 即可全覆盖，收尾按组打印 `→ db "<name>"` 供核对。
 
 ### `oj migrate` 输出格式与模块定向
 
