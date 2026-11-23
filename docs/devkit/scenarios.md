@@ -537,8 +537,9 @@ db: analytics        # ★ 该模块里字面 db.* 的调用落到 analytics（�
 ```bash
 # 一条命令全覆盖：每个模块的迁移/fixtures/seed/对账自动落到它 manifest db: 绑定的库
 ./bin/oj migrate -c config.yaml -d dist
-# 收尾按组打印，用它核对：oj migrate: 3 migration(s) across 1 module(s) → db "analytics"
-#                                                     5 migration(s) across 2 module(s) → db "default"
+# 收尾按组打印（组键字典序，default 在前），用它核对：
+#   oj migrate: 5 migration(s) across 2 module(s) → db "default"
+#   oj migrate: 3 migration(s) across 1 module(s) → db "analytics"
 
 # 只跑某一个库上的绑定模块（不会误跑其它模块）
 ./bin/oj migrate -c config.yaml -d dist --db analytics

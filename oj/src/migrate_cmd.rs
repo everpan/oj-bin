@@ -19,7 +19,7 @@ type Mods = Vec<(String, PathBuf)>;
 /// 逐组落到绑定库，不再共享单一 target。
 struct Slim {
     dbs: HashMap<String, Arc<dyn DataAccessor>>,
-    /// (绑定库名, 模块)——键升序（"default" 在首），组内保持发现顺序。
+    /// (绑定库名, 模块)——键字典序（BTreeMap；组间无依赖），组内保持发现顺序。
     groups: Vec<(String, Mods)>,
     sql_guard: only_js::bridge::SqlGuard,
 }
@@ -114,7 +114,7 @@ async fn slim(
 }
 
 /// 模块 → 绑定库分组（manifest `db:` 段，§5.3；缺省/空 = "default"）。
-/// 键升序（"default" 恒在首），组内保持发现顺序。发现期已保证 manifest.yaml 存在
+/// 键字典序（BTreeMap），组内保持发现顺序。发现期已保证 manifest.yaml 存在
 /// （`manifest::discover` 缺即报错），此处 parse 失败 = 清单损坏 → fail-fast；
 /// 绑定库未在 config db: 段声明 → fail-fast 点名模块与库名，绝不静默回落 default。
 fn bind_groups(
