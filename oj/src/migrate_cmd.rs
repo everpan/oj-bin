@@ -2,6 +2,7 @@
 //! （其证书门禁无逃生口、且携带 seed/路由），CI/运维机无证书也可执行迁移；
 //! 只解析 config → 插件 → 逐 db 开库 → 迁移/fixtures。
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -10,10 +11,16 @@ use only_js::bridge::DataAccessor;
 use crate::args::{FixtureArgs, MigrateArgs, SchemaDiffArgs};
 use crate::serve_cmd::{AppConfig, Registries, assemble_plugins, connect_dbs, load_app_config};
 
-/// 瘦身装配产物：目标库句柄（`--db` 选定的 config profile）+ 模块列表（可被 `--module` 过滤）。
+/// 发现期模块清单项（模块名, 模块目录）——本文件三处签名共用。
+type Mods = Vec<(String, PathBuf)>;
+
+/// 瘦身装配产物：全部命名库句柄（config `db:` 段）+ 模块按 manifest `db:` 绑定
+/// 分组（`--module` 过滤后分组）。REQ-HNSW Phase 1：迁移/fixtures/seed/对账
+/// 逐组落到绑定库，不再共享单一 target。
 struct Slim {
-    target: Arc<dyn DataAccessor>,
-    modules: Vec<(String, PathBuf)>,
+    dbs: HashMap<String, Arc<dyn DataAccessor>>,
+    /// (绑定库名, 模块)——键升序（"default" 在首），组内保持发现顺序。
+    groups: Vec<(String, Mods)>,
     sql_guard: only_js::bridge::SqlGuard,
 }
 
@@ -45,25 +52,18 @@ async fn slim(
     let mut registries = Registries::default();
     assemble_plugins(&cfg, &top, &config_dir, &mut registries, None, false).await?;
     let dbs = connect_dbs(&cfg.db, &registries.dbs, &config_dir).await?;
-    // 目标库（v0.1.21）：`--db` 选 config `db:` 段的 profile，缺省 "default"。
-    // 未声明的库名 fail-fast——静默回落 default 等于把迁移打在开发库上（与
-    // `oj test --db`、`App::from_config` 同一条纪律）。
-    let key = db.unwrap_or("default");
-    let target = dbs
-        .get(key)
-        .ok_or_else(|| {
-            let mut names: Vec<&str> = dbs.keys().map(|s| s.as_str()).collect();
-            names.sort_unstable();
-            match db {
-                Some(_) => format!("--db {key:?} not declared in config (db keys: {names:?})"),
-                None => format!(
-                    "config has no 'default' db（迁移/fixtures/对账需要一个目标库；\
-                     用 --db <name> 指定其它 profile，已声明：{names:?}）"
-                ),
-            }
-        })?
-        .clone();
-    tracing::info!(db = key, "target db selected");
+    // `--db`（v0.1.21）fail-fast 保留：未声明的库名即刻报错——静默回落等于把
+    // 迁移打在开发库上（与 `oj test --db`、`App::from_config` 同一条纪律）。
+    // 此处只校验「声明与否」；「该库有无绑定模块」分组后再判（见 bind_groups 后）。
+    if let Some(db) = db
+        && !dbs.contains_key(db)
+    {
+        let mut names: Vec<&str> = dbs.keys().map(|s| s.as_str()).collect();
+        names.sort_unstable();
+        return Err(format!(
+            "--db {db:?} not declared in config (db keys: {names:?})"
+        ));
+    }
     let mut modules = crate::manifest::discover(&dir, ts, module_index.as_deref())?;
     if let Some(m) = module {
         // 定向匹配两级：① 裸模块名精确匹配（现状保持）；② 未命中时按 dist 版本
@@ -92,11 +92,61 @@ async fn slim(
             }
         }
     }
+    let mut groups = bind_groups(&modules, &dbs)?;
+    if let Some(db) = db {
+        groups.retain(|(k, _)| k == db);
+        if groups.is_empty() {
+            return Err(format!(
+                "--db {db:?} 无绑定模块（迁移/fixtures/对账只作用于 manifest.yaml \
+                 db: 段绑定到该库的模块）"
+            ));
+        }
+    } else {
+        for (k, mods) in &groups {
+            tracing::info!(db = k, modules = mods.len(), "bound group selected");
+        }
+    }
     Ok(Slim {
-        target,
-        modules,
+        dbs,
+        groups,
         sql_guard: cfg.tenant.sql_guard,
     })
+}
+
+/// 模块 → 绑定库分组（manifest `db:` 段，§5.3；缺省/空 = "default"）。
+/// 键升序（"default" 恒在首），组内保持发现顺序。发现期已保证 manifest.yaml 存在
+/// （`manifest::discover` 缺即报错），此处 parse 失败 = 清单损坏 → fail-fast；
+/// 绑定库未在 config db: 段声明 → fail-fast 点名模块与库名，绝不静默回落 default。
+fn bind_groups(
+    modules: &[(String, PathBuf)],
+    dbs: &HashMap<String, Arc<dyn DataAccessor>>,
+) -> Result<Vec<(String, Mods)>, String> {
+    let mut map: std::collections::BTreeMap<String, Vec<(String, PathBuf)>> =
+        std::collections::BTreeMap::new();
+    for (name, mdir) in modules {
+        let mf = crate::manifest::parse_one(&mdir.join("manifest.yaml"))
+            .map_err(|e| format!("模块 {name} 的 manifest.yaml 解析失败：{e}"))?;
+        let binding = mf
+            .db
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "default".into());
+        if !dbs.contains_key(&binding) {
+            let mut names: Vec<&str> = dbs.keys().map(|s| s.as_str()).collect();
+            names.sort_unstable();
+            let fix = if binding == "default" {
+                "请声明 default profile，或将模块 manifest.yaml 的 db: 段改绑已声明库"
+            } else {
+                "请在 config db: 段声明该 profile，或将模块 manifest.yaml 的 db: 段改绑已声明库"
+            };
+            return Err(format!(
+                "模块 {name} 绑定库 {binding:?} 未在 config db: 段声明（已声明：{names:?}）；{fix}"
+            ));
+        }
+        map.entry(binding)
+            .or_default()
+            .push((name.clone(), mdir.clone()));
+    }
+    Ok(map.into_iter().collect())
 }
 
 /// 错误脱敏（设计稿 §4.1.3）：消息中内嵌的 `<scheme>://user:pass@host/...` 形
@@ -270,42 +320,44 @@ async fn migrate_collect(
     (results, total)
 }
 
-/// seed 阶段（仅 `--with-seed` 且 migrate 全成功后调用）：执行 + 规整成
-/// (顶层 `seed` 字段, 失败原因)。失败原因专供 stderr 人话前置——下游
+/// seed 阶段（仅 `--with-seed` 且 migrate 全成功后调用）：逐绑定组执行 +
+/// 规整成 (顶层 `seed` 字段, 失败原因)。失败原因专供 stderr 人话前置——下游
 /// `parseMigrateOutput` 在 `code !== 0` 提前 return，只取 `(stderr||stdout)` 头部，
-/// `seed.*` JSON 是死字段（评审 P-A）。
+/// `seed.*` JSON 是死字段（评审 P-A）。装配期全局失败（方言/读文件）带 [db] 前缀定位。
 async fn run_seed_phase(
-    target: &Arc<dyn DataAccessor>,
-    modules: &[(String, PathBuf)],
+    dbs: &HashMap<String, Arc<dyn DataAccessor>>,
+    groups: &[(String, Vec<(String, PathBuf)>)],
 ) -> (SeedJson, Option<String>) {
-    match crate::seed::replay_modules(target, modules).await {
-        Ok(results) => {
-            // 逐模块 continue-and-collect：任一 ok=false 即整条命令失败。
-            let reason = results.iter().find(|r| !r.ok).map(|r| {
-                let file = r.file.as_deref().unwrap_or("seed.sql");
-                let detail = r.error.as_deref().unwrap_or("未知错误");
-                sanitize_dsn(&format!("模块 {} 的 {file}：{detail}", r.module))
-            });
-            (
-                SeedJson {
-                    results,
-                    error: None,
-                },
-                reason,
-            )
-        }
-        Err(e) => {
-            // 执行前全局失败（门禁 / S002 / 方言 / 读文件）：已脱敏 + 点名文件/下一步。
-            let reason = sanitize_dsn(&e);
-            (
-                SeedJson {
-                    results: Vec::new(),
-                    error: Some(reason.clone()),
-                },
-                Some(reason),
-            )
+    let mut all: Vec<crate::seed::SeedResult> = Vec::new();
+    for (key, mods) in groups {
+        let db = dbs.get(key).expect("bind_groups 已校验绑定库存在");
+        match crate::seed::replay_modules(db, mods).await {
+            Ok(rs) => all.extend(rs),
+            Err(e) => {
+                let reason = sanitize_dsn(&format!("[db {key}] {e}"));
+                return (
+                    SeedJson {
+                        results: all,
+                        error: Some(reason.clone()),
+                    },
+                    Some(reason),
+                );
+            }
         }
     }
+    // 逐组 continue-and-collect：任一 ok=false 即整条命令失败。
+    let reason = all.iter().find(|r| !r.ok).map(|r| {
+        let file = r.file.as_deref().unwrap_or("seed.sql");
+        let detail = r.error.as_deref().unwrap_or("未知错误");
+        sanitize_dsn(&format!("模块 {} 的 {file}：{detail}", r.module))
+    });
+    (
+        SeedJson {
+            results: all,
+            error: None,
+        },
+        reason,
+    )
 }
 
 /// `oj migrate [-c config] [-d dir] [--db name] [--baseline] [--with-seed]
@@ -343,19 +395,26 @@ pub async fn run_migrate(a: &MigrateArgs) -> Result<(), String> {
             return Err(e);
         }
     };
-    let (results, total) =
-        migrate_collect(&s.target, &s.modules, a.baseline, s.sql_guard, json_mode).await;
+    let mut results: Vec<JsonResult> = Vec::new();
+    // 逐绑定组执行：每组落自己的库；组间 continue-and-collect 由 results 合并承载。
+    let mut per_group: Vec<(String, usize, usize)> = Vec::new();
+    for (key, mods) in &s.groups {
+        let target = s.dbs.get(key).expect("bind_groups 已校验绑定库存在");
+        let (r, t) = migrate_collect(target, mods, a.baseline, s.sql_guard, json_mode).await;
+        per_group.push((key.clone(), t, mods.len()));
+        results.extend(r);
+    }
+    let n_modules: usize = s.groups.iter().map(|(_, m)| m.len()).sum();
     let failed: Vec<String> = results
         .iter()
         .filter(|r| !r.ok)
         .map(|r| r.module.clone())
         .collect();
-    // --with-seed（v0.1.125）：仅在**迁移全成功**后，对同一批 s.modules 同批重放
-    // seed，共用 s.target 库连接、不另解析 config。迁移有失败 → 不跑 seed、顶层
-    // `seed` 也不出现（对齐 app.rs 迁移门禁先于 seed）。seed 任一失败 → 整条命令
-    // 非零退出（安装器 parseMigrateOutput 以 exit code 为成败真源）。
+    // --with-seed（v0.1.125）：仅在**迁移全成功**后逐组重放 seed。迁移有失败 →
+    // 不跑 seed、顶层 `seed` 也不出现（对齐 app.rs 迁移门禁先于 seed）。
+    // seed 任一失败 → 整条命令非零退出（安装器 parseMigrateOutput 以 exit code 为成败真源）。
     let (seed_out, seed_failure) = if a.with_seed && failed.is_empty() {
-        let (sj, reason) = run_seed_phase(&s.target, &s.modules).await;
+        let (sj, reason) = run_seed_phase(&s.dbs, &s.groups).await;
         (Some(sj), reason)
     } else {
         (None, None)
@@ -376,11 +435,9 @@ pub async fn run_migrate(a: &MigrateArgs) -> Result<(), String> {
         };
         println!("{}", json_line(&out)?);
     } else {
-        println!(
-            "oj migrate: {total} migration(s) across {} module(s) → db {:?}",
-            s.modules.len(),
-            a.db.as_deref().unwrap_or("default")
-        );
+        for (key, t, n) in &per_group {
+            println!("oj migrate: {t} migration(s) across {n} module(s) → db {key:?}");
+        }
         if let Some(sj) = &seed_out {
             let ok = sj.results.iter().filter(|r| r.ok).count();
             println!("oj migrate: seed 重放 {ok}/{} 模块", sj.results.len());
@@ -390,7 +447,7 @@ pub async fn run_migrate(a: &MigrateArgs) -> Result<(), String> {
         Err(format!(
             "{} of {} module(s) failed: {}",
             failed.len(),
-            s.modules.len(),
+            n_modules,
             failed.join(", ")
         ))
     } else if seed_failure.is_some() {
@@ -411,7 +468,12 @@ pub async fn run_fixture(a: &FixtureArgs) -> Result<(), String> {
         a.module_root.as_deref(),
     )
     .await?;
-    let n = load_fixtures(Some(&s.target), &s.modules).await?;
+    // 逐绑定组灌 fixtures：每组落自己的库。
+    let mut n = 0;
+    for (key, mods) in &s.groups {
+        let target = s.dbs.get(key).expect("bind_groups 已校验绑定库存在");
+        n += load_fixtures(Some(target), mods).await?;
+    }
     println!("oj test fixture: {n} statement(s) loaded");
     Ok(())
 }
@@ -428,18 +490,22 @@ pub async fn run_schema_diff(a: &SchemaDiffArgs) -> Result<(), String> {
         a.module_root.as_deref(),
     )
     .await?;
-    let mut mods = Vec::new();
-    for (name, mdir) in &s.modules {
-        if let Some(f) = crate::schema::SchemaFile::load(mdir)? {
-            mods.push((name.clone(), f));
+    // 逐绑定组对账：模块声明与自己的绑定库比对（绑定库无该组之外的模块噪音）。
+    let mut mods_n = 0;
+    let mut report = Vec::new();
+    for (key, mods) in &s.groups {
+        let mut mods_decl = Vec::new();
+        for (name, mdir) in mods {
+            if let Some(f) = crate::schema::SchemaFile::load(mdir)? {
+                mods_decl.push((name.clone(), f));
+            }
         }
+        mods_n += mods_decl.len();
+        let db = s.dbs.get(key).expect("bind_groups 已校验绑定库存在");
+        report.extend(crate::schema::diff(db.as_ref(), &mods_decl).await?);
     }
-    let report = crate::schema::diff(s.target.as_ref(), &mods).await?;
     if report.is_empty() {
-        println!(
-            "oj schema diff: in sync（{} 个模块声明与实库一致）",
-            mods.len()
-        );
+        println!("oj schema diff: in sync（{} 个模块声明与实库一致）", mods_n);
         Ok(())
     } else {
         for l in &report {

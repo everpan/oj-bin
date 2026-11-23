@@ -72,6 +72,48 @@ fn project(tag: &str) -> PathBuf {
     t
 }
 
+/// 夹具：双模块双库——`core` 无绑定（→default），`ao` 绑定 `vectors`。
+/// REQ-HNSW Phase 1：迁移按 manifest `db:` 段路由到命名连接。
+fn project_bound(tag: &str) -> PathBuf {
+    let t = tmpdir(tag);
+    let d = format!("sqlite://{}/db.sqlite", t.display());
+    let v = format!("sqlite://{}/db_vectors.sqlite", t.display());
+    write_config(&t, &[("default", &d), ("vectors", &v)]);
+    for (m, manifest) in [
+        ("core", "name: core\ndesc: d\nversion: 0.1.0\n"),
+        ("ao", "name: ao\ndesc: d\nversion: 0.1.0\ndb: vectors\n"),
+    ] {
+        std::fs::create_dir_all(t.join(format!("src/{m}/migrations"))).unwrap();
+        std::fs::write(t.join(format!("src/{m}/manifest.yaml")), manifest).unwrap();
+    }
+    std::fs::write(
+        t.join("src/core/migrations/0001__init.sql"),
+        "CREATE TABLE g (x);",
+    )
+    .unwrap();
+    std::fs::write(
+        t.join("src/ao/migrations/0001__init.sql"),
+        "CREATE TABLE v (x);",
+    )
+    .unwrap();
+    t
+}
+
+/// 便捷构造：标准 migrate 调用（其余旗标缺省）。
+fn mig_args(t: &Path, db: Option<&str>) -> MigrateArgs {
+    MigrateArgs {
+        site: None,
+        config: Some(cfg(t)),
+        dir: src(t),
+        module_root: None,
+        baseline: false,
+        with_seed: false,
+        module: None,
+        db: db.map(|s| s.to_string()),
+        format: None,
+    }
+}
+
 /// 项目 config 路径 + src 目录（测试里反复用）。
 fn cfg(t: &Path) -> String {
     t.join("config.yaml").display().to_string()
@@ -166,7 +208,13 @@ async fn migrate_and_fixture_end_to_end() {
 #[tokio::test(flavor = "current_thread")]
 async fn db_flag_targets_declared_profile_and_rejects_unknown() {
     let t = project("dbflag");
-    // 声明并迁移：三处瘦身装配的目标库都随 --db 走。
+    // 声明并迁移：三处瘦身装配的目标库都随 --db 走。模块绑定 test 库（manifest
+    // db: 段）——迁移/fixtures/对账只作用于绑定到 --db 所指库的模块。
+    std::fs::write(
+        t.join("src/m/manifest.yaml"),
+        "name: m\ndesc: d\nversion: 0.1.0\ndb: test\n",
+    )
+    .unwrap();
     std::fs::write(
         t.join("src/m/schema.yaml"),
         "tables:\n  g:\n    columns:\n      x: { type: text }\n",
@@ -204,7 +252,7 @@ async fn db_flag_targets_declared_profile_and_rejects_unknown() {
     })
     .await
     .unwrap();
-    // 对账同样落在 test profile（迁过的库 in sync；default 未迁 → D001 漂移）。
+    // 对账同样落在 test profile（迁过的库 in sync；default 无绑定模块 → 空对账 in sync）。
     run_schema_diff(&SchemaDiffArgs {
         config: Some(cfg(&t)),
         dir: src(&t),
@@ -213,15 +261,14 @@ async fn db_flag_targets_declared_profile_and_rejects_unknown() {
     })
     .await
     .unwrap();
-    let e = run_schema_diff(&SchemaDiffArgs {
+    run_schema_diff(&SchemaDiffArgs {
         config: Some(cfg(&t)),
         dir: src(&t),
         module_root: None,
         db: None,
     })
     .await
-    .unwrap_err();
-    assert!(e.contains("漂移"), "--db 缺省仍对 default 库对账：{e}");
+    .unwrap();
     // 未声明库名：三处一致 fail-fast 且报出可用键。
     for e in [
         run_migrate(&MigrateArgs {
@@ -286,7 +333,7 @@ async fn db_flag_edge_cases_never_fall_back_to_default() {
         !has_table(&t, "g").await,
         "空 --db 不得回落 default 执行迁移"
     );
-    // 只声明 test（无 default）：不给 --db 报错并指路，给 --db 则正常迁移。
+    // 只声明 test（无 default）：未绑定模块无处落账 → 装配期 fail-fast 点名 default。
     let x = format!("sqlite://{}/db_test.sqlite", t.display());
     write_config(&t, &[("test", &x)]);
     let e = run_migrate(&MigrateArgs {
@@ -302,8 +349,15 @@ async fn db_flag_edge_cases_never_fall_back_to_default() {
     })
     .await
     .unwrap_err();
-    assert!(e.contains("--db"), "缺 default 须指路 --db：{e}");
+    assert!(e.contains("default"), "须点名缺失的 default 绑定库：{e}");
+    assert!(e.contains("test"), "报错须列出已声明键：{e}");
     assert!(!has_table_in(&t.join("db_test.sqlite"), "g").await);
+    // 模块改绑 test 后：--db test 正常迁移（落 test 库，不回落 default）。
+    std::fs::write(
+        t.join("src/m/manifest.yaml"),
+        "name: m\ndesc: d\nversion: 0.1.0\ndb: test\n",
+    )
+    .unwrap();
     run_migrate(&MigrateArgs {
         site: None,
         config: Some(cfg(&t)),
@@ -318,6 +372,272 @@ async fn db_flag_edge_cases_never_fall_back_to_default() {
     .await
     .unwrap();
     assert!(has_table_in(&t.join("db_test.sqlite"), "g").await);
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+// ===== REQ-HNSW Phase 1：迁移/fixtures/seed/对账按 manifest.db 绑定路由 =====
+
+/// S1：无绑定模块落 default、绑定模块落命名库；同库多模块共存；重跑幂等。
+#[tokio::test(flavor = "current_thread")]
+async fn migrate_routes_by_manifest_db_binding() {
+    let t = project_bound("route");
+    // ao2 同绑 vectors：与 ao 同组、都落 vectors。
+    std::fs::create_dir_all(t.join("src/ao2/migrations")).unwrap();
+    std::fs::write(
+        t.join("src/ao2/manifest.yaml"),
+        "name: ao2\ndesc: d\nversion: 0.1.0\ndb: vectors\n",
+    )
+    .unwrap();
+    std::fs::write(
+        t.join("src/ao2/migrations/0001__init.sql"),
+        "CREATE TABLE v2 (x);",
+    )
+    .unwrap();
+    run_migrate(&mig_args(&t, None)).await.unwrap();
+    assert!(has_table(&t, "g").await, "core（无绑定）落 default");
+    assert!(!has_table(&t, "v").await, "ao 不得落 default");
+    let dv = t.join("db_vectors.sqlite");
+    assert!(
+        has_table_in(&dv, "v").await && has_table_in(&dv, "v2").await,
+        "ao/ao2 都落 vectors"
+    );
+    assert!(has_table_in(&dv, "_oj_migrations").await);
+    assert_eq!(
+        ledger_modules_in(&dv).await,
+        vec!["ao".to_string(), "ao2".to_string()]
+    );
+    // 幂等：重跑账本不增。
+    let n = ledger_rows_in(&dv, "ao").await;
+    run_migrate(&mig_args(&t, None)).await.unwrap();
+    assert_eq!(ledger_rows_in(&dv, "ao").await, n, "重跑不得新增账本行");
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+/// S2：`--db` 过滤——只跑绑定组，其余库零变更。
+#[tokio::test(flavor = "current_thread")]
+async fn migrate_db_flag_filters_to_bound_group() {
+    let t = project_bound("dbfilter");
+    run_migrate(&mig_args(&t, Some("vectors"))).await.unwrap();
+    assert!(has_table_in(&t.join("db_vectors.sqlite"), "v").await);
+    assert!(
+        !has_table(&t, "g").await && !has_table(&t, "_oj_migrations").await,
+        "default 库零变更"
+    );
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+/// S3：绑定库未在 config 声明 → 装配期 fail-fast，点名模块与库名，所有库零变更。
+#[tokio::test(flavor = "current_thread")]
+async fn migrate_fail_fast_on_undeclared_bound_db() {
+    let t = project_bound("undeclared");
+    let d = format!("sqlite://{}/db.sqlite", t.display());
+    write_config(&t, &[("default", &d)]);
+    let e = run_migrate(&mig_args(&t, None)).await.unwrap_err();
+    assert!(e.contains("ao") && e.contains("vectors"), "{e}");
+    assert!(!has_table(&t, "g").await, "装配期失败不得落任何库");
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+/// S4：`--db` 指向已声明但无绑定模块的库 → 报错不误跑其它模块。
+#[tokio::test(flavor = "current_thread")]
+async fn migrate_db_flag_with_no_bound_module_errors() {
+    let t = project_bound("nobound");
+    let d = format!("sqlite://{}/db.sqlite", t.display());
+    let v = format!("sqlite://{}/db_vectors.sqlite", t.display());
+    let a = format!("sqlite://{}/db_analytics.sqlite", t.display());
+    write_config(&t, &[("default", &d), ("vectors", &v), ("analytics", &a)]);
+    let e = run_migrate(&mig_args(&t, Some("analytics")))
+        .await
+        .unwrap_err();
+    assert!(e.contains("analytics"), "{e}");
+    assert!(!has_table(&t, "g").await, "不得误跑 default 组");
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+/// `--module` × `--db`：定向模块绑定他库 → 同 S4 空组报错。
+#[tokio::test(flavor = "current_thread")]
+async fn migrate_module_flag_with_mismatched_db_errors() {
+    let t = project_bound("moddb");
+    let e = run_migrate(&MigrateArgs {
+        module: Some("core".into()),
+        ..mig_args(&t, Some("vectors"))
+    })
+    .await
+    .unwrap_err();
+    assert!(e.contains("vectors"), "{e}");
+    assert!(!has_table(&t, "g").await);
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+/// S8：某组部分失败 → 其余组仍应用、整体报错点名失败模块。
+#[tokio::test(flavor = "current_thread")]
+async fn migrate_partial_failure_continues_other_groups() {
+    let t = project_bound("partial");
+    std::fs::write(
+        t.join("src/ao/migrations/0002__boom.sql"),
+        "CREATE TABLE t_syntax_error (",
+    )
+    .unwrap();
+    let e = run_migrate(&mig_args(&t, None)).await.unwrap_err();
+    assert!(e.contains("ao"), "{e}");
+    assert!(
+        has_table(&t, "g").await,
+        "default 组不得被 vectors 组失败阻断"
+    );
+    assert!(
+        has_table_in(&t.join("db_vectors.sqlite"), "v").await,
+        "ao 的 0001 已提交应保留"
+    );
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+/// P0：schema reconcile 随绑定库走（HNSW DDL 的真实承载路径）。
+#[tokio::test(flavor = "current_thread")]
+async fn migrate_reconcile_targets_bound_db() {
+    let t = project_bound("reconcile");
+    std::fs::write(
+        t.join("src/ao/schema.yaml"),
+        "tables:\n  v:\n    columns:\n      x: { type: text }\n      y: { type: text }\n",
+    )
+    .unwrap();
+    run_migrate(&mig_args(&t, None)).await.unwrap();
+    let v = connect_db(&t.join("db_vectors.sqlite")).await;
+    let cols: Vec<String> = v
+        .query("select name from pragma_table_info('v')")
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        cols.contains(&"y".to_string()),
+        "reconcile 加列须落绑定库：{cols:?}"
+    );
+    let d = t.join("db.sqlite");
+    assert!(
+        !has_table_in(&d, "v").await,
+        "default 库不得被 ao 的 reconcile 触碰"
+    );
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+/// S-baseline：baseline 记账落绑定库、不执行 SQL。
+#[tokio::test(flavor = "current_thread")]
+async fn migrate_baseline_targets_bound_db() {
+    let t = project_bound("baseline-bound");
+    let mut args = mig_args(&t, None);
+    args.baseline = true;
+    run_migrate(&args).await.unwrap();
+    let dv = t.join("db_vectors.sqlite");
+    assert!(
+        has_table_in(&dv, "_oj_migrations").await,
+        "baseline 账本落绑定库"
+    );
+    assert!(!has_table_in(&dv, "v").await, "baseline 不执行迁移 SQL");
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+/// S5：`--with-seed` 随绑定库路由——种子行落各模块的绑定库。
+#[tokio::test(flavor = "current_thread")]
+async fn with_seed_routes_by_bound_db() {
+    let t = project_bound("wseed-route");
+    std::fs::write(
+        t.join("src/core/migrations/0001__init.sql"),
+        "CREATE TABLE g (id INTEGER PRIMARY KEY, x TEXT);",
+    )
+    .unwrap();
+    std::fs::write(
+        t.join("src/ao/migrations/0001__init.sql"),
+        "CREATE TABLE v (id INTEGER PRIMARY KEY, x TEXT);",
+    )
+    .unwrap();
+    std::fs::write(
+        t.join("src/core/seed.sql"),
+        "INSERT OR IGNORE INTO g (id, x) VALUES (1, 'c');",
+    )
+    .unwrap();
+    std::fs::write(
+        t.join("src/ao/seed.sql"),
+        "INSERT OR IGNORE INTO v (id, x) VALUES (1, 'a');",
+    )
+    .unwrap();
+    let mut args = mig_args(&t, None);
+    args.with_seed = true;
+    run_migrate(&args).await.unwrap();
+    let d = connect_db(&t.join("db.sqlite")).await;
+    assert_eq!(
+        d.query("select x from g").await.unwrap()[0]["x"]
+            .as_str()
+            .unwrap(),
+        "c"
+    );
+    let v = connect_db(&t.join("db_vectors.sqlite")).await;
+    assert_eq!(
+        v.query("select x from v").await.unwrap()[0]["x"]
+            .as_str()
+            .unwrap(),
+        "a"
+    );
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+/// S6：fixture 随绑定库路由。
+#[tokio::test(flavor = "current_thread")]
+async fn fixture_routes_by_bound_db() {
+    let t = project_bound("fx-route");
+    run_migrate(&mig_args(&t, None)).await.unwrap();
+    std::fs::create_dir_all(t.join("src/core/fixtures")).unwrap();
+    std::fs::write(
+        t.join("src/core/fixtures/demo.sql"),
+        "INSERT OR IGNORE INTO g VALUES (1);",
+    )
+    .unwrap();
+    std::fs::create_dir_all(t.join("src/ao/fixtures")).unwrap();
+    std::fs::write(
+        t.join("src/ao/fixtures/demo.sql"),
+        "INSERT OR IGNORE INTO v VALUES (1);",
+    )
+    .unwrap();
+    run_fixture(&FixtureArgs {
+        site: None,
+        config: Some(cfg(&t)),
+        dir: src(&t),
+        module_root: None,
+        module: None,
+        db: None,
+    })
+    .await
+    .unwrap();
+    let d = connect_db(&t.join("db.sqlite")).await;
+    assert_eq!(
+        d.query("select count(*) as n from g").await.unwrap()[0]["n"]
+            .as_i64()
+            .unwrap(),
+        1
+    );
+    let v = connect_db(&t.join("db_vectors.sqlite")).await;
+    assert_eq!(
+        v.query("select count(*) as n from v").await.unwrap()[0]["n"]
+            .as_i64()
+            .unwrap(),
+        1
+    );
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+/// S7（行为等价锚）：全部模块无绑定 → 全部落 default，与 v0.1.141 行为一致。
+#[tokio::test(flavor = "current_thread")]
+async fn migrate_unbound_modules_keep_default_behavior() {
+    let t = project("unbound-regression");
+    run_migrate(&mig_args(&t, None)).await.unwrap();
+    assert!(
+        has_table(&t, "g").await && has_table(&t, "_oj_migrations").await,
+        "无绑定模块全部落 default"
+    );
+    assert!(
+        !has_table_in(&t.join("db_test.sqlite"), "_oj_migrations").await,
+        "test 库零变更"
+    );
     let _ = std::fs::remove_dir_all(&t);
 }
 
@@ -494,7 +814,15 @@ fn dist_tree(t: &Path, mods: &[DistMod]) {
     let mut lock = String::new();
     for (name, ver, migs) in mods {
         lock.push_str(&format!("{name}: {ver}\n"));
-        let mg = dist.join(format!("{name}-{ver}")).join("migrations");
+        let mdir = dist.join(format!("{name}-{ver}"));
+        std::fs::create_dir_all(&mdir).unwrap();
+        // 复刻真实 oj build 产物：模块目录含 manifest.yaml（无 db: 绑定 → default）。
+        std::fs::write(
+            mdir.join("manifest.yaml"),
+            format!("name: {name}\ndesc: d\nversion: {ver}\n"),
+        )
+        .unwrap();
+        let mg = mdir.join("migrations");
         std::fs::create_dir_all(&mg).unwrap();
         for (fname, sql) in *migs {
             std::fs::write(mg.join(fname), sql).unwrap();
