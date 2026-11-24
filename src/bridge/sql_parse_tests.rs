@@ -303,3 +303,154 @@ async fn sql_parse_unicode_identifiers_verbatim() {
         json!([{"name": "订单表", "schema": null, "alias": null}])
     );
 }
+
+/// S6：幂等无副作用——同输入连调两次结果 deep-equal。
+#[tokio::test(flavor = "current_thread")]
+async fn sql_parse_idempotent_same_input_deep_equal() {
+    let (b, _) = new_bridge();
+    let cap = b
+        .run_with(
+            r#"const s = "WITH r AS (SELECT id FROM t) SELECT r.id FROM r";
+               const a = JSON.stringify(sql.parse(s, { dialect: "postgresql" }));
+               const c = JSON.stringify(sql.parse(s, { dialect: "postgresql" }));
+               json.ok({ equal: a === c, len: a.length });"#,
+            RequestInfo::default(),
+        )
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["data"]["equal"], true);
+    assert!(
+        v["data"]["len"].as_u64().unwrap() > 100,
+        "result must carry real content"
+    );
+}
+
+/// S7：预算——>1MiB 输入在解析前拒绝（budget），快速返回。
+#[tokio::test(flavor = "current_thread")]
+async fn sql_parse_budget_rejects_oversized_input() {
+    let (b, _) = new_bridge();
+    let cap = b
+        .run_with(
+            r#"let caught = null;
+               try { sql.parse("SELECT " + "x".repeat(1048577), { dialect: "postgresql" }); } catch (e) { caught = e; }
+               json.ok({
+                 reason: caught && caught.reason,
+                 code: caught && caught.code,
+                 max: caught && caught.max,
+               });"#,
+            RequestInfo::default(),
+        )
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["data"]["code"], "OJ_SQL_PARSE");
+    assert_eq!(v["data"]["reason"], "budget");
+    assert_eq!(v["data"]["max"], 1048576);
+}
+
+/// S10：深嵌套不崩——千层括号映射为结构化错误（syntax 或 engine），
+/// 同 runtime 后续请求仍可用（进程存活）。
+#[tokio::test(flavor = "current_thread")]
+async fn sql_parse_deep_nesting_structured_error_and_survivor() {
+    let (b, _) = new_bridge();
+    let cap = b
+        .run_with(
+            r#"const deep = "SELECT " + "(".repeat(2000) + "1" + ")".repeat(2000);
+               let caught = null;
+               try { sql.parse(deep, { dialect: "postgresql" }); } catch (e) {
+                 caught = { code: e.code, reason: e.reason || "(none)" };
+               }
+               // survivor probe: same runtime still serves normal parses
+               const ok = sql.parse("select 1", { dialect: "postgresql" });
+               json.ok({ caught, survivor: ok.ast.type });"#,
+            RequestInfo::default(),
+        )
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(
+        v["data"]["survivor"], "select",
+        "runtime must survive deep-nest failure: {v}"
+    );
+    let reason = v["data"]["caught"]["reason"].as_str().unwrap_or("");
+    assert!(
+        reason == "syntax" || reason == "engine",
+        "deep nesting must surface as a STRUCTURED error (syntax|engine), got: {v}"
+    );
+    assert_eq!(v["data"]["caught"]["code"], "OJ_SQL_PARSE");
+}
+
+/// Review Focus 3 + 多语句：空串/纯注释/非字符串 → input；多语句 → syntax。
+#[tokio::test(flavor = "current_thread")]
+async fn sql_parse_input_edge_cases() {
+    let (b, _) = new_bridge();
+    let cap = b
+        .run_with(
+            r#"const grab = (fn) => { try { fn(); return null; } catch (e) { return { reason: e.reason, code: e.code }; } };
+               json.ok({
+                 empty: grab(() => sql.parse("", { dialect: "postgresql" })),
+                 blank: grab(() => sql.parse("   ", { dialect: "postgresql" })),
+                 commentOnly: grab(() => sql.parse("-- nothing here", { dialect: "postgresql" })),
+                 nonString: grab(() => sql.parse(42, { dialect: "postgresql" })),
+                 nonStringObj: grab(() => sql.parse({ sql: "select 1" }, { dialect: "postgresql" })),
+                 multi: grab(() => sql.parse("select 1; select 2", { dialect: "postgresql" })),
+               });"#,
+            RequestInfo::default(),
+        )
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    for k in ["empty", "blank", "nonString", "nonStringObj"] {
+        assert_eq!(
+            v["data"][k]["code"], "OJ_SQL_PARSE",
+            "{k} must be structured: {v}"
+        );
+        assert_eq!(
+            v["data"][k]["reason"], "input",
+            "{k} must be reason=input: {v}"
+        );
+    }
+    assert_eq!(
+        v["data"]["commentOnly"]["code"], "OJ_SQL_PARSE",
+        "comment-only must not be silent: {v}"
+    );
+    assert_eq!(
+        v["data"]["multi"]["reason"], "syntax",
+        "multi-statement must be rejected: {v}"
+    );
+}
+
+/// Review Focus 2：SQL 内注释透明 + 引号标识符（mysql 反引号）逐字。
+#[tokio::test(flavor = "current_thread")]
+async fn sql_parse_comments_transparent_and_backtick_identifiers() {
+    let (b, _) = new_bridge();
+    let cap = b
+        .run_with(
+            r#"const c = sql.parse("SELECT id -- trailing comment\n/* block */ FROM users", { dialect: "mysql" });
+               const q = sql.parse("SELECT `订单号` FROM `订单表`", { dialect: "mysql" });
+               json.ok({ cColumns: c.columns, cTables: c.tables, qColumns: q.columns, qTables: q.tables });"#,
+            RequestInfo::default(),
+        )
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(
+        v["data"]["cColumns"],
+        json!([{"table": "users", "column": "id"}]),
+        "comments must be transparent to extraction: {v}"
+    );
+    assert_eq!(
+        v["data"]["cTables"],
+        json!([{"name": "users", "schema": null, "alias": null}])
+    );
+    assert_eq!(
+        v["data"]["qColumns"],
+        json!([{"table": "订单表", "column": "订单号"}]),
+        "backtick-quoted identifiers verbatim (quotes stripped): {v}"
+    );
+    assert_eq!(
+        v["data"]["qTables"],
+        json!([{"name": "订单表", "schema": null, "alias": null}])
+    );
+}
