@@ -116,6 +116,18 @@ fn vendor_table() {
         ("jdbc:kingbase8://h:54321/db", "kingbase"),
         ("jdbc:sqlserver://h;databaseName=d", "mssql"),
         ("jdbc:microsoft://h", "mssql"),
+        // 七方言扩展（REQ-A4，v0.1.144）：仅诊断臂，dialect() 恒 "jdbc" 不变。
+        ("jdbc:snowflake://acct.snowflakecomputing.com/?warehouse=w", "snowflake"),
+        ("jdbc:databricks://h:443/default;httpPath=/sql/1.0/warehouses/x", "databricks"),
+        ("jdbc:ch:http://h:8123/db", "clickhouse"),
+        ("jdbc:clickhouse:http://h:8123/db", "clickhouse"),
+        ("jdbc:trino://h:8080/catalog/schema", "trino"),
+        ("jdbc:kyuubi://h:10009/default", "kyuubi"),
+        ("jdbc:heavyai://h:6274/db", "heavydb"),
+        ("jdbc:mapd://h:6274/db", "heavydb"),     // 旧前缀同臂
+        ("jdbc:omnisci://h:6274/db", "heavydb"),  // 旧前缀同臂
+        ("jdbc:duckdb:", "duckdb"),               // 内存库无 host 段
+        ("jdbc:duckdb:/path/to/db", "duckdb"),
         ("jdbc:teradata://h", "teradata"),    // 未知原样
         ("not-a-jdbc-url", "not-a-jdbc-url"), // 无 jdbc: 前缀：整串当段（调用方保证先判形态）
     ];

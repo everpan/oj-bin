@@ -109,6 +109,15 @@ pub fn vendor_of(url: &str) -> &'static str {
         "dm" => "dameng",
         "kingbase8" => "kingbase",
         "sqlserver" | "microsoft" => "mssql",
+        // 七方言扩展（REQ-A4，v0.1.144）：仅诊断臂；heavydb 收编旧前缀
+        // mapd/omnisci（上游更名史：MapD → OmniSci → HeavyAI）。
+        "snowflake" => "snowflake",
+        "databricks" => "databricks",
+        "ch" | "clickhouse" => "clickhouse",
+        "trino" => "trino",
+        "kyuubi" => "kyuubi",
+        "heavyai" | "mapd" | "omnisci" => "heavydb",
+        "duckdb" => "duckdb",
         other => Box::leak(other.to_string().into_boxed_str()),
     }
 }
