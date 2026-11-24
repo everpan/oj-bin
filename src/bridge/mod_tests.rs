@@ -27,17 +27,21 @@ fn vendor_sql_parser_js_is_7bit_ascii() {
         include_str!("vendor_sql_parser.js").is_ascii(),
         "vendor_sql_parser.js must stay 7-bit ASCII (deno_core rejects non-ASCII extension code)"
     );
+    assert!(
+        include_str!("sql_parse_impl.js").is_ascii(),
+        "sql_parse_impl.js must stay 7-bit ASCII (deno_core rejects non-ASCII extension code)"
+    );
 }
 
 /// 回归护栏：sql.parse 的懒加载 ESM 必须注册且内嵌（不得依赖构建机路径）。
+/// 顺序无关，但 impl 必须在场（bootstrap 门面拉取的就是它）。
 #[test]
 fn bridge_lazy_esm_source_is_embedded() {
-    assert_eq!(BRIDGE_LAZY_ESM.len(), 1);
+    assert_eq!(BRIDGE_LAZY_ESM.len(), 2);
     assert!(BRIDGE_LAZY_ESM.iter().all(|f| f.is_runtime_loadable()));
-    assert_eq!(
-        BRIDGE_LAZY_ESM[0].specifier,
-        "ext:bridge_ext/vendor_sql_parser.js"
-    );
+    let specs: Vec<_> = BRIDGE_LAZY_ESM.iter().map(|f| f.specifier).collect();
+    assert!(specs.contains(&"ext:bridge_ext/vendor_sql_parser.js"));
+    assert!(specs.contains(&"ext:bridge_ext/sql_parse_impl.js"));
 }
 
 fn new_bridge() -> (Bridge, Arc<InMemoryAccessor>) {

@@ -1921,24 +1921,19 @@ globalThis.crypto = Object.assign(globalThis.crypto || {}, {
 })();
 
 // ----- sql: pure SQL parsing (v0.1.143, REQ-PARSE phase 2) -----
-// Backed by vendored node-sql-parser 5.4.0 (Apache-2.0; provenance + transform
-// recipe in vendor_sql_parser.js header). The ~2.5MB bundle is registered LAZY
-// (ext.lazy_loaded_esm_files): a static import here would re-parse it on every
-// pooled runtime and regress the cold-start work. core.createLazyLoader is the
-// deno_core lazy-ESM face (op_lazy_load_esm: sync load+evaluate, memoized by
-// the loader itself); note core.loadExtScript is the CLASSIC-script channel and
-// cannot see lazy ESM. Pure synchronous function: no ops, no I/O, no tenant
-// data. NOTE (phase 2 task 1): this spike surface returns the raw AST only;
-// the frozen contract ({dialect, tables, columns, ctes, lineage, ast}) lands
-// with sql_parse_impl.js (plan task 2).
-const ojSqlLoad = core.createLazyLoader("ext:bridge_ext/vendor_sql_parser.js");
+// Frozen contract: {dialect, tables, columns, ctes, lineage, ast} -- see
+// docs/superpowers/plans/2026-11-24-upstream-reqs-phase2-sql-parse.md. The
+// vendored node-sql-parser 5.4.0 bundle (~2.5MB, Apache-2.0; provenance +
+// transform recipe in vendor_sql_parser.js) plus the contract implementation
+// are registered LAZY (ext.lazy_loaded_esm_files): a static import here would
+// re-parse the bundle on every pooled runtime and regress the cold-start work.
+// core.createLazyLoader is the deno_core lazy-ESM face (op_lazy_load_esm: sync
+// load+evaluate, memoized by the loader itself); core.loadExtScript is the
+// CLASSIC-script channel and cannot see lazy ESM. Pure synchronous function:
+// no ops, no I/O, no tenant data.
+const ojSqlLoad = core.createLazyLoader("ext:bridge_ext/sql_parse_impl.js");
 globalThis.sql = {
-  parse: (sqlText, opts) => {
-    const o = opts || {};
-    return {
-      ast: new (ojSqlLoad().default.Parser)().astify(String(sqlText), {
-        dialect: String(o.dialect === undefined ? "mysql" : o.dialect),
-      }),
-    };
-  },
+  // loader is called INSIDE parse: createLazyLoader returns a function; the
+  // module namespace (and its .default.parse) exists only after the first call.
+  parse: (sqlText, opts) => ojSqlLoad().default.parse(sqlText, opts),
 };
