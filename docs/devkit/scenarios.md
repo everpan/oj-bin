@@ -46,6 +46,7 @@
 | [73](#场景-73装完部署后让-seed-随迁移即时灌oj-migrate---with-seedv01125) | 带 `seed.sql` 的模块装完数据面空：`oj migrate --with-seed` 把迁移+seed 一起做完（严格 migrate→seed、幂等、fail-closed 门禁、`--format json` 顶层 `seed`、exit code 成败真源） | §3 数据层 / §10 `oj migrate --with-seed` |
 | [74](#场景-74普通请求里对别的租户做窄范围写语句级-fortenantidv01129) | 服务端派生别的租户 id（企微 `corp_id`），普通请求里只删**那一个租户**的 refresh token，又不想关掉整个请求的租户防护 | §8 鉴权与多租户 / §6 db |
 | [83](#场景-83sql-审计入湖前先解析出表列血缘sqlparsev01143) | SQL 审计入湖前先解析：`sql.parse` 抽 tables/columns/lineage 存审计行（v0.1.143；单层血缘口径，勿当全量递归血缘用） | §6 sql.parse |
+| [84](#场景-84七方言-jdbc-离线摄取元数据duckdb-零服务端照抄例v01144) | 七方言 JDBC 元数据摄取（REQ-A4）：随包三件套 `cargo xtask jdbc-drivers` + DuckDB 内存库零服务端照抄例——连接→information_schema 摄取→参数查询（v0.1.144） | §6 plugins / `docs/plugins/jdbc.md` 分发矩阵 |
 
 ---
 
@@ -5342,3 +5343,72 @@ curl -X POST http://localhost:9778/v1/api/audit/sql-ingest/ \
 | 传 `pg`/`mssql` 后入湖方言对不上 | 返回的 `dialect` 是归一后名（`postgresql`/`transactsql`）——入湖存返回值，别存入参 |
 | 忘传 dialect | 无魔法默认，必抛 `reason:"dialect"`；错误对象带 `supported` 全表可回给前端做下拉 |
 | 大 SQL 打挂服务 | >1 MiB 在解析前拒绝（`reason:"budget"`），快速返回不占 CPU；AST 可达输入 10 倍大，勿把 `ast` 整体入湖，只存 tables/columns/lineage |
+
+## 场景 84：七方言 JDBC 离线摄取元数据——DuckDB 零服务端照抄例（v0.1.144）
+
+> 何时抄我：业务库是 Snowflake / Databricks / ClickHouse / Trino / Kyuubi / HeavyDB /
+> DuckDB 之一（上游 REQ-A4 的七种非原生源）。`jdbc:` DSN 由 `oj-db-jdbc` 泛型桥认领
+> （同场景 82 达梦口径：方言恒 `"jdbc"`、构造器门控、裸 `?` SQL）。jar 分发见
+> `docs/plugins/jdbc.md` 七方言分发矩阵——随包三件套一键落位，DuckDB 内存库
+> **零服务端**，本场景可离线完整走通（连接→元数据摄取→参数查询）。
+
+### ① 配置
+
+```bash
+# 1. 随包三件套一键落位（Trino/ClickHouse/Kyuubi，Apache-2.0，~45MB，幂等）：
+cargo xtask jdbc-drivers
+# 2. 自备件（Snowflake 99MB / Databricks 43MB / DuckDB 81MB / HeavyDB 上游废弃）：
+#    jar 丢同一目录，改 config 的 drivers_dir 指路；矩阵表见 docs/plugins/jdbc.md
+```
+
+```yaml
+# config.yaml —— DuckDB 内存库离线可跑；生产库同形换 URL（整串 ENC[...] 密封）
+plugins:
+  oj-db-jdbc:
+    drivers_dir: bin/plugins/<host-triple>/jdbc/drivers   # 或 /opt/oj/jdbc-drivers
+db:
+  duck: 'jdbc:{"url":"jdbc:duckdb:"}'                     # 内存库；文件库 jdbc:duckdb:/path/to.db
+  # 生产例：ch: 'jdbc:{"url":"jdbc:ch:http://ck:8123/db","user":"oj","password":{"$env":"CK_PW"}}'
+```
+
+### ② handler（摄取元数据 + 参数查询）
+
+```ts
+// src/ck/catalog-ingest/api.ts —— REQ-A4「POST /catalog 摄取」的平台侧最小形态
+async function post(): Promise<void> {
+  const ck = DB("duck");                  // 换成业务库命名键（ch / trino / sf …）
+  if (!ck) { json.fail(500, "db not configured"); return; }
+  // 元数据摄取：information_schema 查询（方言族诊断随错误文案透出，d.dialect() 恒 "jdbc"）
+  const tables = await ck.query(
+    "select table_name, table_type from information_schema.tables where table_schema = ?",
+    ["main"],
+  );
+  // 列元数据同形：information_schema.columns 按表过滤 → 入业务库/缓存
+  await ck.query("insert into catalog_hit values (?, ?)", ["duck", new Date().toISOString()])
+          .catch(() => {});             // 摄取打点失败不挡主流程
+  json.ok({ dialect: "jdbc", tables: tables.length, sample: tables.slice(0, 5) });
+}
+```
+
+### ③ 验证
+
+```bash
+./bin/oj serve -c config.yaml --api-path src
+curl -X POST http://localhost:9778/v1/api/ck/catalog-ingest/     # 离线可全链走通
+```
+
+验证口径：e2e_duckdb 腿已钉——连接/参数化 insert/DECIMAL scale 分流/information_schema
+摄取/事务回滚提交/stream 批边界 100-100-50 全绿；随包三件套驱动装载由
+e2e_driver_smoke 腿真 JVM 实证（三驱动同目录共处注册）。
+
+### ④ 常见坑
+
+| 坑 | 解 |
+|---|---|
+| ClickHouse 装了 jar 仍报 `No suitable driver` | classifier 拿错：必须 `-all-dependencies`（`-all` 缺 slf4j，驱动类实例化即 `NoClassDefFoundError`）。xtask 已钉正确版本 |
+| Kyuubi 报驱动类找不到 | 必须 `kyuubi-hive-jdbc-shaded`；`org.apache.hive:hive-jdbc` thin 在平面 drivers 目录不可用 |
+| Trino 升级后连不上 | 周级发版 + JDK 基线 470 起要求 Java 11——钉版本（xtask 表）+ 升级后重跑 smoke 腿 |
+| DuckDB 大查询 OOM | 全量内存无流式：`db.stream` 只是分批搬运；大结果先 `LIMIT` 或换网络型方言 |
+| 多家驱动放一个目录行为诡异 | 装载按文件名排序、同名不同版先到先得——「一目录一版本」；非自包含驱动（DM/Oracle 等）建议单部署单厂商 |
+| 构造器报 `OJ_DB_UNSUPPORTED` | 预期门控（方言恒 `"jdbc"`）：正解裸 `?` SQL；`db.export` 流式泵不受门控 |
+| 老 jar 缺 ServiceLoader 条目 | DSN 信封 `"props":{"driver_class":"<驱动类名>"}` 逃生舱 |

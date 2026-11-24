@@ -742,11 +742,9 @@ mod tests {
             "{names:?}"
         );
         for (name, url) in JDBC_BUNDLED {
-            let want = format!("https://repo1.maven.org/maven2/{url}");
             assert!(
-                want.ends_with(&format!("/repo1/{}", name.replace(".jar", ".jar")))
-                    || want.rsplit('/').next() == Some(*name),
-                "url must end with the pinned filename: {want} vs {name}"
+                url.rsplit('/').next() == Some(*name),
+                "url must end with the pinned filename: {url} vs {name}"
             );
         }
     }

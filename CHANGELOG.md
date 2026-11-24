@@ -18,6 +18,30 @@
 
 ## 下一版（未发布）
 
+**REQ-A4 Phase 3：oj-db-jdbc 七方言覆盖（上游 UPSTREAM-REQS §3.1 五条验收对照；devkit
+四件已同步）**：
+
+- 七方言（Snowflake / Databricks / ClickHouse / Trino / Kyuubi / HeavyDB / DuckDB）经
+  同一泛型 JDBC 桥接入——Java 侧零方言分支（DriverManager 按 URL 自路由），Rust 侧
+  `vendor_of()` 诊断表 +7 臂（heavydb 收编旧前缀 mapd/omnisci；未知前缀原样透出），
+  `db.dialect()` 恒 `"jdbc"` 门控语义不变（REQ-A4 验收第 4 条 sql_guard 约束正是靠这道门）。
+- jar 分发链：`cargo xtask jdbc-drivers` 随包三件套（Trino 484 / ClickHouse 0.11.2
+  **-all-dependencies** / Kyuubi 1.12.0 shaded，Apache-2.0，~45MB，幂等落位
+  `<bin>/plugins/<triple>/jdbc/drivers/`，pinned 版本表单测钉死）；其余自备（体积/上游
+  状态），`docs/plugins/jdbc.md` 新增七方言分发矩阵节（矩阵表 + 自备四步指引 + 一目录
+  一版本 + HeavyDB 上游废弃声明）。
+- 实测钉死跨厂差异（全部进测试与限制文档）：ClickHouse `-all` classifier 缺 slf4j →
+  两驱动类实例化即 `NoClassDefFoundError`、DriverManager 报 `No suitable driver`（必须
+  `-all-dependencies`）；DuckDB 全量内存无流式（`setFetchSize` 无效果）+ 约束冲突无
+  SQLState 落 `internal` 兜底 + DDL 计数 -1（SUCCESS_NO_INFO）；Trino 懒连接（connect
+  不开 TCP，网络证据落首个查询）。
+- 测试腿：`e2e_duckdb.rs` 离线全链（零服务端——连接/参数化 insert/DECIMAL scale 分流/
+  information_schema 元数据摄取（REQ-A4 验收第 1 条对照）/事务/stream 批边界/close）；
+  `e2e_driver_smoke.rs` 随包三件套同目录单 JVM 驱动装载（核心断言 = 无 `No suitable
+  driver`）+ HeavyDB env-gated 可选腿；xtask 版本表单测。
+- 多实例一致性（验收第 5 条）与连通性探针（第 3 条）口径固化进 jdbc.md/场景 84：config
+  声明式天然一致、`db.client.register` 进程内 StableState 各池同见、`select 1` 即探针。
+
 **REQ-PARSE Phase 2：平台 SQL 解析服务 `sql.parse`**（下游血缘采集/SQL 审计需求；devkit
 四件已同步）：
 

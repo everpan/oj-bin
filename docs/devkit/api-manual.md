@@ -2246,7 +2246,14 @@ json.ok(plugins());
   构造器/`listTables`/`nextSeq`/`oj migrate`/seed/`db.import` 一律结构化
   `OJ_DB_UNSUPPORTED`（`e.data.capability` 点名），**受支持路径**是裸 SQL
   `db.query`/`db.exec`（`?` 绑参直通）+ `db.stream` + `db.export`（导出走流式泵，
-  不受 known-dialect 门控）。完整手册见仓库 `docs/plugins/jdbc.md`。
+  不受 known-dialect 门控）。**七方言覆盖（v0.1.144，REQ-A4）**：Snowflake /
+  Databricks / ClickHouse / Trino / Kyuubi / HeavyDB / DuckDB 经同一桥接入——
+  随包三件套 `cargo xtask jdbc-drivers`（Trino/ClickHouse/Kyuubi），其余自备
+  （DuckDB 内存库离线可用，HeavyDB 上游废弃）；错误文案与日志按 URL 前缀透出
+  诊断方言族（snowflake/databricks/clickhouse/trino/kyuubi/heavydb/duckdb），
+  `db.dialect()` 恒 `"jdbc"` 不变。元数据摄取（catalog 形态）用 `db.query` 跑
+  `information_schema` 查询，见场景 84。完整手册见仓库 `docs/plugins/jdbc.md`
+  七方言分发矩阵。
 
 ### axis(name) —— 泛型插件轴调用面（v0.1.54）
 
@@ -4151,7 +4158,7 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | 流式取消（`signal`）= 干净提前结束（v0.1.39；v0.1.42 起 pg/mysql 真取消） | abort 后**停止后端拉取**（有界行缓冲背压），缓冲行交付完即 done。**第一方插件 `oj-db-postgres`/`oj-db-mysql` 在 `postgres://`/`mysql://` DSN 下走专用连接，取消 = `pg_cancel_backend`/`KILL QUERY` + 断连 → 服务端查询立即终止（真取消）**；core（sqlite）与 Any 回退路径为协作式（批间生效）。已回调的行不回滚 |
 | `db.export` 任务式导出（U-18，v0.1.104）：发起即返 taskId，自驱消费任务落 blob | `await db.export({sql, params?, format:"csv"\|"jsonl", fileName?, maxBytes?})` → `{taskId}`（开游标轻、查询下推异步，大结果集 200ms 内回执）；`db.exportStatus(taskId)` 轮询 `{taskId, state:"running"\|"done"\|"failed"\|"cancelled", alias, rows, bytes, truncated, truncatedReason, startedAtMs, finishedAtMs, error, blobKey}`；`db.exportCancel(taskId)` 幂等（半成品经 put_stream_abort 清，防 s3 orphan parts）。配额：全局 4 / 每主体 2（`db_export:` 段，错误文案区分「全局满/本人满」）；**maxBytes 超限 → failed（不静默截断）**；`max_rows` 策略截断 → done + `truncated:true` + `truncatedReason:"max_rows"`（错误 ≠ 策略双轨）。产物 key = `export/<taskId>.<ext>`（随机不可预测），TTL 24h 宿主清扫（live 任务豁免，`db_export.ttl_secs/sweep_interval_secs` 可调）；local 首方下载带 Content-Disposition 原名（`fileName` 存 sidecar），s3 腿尽力（无此元数据）。重启后旧 taskId 一律 not found（不是 failed）；他人 id 不可见（bearer 语义，日志只出前 8 字符）；发起/终态落审计事件（SQL 全文不入审计） |
 | `db.export` 与 REQ-05 护栏的分工（v0.1.104） | 导出是**长任务**：不吃 `statement_timeout_ms`（合法导出天然超语句窗口——超时竞速只罩「发起→开游标」的同步段）；`max_result_bytes` 是查询响应闸、导出自己的闸是 `maxBytes`（产物字节）。导出与 db.query 同门过 db_access 判权 + `max_rows` 策略截断可见化。`format` 只注册 csv/jsonl，未知格式报 `OJ_DB_UNSUPPORTED`（`e.data.capability="format"`，含 format 值）；xlsx/parquet = 格式注册表扩展位，本期不做 |
-| `oj-db-jdbc` 泛型 JDBC 后端（v0.1.141） | `jdbc:` DSN 接达梦/金仓/Oracle/H2（sidecar：cdylib spawn Java 桥进程，NDJSON over stdio，目标机需 Java 11+）。方言恒 `"jdbc"`：**生成 SQL 全门控**——构造器/`listTables`/`nextSeq`/`oj migrate`/seed/`db.import` 报 `OJ_DB_UNSUPPORTED`，正面路径 = 裸 `db.query`/`db.exec`（`?`）+ `db.stream` + `db.export`（导出走流式泵照常可用）。DECIMAL/NUMERIC scale>0 回 string、scale==0 走整数族；`''` 读回驱动特定（达梦实测原样保留）；信封内嵌 `ENC[...]` 不解密——config 静态 DSN 整串 `oj secret seal`。慢查询钉死（非 stream 无取消，给 `socketTimeout`）；LOB 单列 16MB；v1 单部署单厂商（多厂商起多实例）。完整手册见仓库 `docs/plugins/jdbc.md` |
+| `oj-db-jdbc` 泛型 JDBC 后端（v0.1.141） | `jdbc:` DSN 接达梦/金仓/Oracle/H2（sidecar：cdylib spawn Java 桥进程，NDJSON over stdio，目标机需 Java 11+）。方言恒 `"jdbc"`：**生成 SQL 全门控**——构造器/`listTables`/`nextSeq`/`oj migrate`/seed/`db.import` 报 `OJ_DB_UNSUPPORTED`，正面路径 = 裸 `db.query`/`db.exec`（`?`）+ `db.stream` + `db.export`（导出走流式泵照常可用）。DECIMAL/NUMERIC scale>0 回 string、scale==0 走整数族；`''` 读回驱动特定（达梦实测原样保留）；信封内嵌 `ENC[...]` 不解密——config 静态 DSN 整串 `oj secret seal`。慢查询钉死（非 stream 无取消，给 `socketTimeout`）；LOB 单列 16MB；随包三件套（自包含 shaded）可同目录共处、非自包含驱动建议单厂商（v0.1.144 实测口径）；DuckDB 全量内存无流式 + 约束冲突无 SQLState 落 internal 兜底 + DDL 计数 -1（均为 v0.1.144 实测钉死）。完整手册见仓库 `docs/plugins/jdbc.md` |
 | `db.cancel` 跨请求取消（v0.1.96；v0.1.114 起受理池执行） | `executionId` 来自 `db.stream` 的 `onOpen`/`executionId()`，或带 `onOpen` 回调的 `db.query`/`db.exec`；同一主体任意请求可消，重复取消幂等。流：取消后发起方**下一次拉取抛错** `db stream exec_… was cancelled via db.cancel`（不是静默 done）；池执行：reject `OJ_DB_CANCELLED`。未知/已结束/他人 id 一律 `execution exec_… not found`（不泄露存在性，日志/错误只出前 8 字符）。见 `db-guide.md` §3.1 |
 | REQ-11 执行回调面（v0.1.114）：`db.query`/`db.exec` 的 `opts.onOpen`/`onProgress` + `db.stream` 的 `opts.onProgress` | 进度相位 `sent`→`fetching`→`done`（done **恒发一次**、必含行数/受影响数；同相位 100ms 节流）。带 `onOpen`/`onProgress` 即走 begin/poll/take 登记模型（= 跨请求取消入口，`onOpen` 拿 executionId）；不带回调维持原直路返回形态（挂断联动登记面同样覆盖，见 G2 行）。`onOpen` 抛异常只记 warn、**不杀执行** |
 | REQ-11 G2 挂断即取消（v0.1.114，**尽力而为**） | HTTP 客户端断开（真 FIN）→ 按请求的执行登记尽力取消在飞执行。**已提交的结果不写回**（客户端已走）；pg/mysql in-flight 语句经 `pg_cancel_backend`/`KILL QUERY` 尽量真杀（被取消的连接报废、绝不回池）。v0.1.114 起**直连池 `db.query`/`db.exec` 全量登记**（含无回调直路）——挂断取消覆盖全部池执行；不覆盖 `db.tx`/`db.session` 会话内执行（无请求 token）与 WS/内部派发（不挂 guard）；sqlite 无服务端语句 = 客户端早停 |

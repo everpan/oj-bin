@@ -468,6 +468,11 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | 拿 `sql.parse` 当全量递归血缘用（v0.1.143） | **单层口径**：`lineage` 只穿透一层 CTE / 派生子查询，链式 CTE 停在边界名（如 `b→a` 停在 `{table:"a"}` 不追到 `t1`）——无 schema 知识下的诚实边界，别拿它替代逐层物化的血缘引擎 |
 | `sql.parse` 对 DDL 返回空 columns/lineage、对多语句直接抛错（v0.1.143） | 契约：create/alter/drop 只出 tables（create_definitions 是 schema 定义非引用）；多语句（`;` 分隔）一次一句显式拒绝（`reason:"syntax"` + `statements` 计数）——批量 SQL 先按语句拆分再逐句解析 |
 | `sql.parse` 传 `pg`/`mssql` 以为没识别、或传 `duckdb` 报错（v0.1.143） | `pg→postgresql`、`mssql→transactsql` 是内置别名（返回的 `dialect` 为归一后名）；**duckdb 5.4.0 不支持**——方言缺失/未知抛 `reason:"dialect"` 且 `supported` 带全表，无魔法默认方言，必须显式传 |
+| ClickHouse jar 装上了却报 `No suitable driver`（v0.1.144） | **classifier 拿错了**：0.11.x 必须 `-all-dependencies`（内嵌 slf4j）；`-all` 不内嵌 slf4j，驱动类实例化即 `NoClassDefFoundError`，症状与没装 jar 一模一样——`cargo xtask jdbc-drivers` 已钉正确版本，手工下载照 `docs/plugins/jdbc.md` 分发矩阵 |
+| Kyuubi/Trino 连不上也报驱动问题（v0.1.144） | Kyuubi 必须 `kyuubi-hive-jdbc-shaded`（`org.apache.hive:hive-jdbc` thin 171KB 平面目录不可用）；Trino 周级发版 + JDK 基线 470 起提到 11——升级 pinned 版本先读 release notes 再重跑 `e2e_driver_smoke` 腿 |
+| DuckDB 大查询顶爆 JVM 堆（v0.1.144） | **全量内存无流式**：结果集全量物化，`db.stream` 对它只是分批搬运不省内存；约束冲突不回 SQLState（错误落 `internal` 兜底，按 message 判别）；内存库 `jdbc:duckdb:` 离线可用——七方言唯一零服务端可全链自测的方言 |
+| 一个 drivers 目录放多家驱动后行为诡异（v0.1.144） | 装载按文件名排序、共享一个 UCL、**同名不同版先到先得**——「一目录一版本」；随包三件套（自包含 shaded）可共处（实测），DM/金仓/Oracle 等非自包含驱动仍建议单部署单厂商 |
+| HeavyDB（OmniSci/MapD）驱动装不上（v0.1.144） | 上游 2026-05-27 官宣废弃，Maven 停在 2022 的 6.1.0 且是 thin jar（需 `-Pfatjar` 自构）——oj 只承诺通用连接 + 用户自备 jar，插件诊断方言族为 `heavydb`（旧前缀 mapd/omnisci 同臂识别） |
 
 ## 手册
 
