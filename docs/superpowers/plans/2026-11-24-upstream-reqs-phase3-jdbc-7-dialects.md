@@ -153,3 +153,27 @@ pinned 版本表（命令内单源，测试断言这些字面量）：
 - 上游 `POST /catalog` 端点本身的摄取编排属下游仓改造；平台侧以「七源可连接 + 元数据查询
   可跑」由本计划测试腿与场景 84 保障（同 Phase 2 的 golden 契约保障模式）。
 - UCL-per-driver 隔离（同名不同版共存）是 spec 级变更，本阶段明确不做（调查报告风险 5）。
+
+---
+
+## 执行偏差记录（v0.1.144 实落，2026-11-24）
+
+1. **ClickHouse classifier 修正（调查报告口径纠错）**：报告与计划写 `-all`（13.8MB）——
+   smoke 腿真 JVM 实证 `-all` **不内嵌 slf4j**，两个驱动类实例化即
+   `NoClassDefFoundError`，DriverManager 报 `No suitable driver`（症状=没装 jar）。
+   正解 = `-all-dependencies`（同体积，内嵌 slf4j，驱动注册 + `jdbc:ch:`/`jdbc:clickhouse:`
+   acceptsURL 双 true）。xtask 版本表、jdbc.md 矩阵、SKILL 陷阱行全部按实证更新。
+2. **smoke 腿设计收拢**：计划写四个独立 smoke 腿——实落为单腿单 JVM 单 driversDir：
+   `__test_init` 是 OnceLock（进程内换不了 sidecar，第二次 set 静默 no-op），且随包
+   三件套同目录共处正是生产形态（「一目录一版本」针对同 vendor 异版）。HeavyDB 保持
+   env-gated 注入同一目录。
+3. **Trino 懒连接发现**：connect 只建对象不开 TCP（不可达端点 connect 成功是真驱动
+   正确行为）——探针改为「connect 成功则补 `select 1` 一刀取网络证据」，核心断言
+   恒为「无 `No suitable driver`」。
+4. **DuckDB 腿两处跨厂钉死**（探活纪律「不锚一厂语义」）：DDL 计数 -1（SUCCESS_NO_INFO，
+   DM/H2 回 0）；约束冲突无 SQLState（vendor_code 0）→ errmap `internal` 兜底——
+   限制行进 jdbc.md / api-manual §13 / SKILL。
+5. 按 Task 2 计划走系统 curl（零新增依赖）；Task 4 矩阵节落 jdbc.md（随包三件套与
+   自备四件分开）；devkit 四件、CHANGELOG、bump 0.1.144、门禁全绿（only-js 1170 /
+   oj 全套含 e2e / db-jdbc 含两新腿真 JVM / xtask 13 devkit 契约 / clippy -D warnings /
+   fmt）。tag 待用户确认。
