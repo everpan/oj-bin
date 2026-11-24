@@ -186,3 +186,28 @@ globalThis.sql = {
 
 - 下游（oj-wiki-docs）`registerSql` 掩码正则路径替换为 `sql.parse` —— 属下游仓改造，平台侧以验收标准 5（「可直接替换」）由 golden 契约保障。
 - REQ-HNSW 启动门禁绑定路由（Phase 1 遗留，见程序总览）。
+
+---
+
+## 执行偏差记录（v0.1.143 实落，2026-11-24）
+
+1. **vendor 源装载改 `LazyLock` + `Computed`**（commit 852f513，Task 1 修正）：计划写的是
+   `ascii_str_include!` 零拷贝常量（带 `#[allow(long_running_const_eval)]`）。实际 2.5MB
+   const-eval 触发 rustc `long_running_const_eval` 且该 lint 对 allow 不生效
+   （rustc#125290）——clippy `-D warnings` 门禁必挂。改为：编期 `include_str!` 直嵌进
+   二进制（零读盘不变），运行期首次访问 `LazyLock` 拷贝一次 `Arc<str>`、走
+   `ExtensionFileSource::new_computed`；懒加载语义不变（仍只在首次 `sql.parse` 进 V8）。
+   ASCII 门禁从编译期断言移到 mod_tests 的 7-bit 守卫 + `load()` 与磁盘逐字一致断言。
+   代价：首个调用 runtime 一次性 2.5MB 拷贝（此前是零拷贝外部常量），可忽略。
+2. **`core.createLazyLoader` 门面即 impl 文件**：Task 1 期间发现 `loadExtScript` 是
+   classic-script 通道看不到 lazy ESM，门面定为 `createLazyLoader("ext:bridge_ext/
+   sql_parse_impl.js")`（impl 内再 import vendor），loader 必须在 `parse()` 内部调用
+   （bootstrap 求值期 loader 还不是模块命名空间）。
+3. **测试期望修正两处**（Task 3，测试窄于契约而非实现错）：ON 子句列引用（`u.cid`/`c.id`）
+   属引用列进 `columns`；`tables` 保留基表别名（`customers` 带 `alias:"c"`）。
+4. **权限分类器阻断 /tmp 下执行 npm 包 JS**（Task 1 环境性）：bundle 变换改 python3 纯文本
+   处理（无代码执行）；语义等价由阻断前的 Node smoke（SMOKE-OK/SMOKE2-OK）与平台内
+   cargo test 全绿背书——vendored 代码在生产 runtime 里执行本身就是最真验证。
+5. 其余按计划落：契约面/血缘 walker/边界测试 Task 2-4 提交 21e73fc/9aa72f8/da1e57c；
+   Task 5 提交 2adebc4；门禁全绿（only-js 1165、oj 331+e2e、xtask 11 devkit 契约、
+   clippy -D warnings、fmt）。tag 待用户确认。
