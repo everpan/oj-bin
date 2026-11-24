@@ -19,6 +19,27 @@ fn bridge_ext_esm_source_is_embedded() {
     assert_eq!(BRIDGE_ESM[0].specifier, "ext:bridge_ext/bootstrap.js");
 }
 
+/// 红线守护：vendored node-sql-parser 源必须 7-bit ASCII（deno_core 硬校验）。
+/// vendor transform 的 \uXXXX 转义即为此——步骤见 vendor_sql_parser.js 头注释。
+#[test]
+fn vendor_sql_parser_js_is_7bit_ascii() {
+    assert!(
+        include_str!("vendor_sql_parser.js").is_ascii(),
+        "vendor_sql_parser.js must stay 7-bit ASCII (deno_core rejects non-ASCII extension code)"
+    );
+}
+
+/// 回归护栏：sql.parse 的懒加载 ESM 必须注册且内嵌（不得依赖构建机路径）。
+#[test]
+fn bridge_lazy_esm_source_is_embedded() {
+    assert_eq!(BRIDGE_LAZY_ESM.len(), 1);
+    assert!(BRIDGE_LAZY_ESM.iter().all(|f| f.is_runtime_loadable()));
+    assert_eq!(
+        BRIDGE_LAZY_ESM[0].specifier,
+        "ext:bridge_ext/vendor_sql_parser.js"
+    );
+}
+
 fn new_bridge() -> (Bridge, Arc<InMemoryAccessor>) {
     let db = Arc::new(InMemoryAccessor::new());
     db.seed([json!({"id": 1, "name": "ever"})]);

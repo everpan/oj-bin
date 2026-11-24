@@ -767,10 +767,27 @@ const BRIDGE_ESM: &[deno_core::ExtensionFileSource] = &[deno_core::ExtensionFile
     )),
 )];
 
+/// bridge_ext 懒加载 ESM（v0.1.143，`sql.parse`）：vendored node-sql-parser 5.4.0
+/// bundle 约 2.5MB，禁止静态进 bootstrap.js 的 ESM 图（每个池化 runtime 都要解析
+/// 一遍，吃掉冷启动优化）。注册为 `lazy_loaded_esm_files`，首次 `sql.parse` 经
+/// `core.loadExtScript` 拉取（每 runtime 一次，JS 侧模块级 memo）。
+/// `ascii_str_include!` 编译期做 7-bit ASCII 校验并以 v8 外部单字节常量零拷贝进
+/// runtime；allow 的是这份 2.5MB const-eval 的有界一次性编译成本
+/// （`long_running_const_eval`）。运行期零读盘，无需 patch。
+#[allow(long_running_const_eval)]
+const BRIDGE_LAZY_ESM: &[deno_core::ExtensionFileSource] = &[deno_core::ExtensionFileSource::new(
+    "ext:bridge_ext/vendor_sql_parser.js",
+    deno_core::ascii_str_include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/bridge/vendor_sql_parser.js"
+    )),
+)];
+
 /// 构造 `bridge_ext`（bootstrap.js 编进二进制）。所有运行入口都应经此函数取扩展。
 pub fn bridge_ext_init(stable: Arc<StableState>) -> deno_core::Extension {
     let mut ext = bridge_ext::init(stable);
     ext.esm_files = std::borrow::Cow::Borrowed(BRIDGE_ESM);
+    ext.lazy_loaded_esm_files = std::borrow::Cow::Borrowed(BRIDGE_LAZY_ESM);
     ext
 }
 
@@ -2125,3 +2142,7 @@ mod tests;
 #[cfg(test)]
 #[path = "compaction_reader_tests.rs"]
 mod compaction_reader_tests;
+
+#[cfg(test)]
+#[path = "sql_parse_tests.rs"]
+mod sql_parse_tests;
