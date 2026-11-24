@@ -694,7 +694,7 @@ fn diff_configs(
             // U-1 v0.1.93：访问控制策略段（`db_access:` / `db_client:`）改动**不强行热生效**
             // —— StableState 不可变，强行热改会破坏红线。纳入已知键并标 restart_pending，
             // 让运维明确知道「改了这两段必须重启」，消除旧授权静默盲区的误标 `applied`。
-            "db_access" | "db_client" | "db_session" | "audit" | "mgmt" => {
+            "db_access" | "db_client" | "db_session" | "audit" | "mgmt" | "predict" => {
                 restart_pending.push((*key).to_string())
             }
             // 冻结段（v0.1.122 D4）：vars（部署期常量）/ oidc / db_query / db_trace / ws

@@ -97,6 +97,10 @@ db:
 ```
 
 - 信封 `props` 全量上送 JDBC（`socketTimeout` 建议显式给，见「限制」）。
+- **connect 阶段超时**：桥在 JVM 侧统一 `DriverManager.setLoginTimeout`（缺省
+  30 秒，env `OJ_JDBC_LOGIN_TIMEOUT_SECS` 可调），坏 DSN/不可达主机不再把
+  connect 请求钉死；`connect`/`disconnect` 在桥内专用单线程执行器上串行执行，
+  不阻塞既有会话。socket 级读写超时仍由 `props.socketTimeout` 承担。
 - 信封 `password` 支持 `{"$env":"DB_PASS"}` 环境变量引用——这是**运行时**
   `db.client.register` 场景（config 无静态位可封时）的降级手段；config 静态
   声明一律整串 ENC（见下框）。

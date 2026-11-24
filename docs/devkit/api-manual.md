@@ -2241,12 +2241,12 @@ export default {
 | API | 签名 | 说明 |
 |---|---|---|
 | `ws.send` | `send(data: string \| Uint8Array): void` | 向当前连接发一帧：string → Text 帧（0x1），Uint8Array → Binary 帧（0x2，v0.1.16 起）；HTTP 路径下 no-op |
-| `ws.close` | `close(code?: number, reason?: string): void` | 结束当前连接。带码（v0.1.140）只放行 **1000 与 4000-4999**（3xxx/系统保留段报错），reason ≤123 字节；4xxx 语义 = **不可重试关闭**（y-websocket 类客户端在该段停 provider——批量撤销授权不产生重连风暴的前提）；无参 = 无码关闭（原行为） |
+| `ws.close` | `close(code?: number, reason?: string): void` | 结束当前连接。带码（v0.1.140）只放行 **1000 与 4000-4999**（3xxx/系统保留段报错），reason ≤123 字节；4xxx 语义 = **不可重试关闭**（y-websocket 类客户端在该段停 provider——批量撤销授权不产生重连风暴的前提）；**无参 = 1000 正常关闭**（v0.1.147 doc 更正——枚举层面无「无码 Close」形态，旧文案「无码关闭」与实现不符） |
 | `ws.join` | `join(room: string): void` | 当前连接加入房间（v0.1.30；仅 ws handler 内，连接身份自动取） |
 | `ws.leave` | `leave(room: string): void` | 当前连接离开房间（v0.1.30；仅 ws handler 内；断连自动摘除，无需兜底） |
 | `ws.broadcast` | `broadcast(room: string, data: string \| ArrayBuffer \| Uint8Array): number` | 房间扇出（v0.1.30）：**除己**送达成员数（socket.io 语义，发送者要回声自己在 JS 里发）；HTTP handler 也可调（无连接身份 = 不排除任何人）。v0.1.52 起 data 与 `ws.send` 对称：string → Text 帧、ArrayBuffer/Uint8Array → Binary 帧；其余类型**报错**而非发垃圾帧 |
 | `ws.roomSize` | `roomSize(room: string): number` | 房间当前成员数（v0.1.30；presence 最小原语，任意上下文可调） |
-| `ws.roomStateSet` | `roomStateSet(room: string, key: string, data: ArrayBuffer \| Uint8Array): void` | 房间域二进制状态镜像（v0.1.140）：进程本地、**最终一致**（集群模式经中继对齐靠 awareness beacon 自愈，非强一致）。值帽 1 MiB；**键布局约定：awareness 聚合一律按连接键入 `"<connId>"`**——单键单 blob 无合并语义，多客户端共写同一键即互踩；迟到者全量读各键逐个 apply |
+| `ws.roomStateSet` | `roomStateSet(room: string, key: string, data: ArrayBuffer \| Uint8Array): void` | 房间域二进制状态镜像（v0.1.140）：进程本地、**最终一致**（集群模式经中继对齐靠 awareness beacon 自愈，非强一致）。值帽 1 MiB；**键布局约定：awareness 聚合一律按连接键入 `"<connId>"`**——单键单 blob 无合并语义，多客户端共写同一键即互踩；迟到者全量读各键逐个 apply。**身份键随断连回收（v0.1.147）**：键 = `<connId>` 或 `<connId>/…` 前缀的条目在连接断开（含帧超时/池回收等 close 钩子不跑的异常路径）时自动清理——此前异常断连会永久泄漏；非身份键仍由模块 close 钩子 `roomStateDel` 清理 |
 | `ws.roomStateGet` | `roomStateGet(room: string, key: string): Uint8Array \| null` | 房间域读取（不存在 = null） |
 | `ws.roomStateDel` | `roomStateDel(room: string, key: string): boolean` | 房间域删除（`close()` 钩子里清 awareness 死条目；整房清空自动回收） |
 
@@ -3283,7 +3283,7 @@ mounts:
 
 - **幂等**：归一后落盘文件 sha256 **与 manifests 锁（`dist/manifests.yaml`，release 树）双双未变** → 返回 `{"code":0,"msg":"unchanged","generation":<n>}`，不装配、不 swap。（v0.1.122 起锁纳入变化检测：只改锁不改 config 也会触发装配——装/卸模块免重启的检测面。）`unchanged` 的语义是「**活代已与盘上一致**」（闸门状态只在 commit 成功时更新）——调用方（如安装器）应把它当**幂等成功**处理，要强制重装配用 `?force=1`，不要改 config 凑 diff。force 不改变闸门基线。
 - **段 diff 三清单**（每次成功 swap 返回）：
-  - `restart_pending`：后端段（`db`/`redis`/`blob`/`es`/`broker`/`smtp`/`ldap`/`kafkas`/`rabbits`/`plugins`/`plugins_dir`/`secrets`）、**特权面段（`platform`/`fs`）**与**冻结段（`vars`/`oidc`/`db_query`/`db_trace`/`ws`，v0.1.122 起）**——已验证合法，但本代沿用旧连接池/旧插件后端/旧授权面/旧装配期常量，**重启后生效**。特权面段不热生效是安全语义：特权模块不能热改自己的 API/exec/fs 白名单（防自提权）；冻结段不热生效是「装配期冻结」红线（**v0.1.122 行为修正**：旧版把 `vars` 等静默误标进 `applied`，实际并未热生效——现如实归入 `restart_pending`）。
+  - `restart_pending`：后端段（`db`/`redis`/`blob`/`es`/`broker`/`smtp`/`ldap`/`kafkas`/`rabbits`/`plugins`/`plugins_dir`/`secrets`）、**特权面段（`platform`/`fs`）**、**冻结段（`vars`/`oidc`/`db_query`/`db_trace`/`ws`，v0.1.122 起）**与**装配期冻结段（`db_access`/`db_client`/`db_session`/`audit`/`mgmt`/`predict`——v0.1.147 补 `predict`：网关配置装配期进 StableState，热改授权/白名单须重启生效，不再假 `applied`）**——已验证合法，但本代沿用旧连接池/旧插件后端/旧授权面/旧装配期常量，**重启后生效**。特权面段不热生效是安全语义：特权模块不能热改自己的 API/exec/fs 白名单（防自提权）；冻结段不热生效是「装配期冻结」红线（**v0.1.122 行为修正**：旧版把 `vars` 等静默误标进 `applied`，实际并未热生效——现如实归入 `restart_pending`）。
   - **`auth` 段键粒度（v0.1.146）**：`auth.anonymous_paths` 自 v0.1.122 起随换代即时生效（宿主前置管线随影子装配 per-App 重建）——**仅 anonymous_paths 变化归 `applied`**（市场首装给新模块接线匿名端点不再产生无谓的重启要求）；`jwt_secret`/`signing_method`/token 时长/`cookie` 走 oj-auth 插件 init 期冻结 cfg（热更复用 Backend 不重 init），**任一冻结键变化仍整段报 `restart_pending`**（含混合变化，fail-closed 一次性重启生效）。剥离 anon 后剩余为空 mapping 视同段缺席（缺席 = 全缺省，不算冻结键变化）。
   - `kept_listener`：`server` 段（port/host/证书路径）——listener 永生，本代沿旧，改了也**下个进程**才生效。
   - `applied`：其余段（`mounts`/`tenant`/`tasks`）——本代即生效；v0.1.122 起追加 **manifests 锁 diff 条目**（见下「热装配」）。

@@ -11,8 +11,12 @@ import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Paths;
+import java.sql.DriverManager;
 import java.sql.SQLFeatureNotSupportedException;
 import java.util.Properties;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -27,6 +31,33 @@ public final class Bridge {
 
     private Bridge() {}
 
+    /** connect/disconnect 专用单线程 executor（v0.1.147 评审收口）：此前二者在
+     *  stdin 读线程**内联**执行——一个网络黑洞 connect 会无限阻塞 dispatcher，
+     *  所有会话的请求帧全停（全租户停摆）。单线程串行保持 connect/disconnect
+     *  的先后语义；写帧与常规路径同一把锁（跨 conn 帧可交错，既有语义）。 */
+    private static final ExecutorService CONNECT_EXEC =
+            Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "oj-jdbc-connect");
+                t.setDaemon(true);
+                return t;
+            });
+
+    /** 登录超时秒数：环境变量 OJ_JDBC_LOGIN_TIMEOUT_SECS > 0 覆盖，缺省 30。 */
+    private static int loginTimeoutSecs() {
+        String v = System.getenv("OJ_JDBC_LOGIN_TIMEOUT_SECS");
+        if (v != null) {
+            try {
+                int n = Integer.parseInt(v.trim());
+                if (n > 0) {
+                    return n;
+                }
+            } catch (NumberFormatException ignored) {
+                // 非法值按缺省 30s，不杀桥
+            }
+        }
+        return 30;
+    }
+
     public static void main(String[] args) throws Exception {
         // 协议写原始 fd 1：DriverLoader 会把 System.out 重定向到 stderr
         BufferedWriter out = new BufferedWriter(
@@ -34,6 +65,11 @@ public final class Bridge {
         out.write(HELLO);
         out.newLine();
         out.flush();
+        // v0.1.147（评审收口）：JDBC 登录超时——缺省时对网络黑洞（防火墙丢包无
+        // RST）的 getConnection 会挂到 OS TCP 超时（分钟级）。默认 30s，
+        // OJ_JDBC_LOGIN_TIMEOUT_SECS 可覆盖；socket 级超时属驱动 URL 参数，见
+        // docs/plugins/jdbc.md 限制节。
+        DriverManager.setLoginTimeout(loginTimeoutSecs());
         DriverLoader.load(Paths.get(args.length > 0 ? args[0] : "drivers"));
         BufferedReader in = new BufferedReader(
                 new InputStreamReader(System.in, StandardCharsets.UTF_8));
@@ -42,8 +78,9 @@ public final class Bridge {
     }
 
     /** 逐行读请求直至 EOF；任何单请求异常（含 Error）只回 err 帧，不杀循环。
-     *  除 connect/disconnect（dispatcher 线程执行）与 stream_cancel（独立线程执行 cancel，
-     *  唯一绕过 per-conn 队列者）外，请求按 handle 投递到对应 Session 的单线程队列严格 FIFO。 */
+     *  connect/disconnect 在专用单线程 executor 执行（v0.1.147：不再内联阻塞读线程）；
+     *  stream_cancel（独立线程执行 cancel，唯一绕过 per-conn 队列者）；其余请求按
+     *  handle 投递到对应 Session 的单线程队列严格 FIFO。 */
     static void serve(BufferedReader in, BufferedWriter out) throws IOException {
         Object lock = new Object(); // 多 Session 执行线程并发写帧的互斥（不同 conn 的帧可交错）
         String line;
@@ -57,7 +94,20 @@ public final class Bridge {
                 id = req.optLong("id", -1);
                 String op = req.optString("op");
                 if ("connect".equals(op) || "disconnect".equals(op)) {
-                    writeFrame(out, lock, null, new JSONObject().put("id", id).put("ok", dispatch(req)));
+                    // v0.1.147：移出读线程——读线程只负责收帧与分发，慢 connect
+                    // 不再阻塞其他会话的请求处理（黑洞场景全桥停摆的修复）。
+                    final long fid = id;
+                    final BufferedWriter fout = out;
+                    final Object flock = lock;
+                    CONNECT_EXEC.submit(() -> {
+                        JSONObject resp;
+                        try {
+                            resp = new JSONObject().put("id", fid).put("ok", dispatch(req));
+                        } catch (Throwable t) {
+                            resp = new JSONObject().put("id", fid).put("err", errMsg(t));
+                        }
+                        writeFrame(fout, flock, null, resp);
+                    });
                     continue;
                 }
                 Session s = Session.byHandle(req.optInt("handle", -1));
@@ -84,7 +134,18 @@ public final class Bridge {
                 writeFrame(out, lock, null, new JSONObject().put("id", id).put("err", errMsg(t)));
             }
         }
-        Session.drainAll(); // EOF：等在途任务收尾，响应全部落盘后再返回
+        // EOF：先等 connect/disconnect executor 收尾（有界 = 登录超时上界），
+        // 再等各 Session 在途任务——响应全部落盘后再返回。
+        CONNECT_EXEC.shutdown();
+        try {
+            if (!CONNECT_EXEC.awaitTermination(loginTimeoutSecs() + 5L, TimeUnit.SECONDS)) {
+                CONNECT_EXEC.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            CONNECT_EXEC.shutdownNow();
+        }
+        Session.drainAll();
     }
 
     /** cancel 的 Statement.cancel() 由独立线程执行；cancel 线程与 dispatcher 路径

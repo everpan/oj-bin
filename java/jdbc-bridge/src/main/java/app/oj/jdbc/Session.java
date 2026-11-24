@@ -187,7 +187,7 @@ final class Session {
         Stream st;
         while ((st = streams.get(streamId)) == null) {
             if (System.nanoTime() > deadline) {
-                throw new IllegalStateException("unknown stream_id: " + streamId);
+                throw new IllegalStateException("unknown stream_id: " + streamId + " [OJ-JDBC-STREAM-GONE]");
             }
             Thread.sleep(1);
         }
@@ -207,7 +207,7 @@ final class Session {
     void streamClose(long streamId) {
         Stream st = streams.remove(streamId);
         if (st == null) {
-            throw new IllegalStateException("unknown stream_id: " + streamId);
+            throw new IllegalStateException("unknown stream_id: " + streamId + " [OJ-JDBC-STREAM-GONE]");
         }
         try {
             st.rs.close();
@@ -224,7 +224,7 @@ final class Session {
     private Stream streamOrThrow(long streamId) {
         Stream st = streams.get(streamId);
         if (st == null) {
-            throw new IllegalStateException("unknown stream_id: " + streamId);
+            throw new IllegalStateException("unknown stream_id: " + streamId + " [OJ-JDBC-STREAM-GONE]");
         }
         return st;
     }

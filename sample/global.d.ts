@@ -662,7 +662,8 @@ interface ServerReloadResult {
   applied: string[];
   /** 需重启进程才生效的项（如 db/redis/plugins 后端段、server 段）——提示重启，本进程不重建。
    *  v0.1.146：auth 段键粒度——仅 auth.anonymous_paths 变化归 applied（随换代即时生效）；
-   *  jwt_secret/signing_method/token 时长/cookie 任一变化仍整段报 pending。 */
+   *  jwt_secret/signing_method/token 时长/cookie 任一变化仍整段报 pending。
+   *  v0.1.147：predict 段纳入 pending（装配期冻结，热改授权/白名单须重启）。 */
   restart_pending: string[];
   /** 本进程永久持有、不随热更变更的项（如 listener：server.port/host/证书路径）。 */
   kept_listener: string[];

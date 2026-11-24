@@ -492,8 +492,9 @@ pub struct ReqState {
     pub session: Option<String>,
     /// WS 帧循环专用：ws.send 收集（处理器结束后按序写出，先于信封响应）。
     pub ws_sends: Vec<WsSend>,
-    /// WS 帧循环专用：ws.close(code?, reason?) → 本帧结束后关闭（v0.1.140：None = 无码
-    /// 关闭（原行为）；Some((c, r)) = 显式关闭码（平台只放行 1000 与 4000-4999）。
+    /// WS 帧循环专用：ws.close(code?, reason?) → 本帧结束后关闭（v0.1.140；v0.1.147
+    /// 注释更正：无参调用 op 层映射为 Some((1000, ""))——JS 面 None 不可达，None 仅是
+    /// 内部缺省值；显式码只放行 1000 与 4000-4999）。
     pub ws_close: Option<(u16, String)>,
     /// WS 帧收尾（帧池 spec 2026-09-09）：dispatcher `finally` 把 `__sess` 快照交还
     /// （sess.state 外置 Rust 会话表的回传通道；None = 本帧未触发 finally 兜底）。

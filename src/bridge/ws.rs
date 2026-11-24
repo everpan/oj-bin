@@ -181,6 +181,19 @@ impl WsHub {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&conn);
+        // v0.1.147（评审收口）：房间域**按连接键入**的条目（约定键 = `<connId>` 或
+        // `<connId>/…`）随断连回收——close 钩子不跑的异常退出路径（帧超时 V8 terminate
+        // / 池回收）此前会永久泄漏（每条最多 1 MiB）。非身份键仍由模块 close 钩子
+        // 清理（roomStateDel 的文档契约，不变）。
+        let c = conn.to_string();
+        let prefix = format!("{c}/");
+        self.room_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, keys| {
+                keys.retain(|k, _| !(k == &c || k.starts_with(&prefix)));
+                !keys.is_empty()
+            });
     }
 }
 
@@ -397,7 +410,8 @@ pub(crate) fn op_ws_send_bin(state: &mut OpState, #[buffer] data: JsBuffer) {
 }
 
 /// ws.close(code?, reason?)：请求关闭当前连接（REQ-02a，v0.1.140）。
-/// 无参 = 无码关闭（原行为）；带码只放行 **1000 与 4000-4999**（3xxx/系统保留段报错），
+/// 无参调用**映射 1000**（枚举层面无「无码 Close」形态；v0.1.147 注释更正——旧文案
+/// 「无码关闭」与实现不符）；带码只放行 **1000 与 4000-4999**（3xxx/系统保留段报错），
 /// reason ≤123 字节（RFC 6455）；4xxx 语义 = 不可重试关闭（客户端在该段停 provider）。
 /// 名字避开 deno_websocket 内置 `op_ws_close`（出站客户端，v0.1.7 并存注册）。
 #[op2]
@@ -540,6 +554,45 @@ mod hub_tests {
         assert!(h.bin_set(7, "big", big.clone()).is_err());
         assert!(h.room_state_set("r", "big", big).is_err());
         assert_eq!(h.bin_get(7, "big"), None, "拒写不落盘");
+    }
+
+    /// v0.1.147（评审收口）：异常断连（close 钩子不跑）不再泄漏按连接键入的
+    /// roomState 条目——remove_conn 回收键 = `<connId>` 或 `<connId>/…`；非身份键
+    /// 仍归模块 close 钩子（文档契约），不受影响。
+    #[test]
+    fn given_identity_keyed_room_state_when_conn_removed_then_reclaimed() {
+        let h = WsHub::new();
+        h.room_state_set("r", "7", vec![1]).unwrap();
+        h.room_state_set("r", "7/awareness", vec![2]).unwrap();
+        h.room_state_set("r", "8", vec![3]).unwrap();
+        h.room_state_set("r", "module-owned", vec![4]).unwrap();
+        h.remove_conn(7);
+        assert_eq!(h.room_state_get("r", "7"), None, "身份键随断连回收");
+        assert_eq!(
+            h.room_state_get("r", "7/awareness"),
+            None,
+            "身份前缀键随断连回收"
+        );
+        assert_eq!(h.room_state_get("r", "8"), Some(vec![3]), "他连接键不误伤");
+        assert_eq!(
+            h.room_state_get("r", "module-owned"),
+            Some(vec![4]),
+            "非身份键归 close 钩子，不回收"
+        );
+        // 回收后只剩他键的房间保留；整房清空即回收（再写入同房正常）。
+        h.remove_conn(8);
+        assert_eq!(
+            h.room_state_get("r", "module-owned"),
+            Some(vec![4]),
+            "房间按需保留（尚有非身份键）"
+        );
+        h.room_state_del("r", "module-owned");
+        h.room_state_set("r", "9", vec![5]).unwrap();
+        assert_eq!(
+            h.room_state_get("r", "9"),
+            Some(vec![5]),
+            "整房回收后可复写"
+        );
     }
 }
 

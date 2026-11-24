@@ -198,6 +198,10 @@ pub extern "C" fn connect(cfg: RString) -> FfiFuture {
                 }
             }
             let vendor = dsn::vendor_of(&url);
+            // v0.1.147（评审收口）：代际快照必须在**请求前**——响应后快照会把「新
+            // generation + 已死 JVM 的 java_handle」记进表，check_generation 永过，
+            // 重连类错误信封永不触发。半途 JVM 死亡即按旧代处理 → 走重连信封。
+            let conn_gen = sc.generation();
             let ok = sc
                 .request("connect", Value::Object(args))
                 .await
@@ -211,7 +215,7 @@ pub extern "C" fn connect(cfg: RString) -> FfiFuture {
                 handle,
                 HandleEntry {
                     java_handle,
-                    generation: sc.generation(),
+                    generation: conn_gen,
                     vendor,
                 },
             );
@@ -553,9 +557,12 @@ pub extern "C" fn stream_close(_handle: u64, stream_id: u64) -> FfiFuture {
                 .await
             {
                 Ok(ok) => Ok(ok.to_string().into_bytes()),
-                // cancelled-close 是正常路径：Java 已把取消的流拆掉，
-                // "unknown stream_id" err 帧按幂等成功收口，不向上传播。
-                Err(e) if e.contains("unknown stream_id") => Ok(b"{}".to_vec()),
+                // cancelled-close 是正常路径：Java 已把取消的流拆掉，err 帧按幂等
+                // 成功收口，不向上传播。v0.1.147：跨语言契约改锚**稳定哨兵**
+                // `OJ-JDBC-STREAM-GONE`（Java 侧附加）——文案匹配留作旧 jar 兜底。
+                Err(e) if e.contains("OJ-JDBC-STREAM-GONE") || e.contains("unknown stream_id") => {
+                    Ok(b"{}".to_vec())
+                }
                 Err(e) => Err(e),
             }
         })

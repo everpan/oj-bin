@@ -665,6 +665,20 @@ fn diff_configs_auth_key_granularity() {
         !pending.contains(&"auth".to_string()),
         "pending={pending:?}"
     );
+    // ⑤ v0.1.147（评审收口）：predict: 段整段冻结（网关配置装配期进 StableState，
+    // 热更复用 Backend）——热改授权/白名单必须报 restart_pending，不得假 applied。
+    let old = d("predict:\n  timeout_ms: 15000\n");
+    let new =
+        d("predict:\n  timeout_ms: 3000\n  policy:\n    allowed_sources:\n      - \"db:crm.*\"\n");
+    let (applied, pending, _) = diff_configs(&old, &new);
+    assert!(
+        pending.contains(&"predict".to_string()),
+        "pending={pending:?}"
+    );
+    assert!(
+        !applied.contains(&"predict".to_string()),
+        "applied={applied:?}"
+    );
 }
 
 /// 重复 grant id 会让网关 first-wins 静默取第一条（治理语义漂移）→ 装配期 fail-fast。

@@ -37,6 +37,30 @@
 - devkit 四件同步：api-manual §server 三清单 auth 键粒度段、sample/global.d.ts
   `ServerReloadResult` 注释、SKILL 陷阱一行、README。
 
+**评审修复轮（/code-review high，v0.1.140→v0.1.146 全量复审，8 项全清）**：
+
+- **diff_configs 冻结段补 `predict`**（important）：`predict` 段走装配期
+  fail-fast + Backend 复用不重 init，属冻结段；此前热改授权/白名单被误标
+  `applied`（实际不生效）。归 `restart_pending` 并补测试腿 ⑤。
+- **WsHub room_state 身份键回收**（important）：`remove_conn` 此前只清
+  `conn_bins`，`room_state` 中以 `<connId>`/`<connId>/…` 为键的条目永不释放
+  （连接量大时慢性泄漏）；现随连接移除同键回收，非身份键仍归 close 钩子。
+- **JDBC connect 钉死**（important）：桥的 `connect`/`disconnect` 移入专用
+  单线程执行器，JVM 侧统一 `DriverManager.setLoginTimeout`（缺省 30s，env
+  `OJ_JDBC_LOGIN_TIMEOUT_SECS`）；坏 DSN/不可达主机不再挂死 stdin 读线程拖垮
+  全部会话；EOF 停机对执行器有界等待。Rust 侧 connect 前先取 generation 快照
+  （防止连接期间插件重启致 handle 记到新代）。
+- **JDBC 流取消哨兵**：流已被清理时 Java 报错统一带 `[OJ-JDBC-STREAM-GONE]`
+  哨兵，Rust `stream_close` 按哨兵匹配（保留 legacy 文本回退），误报
+  `stream_close failed` 消除。
+- **DriverLoader 去重**：`ensureDriver` 按 driverClass `ENSURED` 集合去重，
+  多 DSN 共享驱动时不再重复扫描/加载 jar。
+- **kafka 测试去固定 sleep**：env-gated 腿 700ms 固定 sleep 改为 deadline
+  有界轮询（CI 高负载不 flake）。
+- **文档更正**：`ws.close` 无参映射 1000 正常关闭（JS 面 None 不可达）；
+  `roomStateSet` 补身份键回收语义；api-manual §server 冻结段清单补
+  `predict`；jdbc.md 补 connect 超时一节。
+
 ## v0.1.145（2026-11-24，未打标签）
 
 **REQ-PREDICT Phase 4：预测执行与合规网关（上游 UPSTREAM-REQS §3.2 五条验收对照；

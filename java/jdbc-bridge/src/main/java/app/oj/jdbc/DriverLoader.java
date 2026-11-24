@@ -69,9 +69,15 @@ final class DriverLoader {
         }
     }
 
+    /** 已显式装载过的 driver_class（v0.1.147 评审收口：去重——此前每个带逃生舱的
+     *  connect 都向 DriverManager 追加一条 DriverInfo + 一个 UCL 驱动实例，长活进程
+     *  慢性增长）。 */
+    private static final java.util.Set<String> ENSURED =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+
     /** 信封可选 driver_class：老驱动缺 META-INF/services 条目时的显式装载逃生舱。 */
     static void ensureDriver(String driverClass) throws Exception {
-        if (driverClass == null || driverClass.isEmpty()) {
+        if (driverClass == null || driverClass.isEmpty() || !ENSURED.add(driverClass)) {
             return;
         }
         ClassLoader cl = loader != null ? loader : DriverLoader.class.getClassLoader();

@@ -952,29 +952,36 @@ mod tests {
         ))
         .await
         .expect("subscribe");
-        // latest + 消费组 join 需要一点时间：订阅后发布才收得到。
-        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        // v0.1.147（评审收口，CLAUDE.md 红线）：latest + 消费组 join 时延不确定
+        // （CI 负载下固定 700ms 不够——正是 relay.rs 注释记录过的 flake 形态），
+        // 禁固定 sleep 当同步。改「发布 → 500ms 有界轮询 → 未达再发布」的 deadline
+        // 有界重试（relay.rs Probe 同款哲学），总预算 10s。
         let nonce = format!(r#"{{"room":"r","inst":"x","t":"t","d":"nonce-{group}"}}"#);
         DELIVERED.lock().unwrap().clear();
-        drive(&mut publish(
-            handle,
-            RString::from(topic.as_str()),
-            to_rbytes(nonce.as_bytes()),
-        ))
-        .await
-        .expect("publish");
-        // deadline 轮询 DELIVERED：显式组消费 + deliver 上送 + 手动 commit 全链。
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let hit = loop {
-            let got = DELIVERED
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(t, p)| t == &topic && p == nonce.as_bytes());
+            drive(&mut publish(
+                handle,
+                RString::from(topic.as_str()),
+                to_rbytes(nonce.as_bytes()),
+            ))
+            .await
+            .expect("publish");
+            let poll_until = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            let got = loop {
+                let hit = DELIVERED
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(t, p)| t == &topic && p == nonce.as_bytes());
+                if hit || std::time::Instant::now() >= poll_until {
+                    break hit;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            };
             if got || std::time::Instant::now() >= deadline {
                 break got;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         };
         assert!(
             hit,
