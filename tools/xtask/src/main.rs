@@ -582,8 +582,75 @@ fn home_dir() -> PathBuf {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: cargo xtask <bin | plugin <name> [--check] | build | smoke --bin <path>>");
+    eprintln!("usage: cargo xtask <bin | plugin <name> [--check] | build | smoke --bin <path> | jdbc-drivers [--dir <path>]>");
     std::process::exit(2)
+}
+
+/// REQ-A4 随包三件套（pinned；Apache-2.0 均允许再分发）。自备四件
+/// （Snowflake/Databricks/DuckDB/HeavyDB）不在此表——体积或上游废弃，指引见
+/// docs/plugins/jdbc.md 分发矩阵。升级行须同步改该矩阵并重跑 e2e_driver_smoke 腿。
+const JDBC_BUNDLED: &[(&str, &str)] = &[
+    (
+        "trino-jdbc-484.jar",
+        "io/trino/trino-jdbc/484/trino-jdbc-484.jar",
+    ),
+    (
+        "clickhouse-jdbc-0.11.2-all.jar",
+        "com/clickhouse/clickhouse-jdbc/0.11.2/clickhouse-jdbc-0.11.2-all.jar",
+    ),
+    (
+        "kyuubi-hive-jdbc-shaded-1.12.0.jar",
+        "org/apache/kyuubi/kyuubi-hive-jdbc-shaded/1.12.0/kyuubi-hive-jdbc-shaded-1.12.0.jar",
+    ),
+];
+
+/// drivers 目录解析：显式 `--dir` 原样；缺省按发行布局
+/// `<bin>/plugins/<host-triple>/jdbc/drivers/`（与 PluginLoader 发现路径同形）。
+fn jdbc_drivers_dir(explicit: Option<&Path>) -> PathBuf {
+    match explicit {
+        Some(d) => d.to_path_buf(),
+        None => bin_dir()
+            .join("plugins")
+            .join(host_triple())
+            .join("jdbc")
+            .join("drivers"),
+    }
+}
+
+/// 下载随包三件套进 drivers 目录（幂等：同名 jar 在场即跳过），
+/// 随后打印自备四件指引。走系统 curl（xtask 零新增 HTTP 依赖）。
+fn jdbc_drivers(explicit: Option<&Path>) -> Result<(), String> {
+    let dir = jdbc_drivers_dir(explicit);
+    fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    for (name, path) in JDBC_BUNDLED {
+        let dest = dir.join(name);
+        if dest.is_file() {
+            println!("skip {} (exists)", dest.display());
+            continue;
+        }
+        let url = format!("https://repo1.maven.org/maven2/{path}");
+        println!("fetch {url}");
+        let status = Command::new("curl")
+            .args(["-fSL", "--retry", "3", "--silent", "--show-error", "-o"])
+            .arg(&dest)
+            .arg(&url)
+            .status()
+            .map_err(|e| format!("spawn curl: {e}"))?;
+        if !status.success() {
+            let _ = fs::remove_file(&dest);
+            return Err(format!("download failed: {url}"));
+        }
+        println!("→ {}", dest.display());
+    }
+    println!(
+        "\n自备四件（不随包；坐标与指引见 docs/plugins/jdbc.md 分发矩阵）：\n  \
+         Snowflake  net.snowflake:snowflake-jdbc:4.4.1（99MB）\n  \
+         Databricks com.databricks:databricks-jdbc:3.4.5（43MB，Java 11+）\n  \
+         DuckDB     org.duckdb:duckdb_jdbc:2.0.1.0（81MB，离线可用）\n  \
+         HeavyDB    ai.heavy:heavyai-jdbc:6.1.0（上游已废弃，须自构 fat jar）\n\
+         同目录避免同名不同版（共享 UCL，装载按文件名排序先到先得）。"
+    );
+    Ok(())
 }
 
 fn main() -> Result<(), String> {
@@ -623,6 +690,14 @@ fn main() -> Result<(), String> {
                 .ok_or_else(|| "smoke requires --bin <path>".to_string())?;
             smoke(Path::new(bin))
         }
+        "jdbc-drivers" => {
+            let dir = args
+                .iter()
+                .position(|a| a == "--dir")
+                .and_then(|i| args.get(i + 1))
+                .map(PathBuf::from);
+            jdbc_drivers(dir.as_deref())
+        }
         _ => {
             usage();
         }
@@ -641,6 +716,34 @@ mod tests {
         assert!(PLUGINS.contains(&"auth"));
         assert!(PLUGINS.contains(&"bus-kafka"));
         assert!(PLUGINS.contains(&"mail"));
+    }
+
+    #[test]
+    fn given_jdbc_bundled_table_when_iterated_then_three_pinned_jars() {
+        // REQ-A4 随包三件套：pinned 字面量（Maven Central 检索实证 2026-11-24）。
+        // 升级任何一行必须同时改 docs/plugins/jdbc.md 矩阵表并重跑 smoke 腿。
+        assert_eq!(JDBC_BUNDLED.len(), 3, "bundled set is Trino+ClickHouse+Kyuubi only");
+        let names: Vec<_> = JDBC_BUNDLED.iter().map(|(n, _)| *n).collect();
+        assert!(names.contains(&"trino-jdbc-484.jar"), "{names:?}");
+        assert!(names.contains(&"clickhouse-jdbc-0.11.2-all.jar"), "{names:?}");
+        assert!(names.contains(&"kyuubi-hive-jdbc-shaded-1.12.0.jar"), "{names:?}");
+        for (name, url) in JDBC_BUNDLED {
+            let want = format!("https://repo1.maven.org/maven2/{url}");
+            assert!(
+                want.ends_with(&format!("/repo1/{}", name.replace(".jar", ".jar")))
+                    || want.rsplit('/').next() == Some(*name),
+                "url must end with the pinned filename: {want} vs {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_jdbc_drivers_dir_when_resolved_then_matches_layout() {
+        // 显式 --dir 原样；缺省 = bin/plugins/<host-triple>/jdbc/drivers/（发行布局同形）。
+        let explicit = std::path::Path::new("/opt/oj/jdbc-drivers");
+        assert_eq!(jdbc_drivers_dir(Some(explicit)), explicit.to_path_buf());
+        let def = jdbc_drivers_dir(None);
+        assert_eq!(def, bin_dir().join("plugins").join(host_triple()).join("jdbc").join("drivers"));
     }
 
     #[test]
