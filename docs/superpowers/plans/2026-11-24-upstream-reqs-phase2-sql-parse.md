@@ -211,3 +211,17 @@ globalThis.sql = {
 5. 其余按计划落：契约面/血缘 walker/边界测试 Task 2-4 提交 21e73fc/9aa72f8/da1e57c；
    Task 5 提交 2adebc4；门禁全绿（only-js 1165、oj 331+e2e、xtask 11 devkit 契约、
    clippy -D warnings、fmt）。tag 待用户确认。
+
+### 评审循环裁决（Task 5 Step 5，2026-11-24）
+
+三路评审均 **APPROVE-WITH-FIXES**，修订已落（52db95d + docs 对齐提交）：
+
+- 架构师：2 should-fix（自连接别名塌缩、嵌套 WITH 泄漏）+ 1 nit（Cow::Owned）——全部采纳。
+- 工程师：1 must（自连接）+ 3 should（幻影表/嵌套 WITH/star 文档漂移）+ nits——采纳；
+  其中 **star 文档漂移按文档改**（探针实证 impl 产出 `column:"*"`，api-manual 原措辞
+  「null」与实现不符，改文档保留更多信息量）；walker engine 兜底 + astify RangeError→engine
+  采纳（engine 档从预留转实义，docs 同步）。
+- 测试工程师（BDD 对照）：S1-S10 与 Review Focus 全 PINNED（S3 部分补 tables 断言）；
+  mssql 别名 must-pin 补齐；statements 计数/SELECT */write 目标/commentOnly 各补。
+  其 commentOnly「应为 input」的假设经实测证伪——纯注释 astify 返回空语句数组，
+  走多语句拒绝（syntax + statements:0），与 api-manual input 行定义一致，测试按实断。
