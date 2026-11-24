@@ -566,6 +566,80 @@ fn unconsumed_sections_covers_collision_passthrough_and_normal() {
     );
 }
 
+/// G2 评审收口（v0.1.145）：predict 轴相关的装配期 fail-fast 三腿。
+extern "C" fn nop_axis_call(
+    _op: oj_plugin_ffi::RString,
+    _args: oj_plugin_ffi::RString,
+) -> oj_plugin_ffi::FfiFuture {
+    oj_plugin_ffi::ready_err(String::from("nop"))
+}
+static NOP_VT: oj_plugin_ffi::GenericVtable = oj_plugin_ffi::GenericVtable {
+    call: nop_axis_call,
+};
+
+fn gen_plugin(name: &str, axis: &str) -> LoadedPlugin {
+    LoadedPlugin {
+        descriptor: oj_plugin_ffi::PluginDescriptor {
+            name: name.into(),
+            semver: "0.1.0".into(),
+            abi_version: oj_plugin_ffi::ABI_VERSION,
+            fingerprint: "".into(),
+            desc: "".into(),
+        },
+        registrations: Default::default(),
+        generic_axes: vec![(axis.into(), &NOP_VT)],
+        config_key: None,
+        caps: None,
+    }
+}
+
+/// mgmt.axes ∩ predict.axis 重叠 = 合规旁路配置态（mgmt.call 零三闸触达引擎）→
+/// 装配期 fail-fast（G2 must）；正常单收编路径不受影响（正向腿同钉）。
+#[test]
+fn predict_axis_overlap_with_mgmt_axes_fails_fast() {
+    let mut cfg = Config::default();
+    cfg.mgmt.axes.push("predict".into());
+    let loaded = vec![gen_plugin("predict-engine", "predict")];
+    let err = build_registries(&cfg, &loaded)
+        .err()
+        .expect("overlap must fail-fast");
+    assert!(err.contains("predict.axis 'predict'"), "{err}");
+    assert!(err.contains("mgmt.axes"), "{err}");
+    // 正向：无重叠时单收编照常（predict_generic 独立成表，不进 generic 公开面）。
+    let ok = build_registries(&Config::default(), &loaded).expect("clean path");
+    assert_eq!(ok.predict_generic.len(), 1);
+    assert!(ok.generic.is_empty() && ok.mgmt_generic.is_empty());
+}
+
+/// timeout_ms=0 会让 tokio timeout 恒立即触发（网关静默全废）→ 装配期 fail-fast。
+#[test]
+fn predict_timeout_ms_zero_fails_fast() {
+    let mut cfg = Config::default();
+    cfg.predict.timeout_ms = 0;
+    let err = build_registries(&cfg, &[])
+        .err()
+        .expect("timeout_ms=0 must fail-fast");
+    assert!(err.contains("predict.timeout_ms"), "{err}");
+}
+
+/// 跨插件同名轴（含第二家 predict 引擎同名注册）→ 装配期 fail-fast（G2 should）。
+#[test]
+fn generic_axis_double_provider_fails_fast() {
+    let cfg = Config::default();
+    let loaded = vec![
+        gen_plugin("predict-a", "predict"),
+        gen_plugin("predict-b", "predict"),
+    ];
+    let err = build_registries(&cfg, &loaded)
+        .err()
+        .expect("dup provider must fail-fast");
+    assert!(err.contains("provided by both"), "{err}");
+    assert!(
+        err.contains("predict-a") && err.contains("predict-b"),
+        "{err}"
+    );
+}
+
 /// T13：启动横幅每插件一行，db 轴插件追加 caps 串，非 db 轴插件不追加。
 #[test]
 fn banner_line_shows_abi_fingerprint_and_db_caps() {

@@ -4107,6 +4107,32 @@ async fn predict_gateway_end_to_end() {
                      } catch (e) {
                        json.ok({ code: e.code, msg: String(e) });
                      }
+                   } else if (op === "panic") {
+                     try {
+                       await predict.run({ pql: "PANIC boom", dataScope: { sources: ["db:crm.orders"] }, consent: grant });
+                       json.ok({ leaked: true });
+                     } catch (e) {
+                       json.ok({ code: e.code });
+                     }
+                   } else if (op === "contract") {
+                     // 契约违例双分支：ticket 不符 / 缺 result（audit reason 各归一条）。
+                     const out = [];
+                     for (const pql of ["WRONGTICKET P5", "NORESULT P5"]) {
+                       try {
+                         await predict.run({ pql, dataScope: { sources: ["db:crm.orders"] }, consent: grant });
+                         out.push("leaked");
+                       } catch (e) {
+                         out.push(e.code);
+                       }
+                     }
+                     json.ok(out);
+                   } else if (op === "badpayload") {
+                     try {
+                       await predict.run(123);
+                       json.ok({ leaked: true });
+                     } catch (e) {
+                       json.ok({ code: e.code, msg: String(e) });
+                     }
                    } else if (op === "axisBypass") {
                      try {
                        await axis("predict").run({ pql: "P4" });
@@ -4117,10 +4143,11 @@ async fn predict_gateway_end_to_end() {
                    } else if (op === "ojinfo") {
                      json.ok({ genericAxes: ojInfo().genericAxes ?? ojInfo().generic_axes });
                    } else if (op === "audit") {
-                     const evs = await audit.query({ kind: "PREDICT_DENY", limit: 10 });
-                     const oks = await audit.query({ kind: "PREDICT_AUDIT", limit: 10 });
+                     const evs = await audit.query({ kind: "PREDICT_DENY", limit: 20 });
+                     const oks = await audit.query({ kind: "PREDICT_AUDIT", limit: 20 });
                      json.ok({ denies: evs.length, audits: oks.length,
-                               reasons: evs.map(e => JSON.parse(e.detail || "{}").reason) });
+                               reasons: evs.map(e => JSON.parse(e.detail || "{}").reason),
+                               auditStatuses: oks.map(e => JSON.parse(e.detail || "{}").status) });
                    } else {
                      json.fail("unknown op");
                    }
@@ -4175,8 +4202,8 @@ async fn predict_gateway_end_to_end() {
     );
 
     // 2) dataScope 部分越界：整体拒绝 + violations 点名（绝不裁剪）。
-    let (_s, v) = req(addr, "GET", "/v1/api/p/?op=scope", None).await;
-    assert_eq!(s, 200, "{v}");
+    let (s2, v) = req(addr, "GET", "/v1/api/p/?op=scope", None).await;
+    assert_eq!(s2, 200, "{v}");
     assert_eq!(v["data"]["code"], "OJ_PREDICT_SCOPE", "{v}");
     assert_eq!(
         v["data"]["data"]["violations"],
@@ -4228,18 +4255,112 @@ async fn predict_gateway_end_to_end() {
         .unwrap_or_default();
     assert!(!axes.iter().any(|a| a == "predict"), "{v}");
 
+    // 8b) 异步任务中途 panic：spawn_ffi_future 只收敛构造期——task 内 panic 经
+    //     oneshot 关闭折算 Err（消息失真但不跨界、不挂死），网关收敛 OJ_PREDICT_ENGINE。
+    let (_s, v) = req(addr, "GET", "/v1/api/p/?op=panic", None).await;
+    assert_eq!(v["data"]["code"], "OJ_PREDICT_ENGINE", "{v}");
+
+    // 8c) 契约违例双分支（评审收口补腿）：ticket 不符 / 缺 result → OJ_PREDICT_ENGINE，
+    //     audit detail reason 各归一条（ticket_mismatch / missing_result）。
+    let (_s, v) = req(addr, "GET", "/v1/api/p/?op=contract", None).await;
+    let codes = v["data"].as_array().cloned().unwrap_or_default();
+    assert_eq!(codes.len(), 2, "{v}");
+    for c in &codes {
+        assert_eq!(c, "OJ_PREDICT_ENGINE", "{v}");
+    }
+
+    // 8d) payload 非法（predict.run(123)）：结构化 OJ_PREDICT_ENGINE 不 panic；
+    //     G2 收口：该出口也落 PREDICT_AUDIT denied/bad_payload（指纹=原始 payload）。
+    let (_s, v) = req(addr, "GET", "/v1/api/p/?op=badpayload", None).await;
+    assert_eq!(v["data"]["code"], "OJ_PREDICT_ENGINE", "{v}");
+    assert!(
+        v["data"]["msg"]
+            .as_str()
+            .unwrap_or("")
+            .contains("payload must be"),
+        "{v}"
+    );
+
     // 9) 审计：PREDICT_DENY（scope/consent.no_such_grant/consent.expired）与
-    //    PREDICT_AUDIT（ok/timeout/error）双族可查。
-    let (_s, v) = req(addr, "GET", "/v1/api/p/?op=audit", None).await;
-    assert_eq!(s, 200, "{v}");
+    //    PREDICT_AUDIT 按 status 分形可查（评审收口：字段级断言——timeout 误标
+    //    ok 之类必须抓得住）。
+    let (s9, v) = req(addr, "GET", "/v1/api/p/?op=audit", None).await;
+    assert_eq!(s9, 200, "{v}");
     let denies = v["data"]["denies"].as_i64().unwrap_or(0);
-    assert!(denies >= 3, "deny audit missing: {v}");
+    assert_eq!(denies, 3, "deny audit missing: {v}");
+    // AUDIT 族恰 7 条：ok / timeout / sanitize·panic·wrongticket·noresult（error×4）
+    // / badpayload（denied）。
     let audits = v["data"]["audits"].as_i64().unwrap_or(0);
-    assert!(audits >= 2, "ok/timeout audit missing: {v}");
+    assert!(audits >= 7, "audit family incomplete: {v}");
     let reasons = v["data"]["reasons"].as_array().cloned().unwrap_or_default();
     assert!(reasons.iter().any(|r| r == "scope"), "{v}");
     assert!(reasons.iter().any(|r| r == "consent.no_such_grant"), "{v}");
     assert!(reasons.iter().any(|r| r == "consent.expired"), "{v}");
+    let statuses = v["data"]["auditStatuses"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(statuses.iter().any(|x| x == "ok"), "{v}");
+    assert!(statuses.iter().any(|x| x == "timeout"), "{v}");
+    assert!(statuses.iter().any(|x| x == "denied"), "{v}");
+    assert!(
+        statuses.iter().filter(|x| *x == "error").count() >= 4,
+        "{v}"
+    );
+
+    h.abort();
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+/// 评审收口（v0.1.145，Review Focus 5 后半）：引擎缺席语义——不装预测引擎时
+/// predict.run 报 OJ_PREDICT_ENGINE「not assembled」（能力缺席不静默降级），
+/// 且落 PREDICT_AUDIT denied/no_engine 留痕。空 plugins_dir ⇒ 收编注册表必空。
+#[tokio::test(flavor = "current_thread")]
+async fn predict_gateway_plugin_absent_semantics() {
+    let _g = lock();
+    let t = tmp_project(&[
+        (
+            "src/pa/manifest.yaml",
+            "name: pa\ndesc: plugin absent\nversion: 0.1.0\n",
+        ),
+        (
+            "src/pa/api.ts",
+            r#"async function get() {
+                 let run;
+                 try {
+                   await predict.run({ pql: "P", dataScope: { sources: ["db:crm.orders"] }, consent: { grantId: "g", scopes: ["s"] } });
+                   run = { leaked: true };
+                 } catch (e) {
+                   run = { code: e.code, msg: String(e) };
+                 }
+                 const evs = await audit.query({ kind: "PREDICT_AUDIT", limit: 10 });
+                 const d = evs.length ? JSON.parse(evs[0].detail || "{}") : {};
+                 json.ok({ run: run, audits: evs.length, status: d.status, reason: d.reason });
+               }
+               export default { get };"#,
+        ),
+    ]);
+    std::fs::create_dir_all(t.join("plugins-empty").join(host_triple())).unwrap();
+    let mut cfg = base_cfg(&t);
+    // 显式指空目录：屏蔽 workspace bin/plugins 的发现路径（内置 mock 已归置在那里）。
+    cfg.plugins_dir = Some(t.join("plugins-empty"));
+    let (addr, h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into())
+        .await
+        .unwrap();
+
+    let (_s, v) = req(addr, "GET", "/v1/api/pa/", None).await;
+    assert_eq!(v["data"]["run"]["code"], "OJ_PREDICT_ENGINE", "{v}");
+    assert!(
+        v["data"]["run"]["msg"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not assembled"),
+        "{v}"
+    );
+    // 缺席也留痕：PREDICT_AUDIT denied/no_engine（闸 0 唯一出口）。
+    assert_eq!(v["data"]["audits"], 1, "{v}");
+    assert_eq!(v["data"]["status"], "denied", "{v}");
+    assert_eq!(v["data"]["reason"], "no_engine", "{v}");
 
     h.abort();
     let _ = std::fs::remove_dir_all(&t);

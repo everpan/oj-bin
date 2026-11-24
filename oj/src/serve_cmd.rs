@@ -1869,6 +1869,22 @@ fn build_registries(cfg: &Config, loaded: &[LoadedPlugin]) -> Result<Registries,
     let mgmt_claimed = &cfg.mgmt.axes;
     // REQ-PREDICT（v0.1.145）：`predict.axis` 单值收编（预测引擎轴；不进公开面）。
     let predict_claimed = cfg.predict.axis.as_str();
+    // G2 评审必修（v0.1.145 收口）：重叠声明会让引擎轴静默归 mgmt——predict 网关
+    // 反报 no_engine，而 mgmt.call 可零三闸（dataScope/consent/PREDICT 审计）触达
+    // 引擎 = 合规旁路。装配期 fail-fast，与跨插件同名冲突同口径。
+    if mgmt_claimed.iter().any(|a| a.as_str() == predict_claimed) {
+        return Err(format!(
+            "plugins conflict: predict.axis '{predict_claimed}' is also claimed by mgmt.axes — \
+             the overlap would route the engine past the predict gateway (mgmt.call bypasses \
+             the dataScope/consent/audit gates); remove it from one of the two"
+        ));
+    }
+    if cfg.predict.timeout_ms == 0 {
+        return Err(
+            "predict.timeout_ms must be > 0 (0 would time out every engine call immediately)"
+                .to_string(),
+        );
+    }
     let mut seen: HashMap<&str, &str> = HashMap::new();
     let mut generic = Vec::new();
     let mut mgmt_generic = Vec::new();

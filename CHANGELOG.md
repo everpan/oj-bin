@@ -50,6 +50,17 @@ devkit 四件已同步）**：
   交互式 consent；dataScope 声明式（网关校验声明 ⊆ 白名单，不解析 PQL 验证取数
   一致）；平台 fetch 无出站白名单（独立需求）。交互式 consent 属上游 G2 合规面
   裁定，另立需求。
+- **评审收口（四方评审：架构师 / 工程师 / 测试工程师 BDD 对照 / 合规 G2 专项，
+  G2 初裁不通过 → 修复后复验）**：G2 must——`predict.axis` 与 `mgmt.axes` 重叠时
+  引擎轴静默归 mgmt（`mgmt.call` 零三闸触达引擎 = 合规旁路）→ 装配期 fail-fast +
+  三腿装配测试（重叠 / `timeout_ms: 0` / 跨插件同名轴双提供者）；payload 不可解析
+  出口补审计（AUDIT denied reason=bad_payload，指纹取原始 payload）；文档-实现对齐
+  四处（no_engine 审计形态实为 status=denied reason=no_engine、审计 detail 不落
+  引擎消息文本、空 dataScope 恒过闸 1 成文、脱敏精确子串局限声明 + 引擎契约增
+  「错误消息不得嵌入 PQL/请求数据」与 pql 非空）；e2e 补四腿（异步任务 panic 跨界
+  收敛不挂死 / ticket_mismatch + missing_result 契约违例双分支 / bad_payload /
+  引擎缺席「not assembled」独立站）+ 审计腿升级 status 字段级断言（denied/ok/
+  timeout/error 分形全钉，timeout 误标 ok 抓得住）。
 
 ## v0.1.144（2026-11-24，未打标签）
 

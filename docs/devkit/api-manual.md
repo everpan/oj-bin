@@ -2102,9 +2102,13 @@ const out = await predict.run({
    `axis("predict")` 报 `unknown generic axis 'predict'`，`ojInfo().generic_axes` 不含它。
    引擎缺席时抛 `code:"OJ_PREDICT_ENGINE"`、message
    `"predict engine plugin not assembled (install plugins/oj-predict or a contract-compatible engine; axis is gateway-reserved and not reachable via axis())"`
-   ——**能力缺席，绝不静默降级**（落 PREDICT_AUDIT status=no_engine；此腿无 trace）。
+   ——**能力缺席，绝不静默降级**（落 PREDICT_AUDIT status=denied reason=no_engine；
+   此腿无 trace）。装配期两道 fail-fast：`predict.axis` 与 `mgmt.axes` 重叠 → 拒启
+   （重叠会让引擎静默归 mgmt——`mgmt.call` 可零三闸触达引擎 = 合规旁路）；
+   `predict.timeout_ms: 0` → 拒启（恒立即超时）。
 2. **dataScope 白名单（闸 1，fail-closed）**：`sources` 逐条对 `predict.policy.allowed_sources`
-   （精确串或 `db:<库名>.*` 尾通配）；**任一条越界 → 整体拒绝**（绝不裁剪放行）：抛
+   （精确串——**区分大小写**——或 `db:<库名>.*` 尾通配）；**任一条越界 → 整体拒绝**
+   （绝不裁剪放行）：抛
    `code:"OJ_PREDICT_SCOPE"`、message
    `"predict.run: dataScope exceeds policy.allowed_sources (violations: […]); the whole request is denied, not trimmed"`、
    `e.data.violations` 点名全部越界项。落 `PREDICT_DENY` reason=scope（无 trace）。
@@ -2112,6 +2116,8 @@ const out = await predict.run({
    → 声明 `scopes` 覆盖请求 `scopes`；任一不过抛 `code:"OJ_PREDICT_CONSENT"`、message
    `"predict.run: consent not granted (reason: <no_such_grant|expired|scopes_insufficient>); execution skipped and audited"`、
    `e.data.reason` 三值之一。落 `PREDICT_DENY` reason=consent.*（无 trace）。
+   `dataScope` 整体缺省或 `sources` 为空数组 = **声明零触达**，闸 1 恒过（闸 2 照常）——
+   引擎拿不到任何声明源，读什么由引擎契约自律（见下「合规边界」）。
 
 通过后 dispatch 引擎（`predict.timeout_ms` 毫秒有界，缺省 15000）：
 
@@ -2119,12 +2125,19 @@ const out = await predict.run({
   外部引擎适配器应自带服务端超时）；落 PREDICT_AUDIT status=timeout。
 - 引擎 Err / 回包 ticket 缺失或不符：抛 `OJ_PREDICT_ENGINE`；ticket 不符 message
   `"predict.run: engine did not echo the gateway ticket (contract violation; see docs/plugins/predict.md engine contract)"`。
-  引擎错误消息经**脱敏**（剥 PQL 原文 + 300 字符截断）后才回 JS 与审计——引擎把请求
-  内容回显进错误文案不会泄漏租户数据。落 PREDICT_AUDIT status=error。
+  引擎错误消息经**脱敏**（剥 PQL 原文精确子串 + 300 字符截断）后才回 JS（审计不落
+  消息文本，只落指纹与状态）；注意脱敏只剥**精确整条**回显——引擎把 PQL 拆散/变形
+  拼进错误文案时仍可能残留 ≤300 字符，故引擎契约同时规定**错误消息不得嵌入
+  PQL/请求数据**（见下）。落 PREDICT_AUDIT status=error。
 
 **审计**（U-9 同一出口，`audit.query({kind:"PREDICT_AUDIT"|"PREDICT_DENY"})` 可查）：成功
-/ 失败 / 超时 / **拒绝**全部留痕；detail 含 `pqlSha256`（sha256 前 12 hex）、`sources`、
-`grantId`、`status`、`violations`、耗时——**零凭据、无 PQL 原文**（PQL 不出审计）。
+/ 失败 / 超时 / **拒绝** / 甚至 payload 不可解析（AUDIT denied reason=bad_payload，指纹
+取原始 payload）全部留痕。detail **按 status 分形**：公共键 = `status`（ok/timeout/error/
+denied）+ `pqlSha256`（sha256 前 12 hex）+ `sources` + `grantId` + `ms`；`denied` 另带
+`reason`（scope / consent.* / no_engine / bad_payload）与 `violations`（仅 scope 腿）；
+`error` 中**契约违例**另带 `reason`（ticket_mismatch / missing_result），通用引擎错误
+无 reason 键；`timeout` 另带 `timeoutMs`。detail **不含引擎消息文本**（msg 只回 JS，
+审计只落指纹与状态）。**零凭据、无 PQL 原文**（PQL 不出审计）。
 
 配置（config `predict:` 段；整段缺省 = 白名单与授权表全空、引擎缺席即拒）：
 
@@ -2142,9 +2155,10 @@ predict:
 
 **引擎契约**（部署侧自备引擎替换内置 mock，完整契约与合规边界声明见仓库
 `docs/plugins/predict.md`）：泛型轴插件（`generic(<axis>)`）、op `run` 收**裸对象**
-`{pql, dataScope:{sources,maxRows}, ticket}`、回 `{result, ticket: 原样回显}`（不回显 =
-契约违例拒收）；耗时工作在插件自有 runtime 异步做（`call` 快速返回）；语义要求只读
-预测、遵守 maxRows。内置 mock（`plugins/oj-predict`）：确定性（sha256(pql) 播种）、
+`{pql, dataScope:{sources,maxRows}, ticket}`（pql 须**非空**字符串）、回
+`{result, ticket: 原样回显}`（不回显 = 契约违例拒收）；耗时工作在插件自有 runtime
+异步做（`call` 快速返回）；语义要求**只读**预测、遵守 maxRows、**错误消息不得嵌入
+PQL/请求数据**。内置 mock（`plugins/oj-predict`）：确定性（sha256(pql) 播种）、
 无外呼、不触租户数据——离线联调与部署冒烟用（照抄场景 85）。
 
 **合规边界（红线）**：handler 自建 `fetch` 外呼预测服务 = **绕过合规治理**——租户数据

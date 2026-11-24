@@ -29,7 +29,7 @@ const out = await predict.run({
   consent: { grantId: "g-forecast-2026", scopes: ["forecast.monthly"] },
 });
 // out.result  → 引擎返回（mock 引擎：{engine:"mock", rows:[{period,value}…]}）
-// out.trace   → { id, status:"ok", engineMs, grantId, sources, ticket }
+// out.trace   → { id, status:"ok", engineMs, grantId, sources, ticket, violations:[] }
 ```
 
 不装 oj-predict（或任何契约兼容引擎）时 `predict.run` 报
@@ -39,16 +39,19 @@ const out = await predict.run({
 
 | 闸 | 校验 | 失败形态 |
 |---|---|---|
-| dataScope | 声明源逐条对 `allowed_sources`（精确 / `db:<库名>.*` 尾通配）；**任一条越界 → 整体拒绝**（绝不裁剪放行），violations 点名全部越界项 | `OJ_PREDICT_SCOPE`（`e.data.violations`）+ 审计 `PREDICT_DENY` reason=scope |
+| dataScope | 声明源逐条对 `allowed_sources`（精确串，**区分大小写** / `db:<库名>.*` 尾通配）；**任一条越界 → 整体拒绝**（绝不裁剪放行），violations 点名全部越界项。`dataScope` 缺省或 `sources` 空数组 = 声明零触达、恒过（闸 2 照常） | `OJ_PREDICT_SCOPE`（`e.data.violations`）+ 审计 `PREDICT_DENY` reason=scope |
 | consent | grant 存在 → 未过期（`now >= not_after_ms` 即过期，fail-closed）→ 声明 scopes ⊇ 请求 scopes | `OJ_PREDICT_CONSENT`（`e.data.reason`: no_such_grant / expired / scopes_insufficient）+ 审计 `PREDICT_DENY` reason=consent.* |
-| 引擎 | 收编轴在位；`timeout_ms` 有界；引擎须回显网关 ticket（契约校验） | `OJ_PREDICT_ENGINE` + 审计 `PREDICT_AUDIT` status=timeout / error |
+| 引擎 | 收编轴在位；`timeout_ms` 有界（装配期 `0` 拒启）；引擎须回显网关 ticket（契约校验） | `OJ_PREDICT_ENGINE` + 审计 `PREDICT_AUDIT` status=timeout / error |
 
 **审计**（U-9 同一出口，`audit.query({kind:"PREDICT_AUDIT"|"PREDICT_DENY"})` 可查）：
-成功、失败、超时、**拒绝**全部留痕——detail 零凭据，PQL 原文不出审计（只出
-`pqlSha256` 前 12 hex + sources + grantId + status + 耗时）。
+成功、失败、超时、**拒绝**、连 payload 不可解析（AUDIT denied reason=bad_payload）都
+留痕——detail 按 status 分形（denied 另带 reason/violations；timeout 另带 timeoutMs；
+error 中契约违例另带 reason），零凭据，PQL 原文不出审计（只出 `pqlSha256` 前 12 hex），
+**也不落引擎消息文本**（msg 只回 JS）。
 
-**脱敏**：引擎错误消息经网关剥 PQL 原文 + 300 字符截断——引擎把请求内容回显进
-错误文案不会泄漏租户数据。
+**脱敏**：引擎错误消息经网关剥 PQL 原文精确子串 + 300 字符截断后才回 JS——只剥
+**精确整条**回显，引擎把 PQL 拆散/变形拼进错误文案时仍可能残留 ≤300 字符，故引擎
+契约同时规定**错误消息不得嵌入 PQL/请求数据**（部署侧适配器必须遵守）。
 
 ## 引擎轴收编（特权旁路封堵）
 
@@ -56,6 +59,11 @@ const out = await predict.run({
 （`mgmt.axes` 同款机制）：handler 里 `axis("predict")` 直接报
 `unknown generic axis 'predict'`，`ojInfo().generic_axes` 也不含它。引擎只能经
 `predict.run` 网关触达——三闸不可绕过。
+
+装配期两道 fail-fast（G2 评审收口）：
+- `predict.axis` 与 `mgmt.axes` **重叠** → 拒启——重叠会让引擎静默归 mgmt，
+  `mgmt.call` 可零三闸触达引擎（合规旁路）；
+- 跨插件同名轴（第二家 predict 引擎同名注册）→ 拒启（单轴单提供者）。
 
 ## 引擎契约（部署侧自备引擎照此实现）
 
@@ -67,8 +75,10 @@ const out = await predict.run({
   回 `{"result": <任意 JSON>, "ticket": <原样回显>}`——ticket 不回显 = 契约违例
   （网关拒收）。耗时工作在自己的 runtime 异步做（`catch_future` + `spawn_ffi_future`，
   `call` 快速返回——同步阻塞会拖死网关计时器）。
-- 语义要求：**只读预测**（无租户写路径）；遵守 `dataScope.maxRows`；PQL 语义归引擎，
-  网关不解析 PQL（dataScope 是声明式范围，引擎须自律在声明范围内取数）。
+- 语义要求：**只读预测**（无租户写路径）；遵守 `dataScope.maxRows`；**pql 须非空
+  字符串**（内置 mock 对空 pql 报错）；**错误消息不得嵌入 PQL/请求数据**（网关脱敏
+  只剥精确整条回显，契约约束是第二道防线）；PQL 语义归引擎，网关不解析 PQL
+  （dataScope 是声明式范围，引擎须自律在声明范围内取数）。
 
 内置 mock 引擎（`plugins/oj-predict`）：确定性（sha256(pql) 播种线性趋势，同 pql
 恒同值）、无外呼、不触租户数据——离线联调与部署冒烟用。

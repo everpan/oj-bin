@@ -260,6 +260,15 @@ pub async fn op_predict_run(
     };
     let owner = super::db_session::owner_of(&state.borrow());
     let args: RunArgs = serde_json::from_str(&payload).map_err(|e| {
+        // G2 评审（v0.1.145 收口）：唯一不留痕的出口补审计——payload 不可解析没有
+        // pql/dataScope 可记，指纹取**原始 payload** 的 sha256 前 12 hex（同口径，
+        // 不泄原文）。引擎未触达（非出境事件），kind 用 AUDIT status=denied。
+        emit(
+            &st,
+            &owner,
+            "PREDICT_AUDIT",
+            &deny_detail(&pql_fingerprint(&payload), &[], "", "bad_payload", &[]),
+        );
         super::db_error::structured_js_error(
             CODE_ENGINE,
             format!("predict.run: payload must be {{pql, dataScope, consent}} ({e})"),

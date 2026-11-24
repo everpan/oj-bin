@@ -4,7 +4,8 @@
 //!   回显，供网关回程校验）；PQL 以 `SLEEP<n>` 开头 → **异步**睡 n 毫秒再回
 //!   （网关 timeout 腿——call 必须快速返回 FfiFuture，同步睡会阻塞网关线程令
 //!   tokio 计时器失效）；PQL 以 `FAIL_ECHO …` 开头 → 错误消息回显 PQL 原文
-//!   （网关脱敏腿）；`FAIL…` → 干净错误。
+//!   （网关脱敏腿）；`FAIL…` → 干净错误；`PANIC…` → 任务中途 panic（跨界收敛腿）；
+//!   `WRONGTICKET…`/`NORESULT…` → 契约违例双分支（ticket 不符 / 缺 result）。
 //!
 //! 异步纪律照抄 oj-ldap/oj-db-jdbc 形态：自有 tokio runtime + spawn_ffi_future。
 
@@ -52,6 +53,12 @@ fn engine_run(obj: Value) -> FfiFuture {
                 .unwrap_or(0);
             tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
         }
+        // panic 腿（v0.1.145 评审收口）：异步任务中途 panic——spawn_ffi_future 只
+        // 收敛构造期 panic；task 内 panic 经 oneshot 关闭折算 Err（消息失真但不
+        // 挂死、不跨界）。网关应收敛为 OJ_PREDICT_ENGINE + 审计，宿主存活。
+        if pql.starts_with("PANIC") {
+            panic!("mini-predict task panic (by design)");
+        }
         // 引擎错误腿（PQL 暗号——网关只转发 pql/dataScope/ticket，无旁路 args）：
         // "FAIL_ECHO…" → 错误消息回显**整条 PQL 原文**（网关脱敏腿的威胁模型：
         // 引擎把请求内容拼进错误文案）；"FAIL…" → 干净错误。
@@ -60,6 +67,21 @@ fn engine_run(obj: Value) -> FfiFuture {
         }
         if pql.starts_with("FAIL") {
             return Err("engine boom".to_string());
+        }
+        // 契约违例腿（v0.1.145 评审收口）：WRONGTICKET → ticket 不符；NORESULT →
+        // 回包缺 result 键——两条网关契约校验分支各归一条审计 reason。
+        if pql.starts_with("WRONGTICKET") {
+            return Ok(serde_json::json!({
+                "result": { "engine": "mini" },
+                "ticket": "not-the-gateways",
+            })
+            .to_string()
+            .into_bytes());
+        }
+        if pql.starts_with("NORESULT") {
+            return Ok(serde_json::json!({ "ticket": ticket })
+                .to_string()
+                .into_bytes());
         }
         Ok(serde_json::json!({
             "result": { "engine": "mini", "echoPqlLen": pql.chars().count(), "sources": sources },
