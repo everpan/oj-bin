@@ -74,11 +74,16 @@ function normColumnRef(o) {
   return null;
 }
 
-/** FROM-entry shape per probe: { db, table, as } -- string table + db key. */
+/**
+ * FROM-entry shape per probe: { db, table, as } -- string table + db key, no
+ * `column` field. The `column` exclusion keeps three-part column refs
+ * ({type:"column_ref", db:"a", table:"b", column:"c"}) out: they share the
+ * shape and would otherwise register phantom tables.
+ */
 function isFromEntry(o) {
   return (
     o !== null && typeof o === "object" && !Array.isArray(o) &&
-    typeof o.table === "string" && "db" in o
+    typeof o.table === "string" && "db" in o && o.column === undefined
   );
 }
 
@@ -95,8 +100,10 @@ function walk(v, visit) {
 
 /**
  * Pass 1 scope collection: base sources [{name, schema, alias}] (appearance
- * order, from-entries everywhere incl. nested subqueries) and CTE names
- * (top-level `with` only). CTE definitions map name -> stmt for lineage.
+ * order, from-entries everywhere incl. nested subqueries) and CTE names.
+ * CTE names come from the STATEMENT-level `with` only (root, or the known
+ * `{ast}` wrapper one level down): a WITH declared inside a subquery must not
+ * leak into the global scope nor mask a same-named base table.
  */
 function collectScope(ast) {
   const sources = [];
@@ -104,22 +111,26 @@ function collectScope(ast) {
   const cteDefs = new Map();
   const seen = new Set();
   const cteSet = new Set();
-  // CTE names first (a table named like a CTE is the CTE within this query).
-  walk(ast, (o) => {
-    if (Array.isArray(o.with)) {
-      for (const w of o.with) {
-        if (w && w.name && typeof w.name.value === "string") {
-          ctes.push(w.name.value);
-          cteSet.add(w.name.value);
-          if (w.stmt) cteDefs.set(w.name.value, w.stmt);
-        }
+  // Statement-level WITH only (see doc above); nested WITH is out of scope.
+  const withNode =
+    (Array.isArray(ast.with) && ast.with) ||
+    (ast.ast && Array.isArray(ast.ast.with) && ast.ast.with) ||
+    null;
+  if (withNode) {
+    for (const w of withNode) {
+      if (w && w.name && typeof w.name.value === "string") {
+        ctes.push(w.name.value);
+        cteSet.add(w.name.value);
+        if (w.stmt) cteDefs.set(w.name.value, w.stmt);
       }
     }
-  });
+  }
   const addSource = (o) => {
     if (!isFromEntry(o)) return;
     if (cteSet.has(o.table)) return;
-    const key = (o.db || "") + "." + o.table;
+    // Alias is part of identity: FROM emp a JOIN emp b keeps BOTH entries
+    // (self-join aliases survive; bare columns then honestly degrade to null).
+    const key = (o.db || "") + "." + o.table + "/" + (o.as || "");
     if (seen.has(key)) return;
     seen.add(key);
     sources.push({ name: o.table, schema: o.db || null, alias: o.as || null });
@@ -311,7 +322,13 @@ export default {
     if (o.dialect === undefined || o.dialect === null) {
       fail("dialect", "sql.parse: dialect is required", { supported: DIALECTS.slice() });
     }
-    const raw = String(o.dialect);
+    const raw = o.dialect;
+    if (typeof raw !== "string") {
+      fail("dialect", "sql.parse: dialect must be a string", {
+        dialect: typeof raw,
+        supported: DIALECTS.slice(),
+      });
+    }
     const dialect = DIALECT_ALIASES[raw] || raw;
     if (!DIALECTS.includes(dialect)) {
       fail(
@@ -334,6 +351,12 @@ export default {
     try {
       ast = new nodeSqlParser.Parser().astify(sqlText, { dialect });
     } catch (e) {
+      // Stack exhaustion (deep nesting) is an engine limit, not SQL syntax.
+      if (e instanceof RangeError) {
+        fail("engine", "sql.parse: " + (e.message || "parser resource limit"), {
+          dialect,
+        });
+      }
       // Structured syntax error: parser message + location, never silent.
       const message = "sql.parse: " + (e && e.message ? e.message : "syntax error");
       const extra = { dialect };
@@ -363,23 +386,37 @@ export default {
         { dialect, statements: ast.length },
       );
     }
-    const scope = collectScope(ast);
-    const tables = scope.sources.map((s) => ({
-      name: s.name,
-      schema: s.schema,
-      alias: s.alias,
-    }));
-    // DDL (create/alter/drop): frozen contract -- columns/lineage are empty
-    // (create_definitions happen to contain column_ref-shaped nodes; they are
-    // schema definitions, not references).
-    const isDdl = ast.type === "create" || ast.type === "alter" || ast.type === "drop";
-    const columns = isDdl ? [] : collectColumns(ast, scope);
+    // Belt-and-braces: a contract build over a hostile-but-valid AST (walk
+    // stack exhaustion) must still surface as a structured error.
+    let scope;
+    let tables;
+    let columns;
+    let lineage;
+    try {
+      scope = collectScope(ast);
+      tables = scope.sources.map((s) => ({
+        name: s.name,
+        schema: s.schema,
+        alias: s.alias,
+      }));
+      // DDL (create/alter/drop): frozen contract -- columns/lineage are empty
+      // (create_definitions happen to contain column_ref-shaped nodes; they are
+      // schema definitions, not references).
+      const isDdl = ast.type === "create" || ast.type === "alter" || ast.type === "drop";
+      columns = isDdl ? [] : collectColumns(ast, scope);
+      lineage = isDdl ? [] : collectLineage(ast, scope);
+    } catch (e) {
+      if (e && e.code === "OJ_SQL_PARSE") throw e;
+      fail("engine", "sql.parse: contract extraction failed (" + (e && e.name) + ")", {
+        dialect,
+      });
+    }
     return {
       dialect,
       tables,
       columns,
       ctes: scope.ctes,
-      lineage: isDdl ? [] : collectLineage(ast, scope),
+      lineage,
       ast,
     };
   },

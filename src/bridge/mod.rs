@@ -799,7 +799,7 @@ static BRIDGE_LAZY_ESM: std::sync::LazyLock<Vec<deno_core::ExtensionFileSource>>
 pub fn bridge_ext_init(stable: Arc<StableState>) -> deno_core::Extension {
     let mut ext = bridge_ext::init(stable);
     ext.esm_files = std::borrow::Cow::Borrowed(BRIDGE_ESM);
-    ext.lazy_loaded_esm_files = std::borrow::Cow::Owned(BRIDGE_LAZY_ESM.clone());
+    ext.lazy_loaded_esm_files = std::borrow::Cow::Borrowed(BRIDGE_LAZY_ESM.as_slice());
     ext
 }
 
