@@ -622,6 +622,33 @@ interface SqlApi {
   parse(sqlText: string, opts?: { dialect?: string }): SqlParseResult;
 }
 
+// 预测执行合规网关（v0.1.145，REQ-PREDICT；`predict:` 段 + 预测引擎插件启用，
+// 见 PredictApi JSDoc 与 api-manual §6「predict.run」）。
+interface PredictRunTrace {
+  id: string;
+  status: "ok" | "timeout" | "error";
+  engineMs: number;
+  grantId: string;
+  sources: string[];
+  ticket: string;
+  violations: string[];
+}
+interface PredictApi {
+  /**
+   * 受控预测执行。宿主侧三闸（插件不可绕过）：
+   * dataScope 白名单 fail-closed（throw code:"OJ_PREDICT_SCOPE"、data.violations）/
+   * consent 静态授权表（"OJ_PREDICT_CONSENT"、data.reason ∈ no_such_grant|expired|
+   * scopes_insufficient）/ 引擎在位 + timeout_ms 有界 + ticket 回显契约
+   * ("OJ_PREDICT_ENGINE")。引擎轴收编出 axis() 公开面——只可经本网关触达。
+   * PREDICT_AUDIT / PREDICT_DENY 全程审计（detail 零凭据、无 PQL 原文）。
+   */
+  run(opts: {
+    pql: string;
+    dataScope?: { sources: string[]; maxRows?: number };
+    consent?: { grantId: string; scopes: string[] };
+  }): Promise<{ result: any; trace: PredictRunTrace }>;
+}
+
 // server.*：平台级控制（platform 特权）。
 // reloadConfig：进程内触发热更（与 `POST {base}/_system/config` 同一 executor 与串行锁）；
 // tasks/WS 上下文无归属 → NotCapable；`oj test` / 嵌入式 → `reload not available`；
@@ -1272,6 +1299,8 @@ declare global {
   const yaml: YamlApi;
   // 一等 SQL 解析服务（无特权；见 SqlApi JSDoc 与 api-manual §6「sql.parse」）。
   const sql: SqlApi;
+  // 预测执行合规网关（predict: 段 + 引擎插件；见 PredictApi JSDoc 与 api-manual §6「predict.run」）。
+  const predict: PredictApi;
   // server.*：平台级控制（platform 特权；见 ServerApi JSDoc 与 api-manual §6「server」）。
   const server: ServerApi;
   const bus: BusApi;

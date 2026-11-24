@@ -17,11 +17,14 @@
 
 - [oj-auth.md](oj-auth.md) —— auth 轴插件（验签守卫）。auth 没有 handler 侧 API 专题页，
   状态文档保留在这里。
+- [predict.md](predict.md) —— REQ-PREDICT 预测执行与合规网关（v0.1.145）：引擎契约 +
+  `predict:` 配置参考 + 合规边界声明。
 - [plugin-development.md](plugin-development.md) —— 系统级插件机制与开发手册（架构总览已并入其中）。
 
 AXES 共 9 个：es / db / blob / bus / kv / auth / mq / mail / ldap（类型化）。v0.1.54 起另有
 **泛型轴通道**（`generic(name)` 声明，JS `axis("name").op(...)`，零 ABI 变更）——当前
-oj-ldap 已迁移为泛型轴；清单见 `oj info` / JS `ojInfo().generic_axes`。
+oj-ldap 已迁移为泛型轴；v0.1.145 起 `predict` 轴为网关**收编轴**（不进 `axis()` 公开面，
+只可经 `predict.run` 触达）；清单见 `oj info` / JS `ojInfo().generic_axes`。
 
 系统级插件机制见 [plugin-development.md](plugin-development.md) 与
 `docs/modules/05-ffi-and-plugins.md`。

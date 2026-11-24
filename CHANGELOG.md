@@ -16,6 +16,41 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.145（2026-11-24，未打标签）
+
+**REQ-PREDICT Phase 4：预测执行与合规网关（上游 UPSTREAM-REQS §3.2 五条验收对照；
+devkit 四件已同步）**：
+
+- 新 JS 全局 `predict.run({pql, dataScope, consent})`：宿主侧网关 `op_predict_run`
+  三闸——① 引擎在位（收编注册表；缺席抛 `OJ_PREDICT_ENGINE`，能力缺席不静默降级）；
+  ② dataScope 白名单 fail-closed（`predict.policy.allowed_sources`，精确串或
+  `db:<库名>.*` 尾通配；任一越界整体拒绝 `OJ_PREDICT_SCOPE` + `e.data.violations`，
+  绝不裁剪放行）；③ consent 授权表（`predict.policy.grants` 存在/未过期
+  `not_after_ms` fail-closed/scopes 覆盖；不过抛 `OJ_PREDICT_CONSENT` +
+  `e.data.reason`）。
+- **审计全程留痕**（U-9 同一出口）：成功 PREDICT_AUDIT status=ok、超时/错误
+  PREDICT_AUDIT、拒绝 PREDICT_DENY（reason=scope / consent.*）——`audit.query` 可查；
+  detail 零凭据，PQL 原文不出审计（只出 sha256 前 12 hex）。
+- **引擎轴收编**（`mgmt.axes` 同款机制）：`predict.axis`（缺省 "predict"）装配期从
+  `axis()` 公开面移除、`ojInfo().generic_axes` 不含——引擎只可经 `predict.run` 触达
+  （特权旁路封堵）。
+- **有界执行 + 契约校验**：`predict.timeout_ms`（缺省 15000）tokio 超时；引擎须回显
+  网关 ticket（`gt-…`），不回显 = 契约违例拒收；引擎错误消息剥 PQL 原文 + 300 字符
+  截断脱敏。成功返回 `{result, trace:{id,status,engineMs,grantId,sources,ticket}}`。
+- 新插件 **oj-predict**（泛型轴 `predict`，cdylib）：内置确定性 mock 预测引擎
+  （sha256(pql) 播种线性趋势，同 pql 恒同值；无外呼、不触租户数据）——离线联调与
+  部署冒烟用；外部引擎（KumoRFM 等）由部署侧按引擎契约自备泛型轴插件（
+  `docs/plugins/predict.md`），平台不代猜外部 API。
+- e2e 九腿（mini-predict echo 夹具）：ok 形状+ticket / scope 越界点名 / noGrant /
+  expired / 300ms 超时 vs SLEEP5000（夹具异步 FFI——同步阻塞会拖死网关计时器）/
+  PQL 脱敏 / axis 直连收编封堵 / ojInfo 不见 predict / PREDICT_DENY+PREDICT_AUDIT
+  审计可查；核心校验核 14 用例 + 插件单测 6 用例。
+- **合规边界成文**（`docs/plugins/predict.md`「合规边界」）：handler 自建 `fetch`
+  外呼预测服务 = 绕过合规治理（出境必须走三闸）；v1 grants 是部署期静态治理非
+  交互式 consent；dataScope 声明式（网关校验声明 ⊆ 白名单，不解析 PQL 验证取数
+  一致）；平台 fetch 无出站白名单（独立需求）。交互式 consent 属上游 G2 合规面
+  裁定，另立需求。
+
 ## v0.1.144（2026-11-24，未打标签）
 
 **REQ-A4 Phase 3：oj-db-jdbc 七方言覆盖（上游 UPSTREAM-REQS §3.1 五条验收对照；devkit

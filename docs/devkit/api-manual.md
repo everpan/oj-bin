@@ -1110,6 +1110,7 @@ const n = await db.exec("update user set name = ? where id = ?", ["b", 1]);
 | `es.search / index / del` | Elasticsearch 薄客户端（`es:` 段启用） |
 | `Mail(key)` / `mail` | 邮件投递（`smtp:` 段 + `oj-mail` 插件启用）：`send / sendSync / enqueue / result / sendRaw`，见下「mail」 |
 | `axis(name)` | 泛型插件轴调用面（v0.1.54）：`axis("cache").get("k")`；未知轴抛错并列出可用轴名，见下「axis(name)」 |
+| `predict.run(opts)` | 预测执行合规网关（v0.1.145，REQ-PREDICT；`predict:` 段 + 预测引擎插件启用）：宿主侧三闸（dataScope 白名单 fail-closed / consent 静态授权表 / 引擎在位 + 有界超时 + ticket 回显契约），引擎轴装配期**收编**出 `axis()` 公开面——只可经网关触达；PREDICT_AUDIT/PREDICT_DENY 全程审计（零凭据、无 PQL 原文），见下「predict.run」 |
 | `LDAP(key)` / `ldap` | LDAP 目录查询与鉴证（`ldap:` 段 + oj-ldap 插件启用）。**v0.1.54 起 oj-ldap 迁移泛型轴**：JS 调用面为 `axis("ldap").bind/search/search_paged/whoami/compare`（见下「ldap」与「axis(name)」）；类型化 `ldap`/`LDAP` 全局为遗留双轨面 |
 | `Kafka(name)` / `RabbitMQ(name)` | 命名 MQ 客户端（`kafkas:`/`rabbits:` 段；未配置的名 → `undefined`；消费方法仅任务上下文，见下「命名 MQ 客户端与长任务」） |
 | `tasks.stopping() / tasks.sleep(ms)` | 长任务上下文：停机信号 + 等待原语（见下「命名 MQ 客户端与长任务」） |
@@ -2079,6 +2080,78 @@ if (r.ok) {
   json.ok(await r.json());
 }
 ```
+
+### predict.run —— 预测执行合规网关（v0.1.145，REQ-PREDICT；`predict:` 段 + 预测引擎插件启用）
+
+上游 REQ-PREDICT：平台接受一段 PQL + 声明式数据范围 + 授权，在**受控数据面**执行并回给
+模块，全程审计留痕。调用面（纯 JSON 进出，可直接当 ReAct 工具输出）：
+
+```ts
+const out = await predict.run({
+  pql: "FORECAST revenue NEXT 3",                         // 语义归引擎，网关不解析
+  dataScope: { sources: ["db:crm.orders"], maxRows: 10 }, // 声明式范围（闸 1）
+  consent:  { grantId: "g-forecast-2026", scopes: ["forecast.monthly"] }, // 闸 2
+});
+// out.result → 引擎返回（内置 mock：{engine:"mock", deterministic:true, rows:[{period,value}…]}）
+// out.trace  → { id:"pt-…", status:"ok", engineMs, grantId, sources, ticket:"gt-…", violations:[] }
+```
+
+三闸全部在**宿主侧**（插件不可绕过），按序执行：
+
+1. **引擎在位（闸 0）**：引擎轴在装配期**收编**出 `axis()` 公开面（`mgmt.axes` 同款机制）——
+   `axis("predict")` 报 `unknown generic axis 'predict'`，`ojInfo().generic_axes` 不含它。
+   引擎缺席时抛 `code:"OJ_PREDICT_ENGINE"`、message
+   `"predict engine plugin not assembled (install plugins/oj-predict or a contract-compatible engine; axis is gateway-reserved and not reachable via axis())"`
+   ——**能力缺席，绝不静默降级**（落 PREDICT_AUDIT status=no_engine；此腿无 trace）。
+2. **dataScope 白名单（闸 1，fail-closed）**：`sources` 逐条对 `predict.policy.allowed_sources`
+   （精确串或 `db:<库名>.*` 尾通配）；**任一条越界 → 整体拒绝**（绝不裁剪放行）：抛
+   `code:"OJ_PREDICT_SCOPE"`、message
+   `"predict.run: dataScope exceeds policy.allowed_sources (violations: […]); the whole request is denied, not trimmed"`、
+   `e.data.violations` 点名全部越界项。落 `PREDICT_DENY` reason=scope（无 trace）。
+3. **consent 授权表（闸 2）**：grant 存在 → 未过期（`now >= not_after_ms` 即过期，fail-closed）
+   → 声明 `scopes` 覆盖请求 `scopes`；任一不过抛 `code:"OJ_PREDICT_CONSENT"`、message
+   `"predict.run: consent not granted (reason: <no_such_grant|expired|scopes_insufficient>); execution skipped and audited"`、
+   `e.data.reason` 三值之一。落 `PREDICT_DENY` reason=consent.*（无 trace）。
+
+通过后 dispatch 引擎（`predict.timeout_ms` 毫秒有界，缺省 15000）：
+
+- 超时：抛 `OJ_PREDICT_ENGINE`——网关**放弃等待，非取消语义**（引擎侧计算可能仍在跑，
+  外部引擎适配器应自带服务端超时）；落 PREDICT_AUDIT status=timeout。
+- 引擎 Err / 回包 ticket 缺失或不符：抛 `OJ_PREDICT_ENGINE`；ticket 不符 message
+  `"predict.run: engine did not echo the gateway ticket (contract violation; see docs/plugins/predict.md engine contract)"`。
+  引擎错误消息经**脱敏**（剥 PQL 原文 + 300 字符截断）后才回 JS 与审计——引擎把请求
+  内容回显进错误文案不会泄漏租户数据。落 PREDICT_AUDIT status=error。
+
+**审计**（U-9 同一出口，`audit.query({kind:"PREDICT_AUDIT"|"PREDICT_DENY"})` 可查）：成功
+/ 失败 / 超时 / **拒绝**全部留痕；detail 含 `pqlSha256`（sha256 前 12 hex）、`sources`、
+`grantId`、`status`、`violations`、耗时——**零凭据、无 PQL 原文**（PQL 不出审计）。
+
+配置（config `predict:` 段；整段缺省 = 白名单与授权表全空、引擎缺席即拒）：
+
+```yaml
+predict:
+  axis: predict          # 引擎轴名（收编目标；跨插件同名轴装配冲突 fail-fast）
+  timeout_ms: 15000
+  policy:
+    allowed_sources: ["db:crm.*"]
+    grants:
+      - id: "g-forecast-2026"
+        scopes: ["forecast.monthly"]
+        not_after_ms: 1798761600000   # unix 毫秒；缺省永不过期
+```
+
+**引擎契约**（部署侧自备引擎替换内置 mock，完整契约与合规边界声明见仓库
+`docs/plugins/predict.md`）：泛型轴插件（`generic(<axis>)`）、op `run` 收**裸对象**
+`{pql, dataScope:{sources,maxRows}, ticket}`、回 `{result, ticket: 原样回显}`（不回显 =
+契约违例拒收）；耗时工作在插件自有 runtime 异步做（`call` 快速返回）；语义要求只读
+预测、遵守 maxRows。内置 mock（`plugins/oj-predict`）：确定性（sha256(pql) 播种）、
+无外呼、不触租户数据——离线联调与部署冒烟用（照抄场景 85）。
+
+**合规边界（红线）**：handler 自建 `fetch` 外呼预测服务 = **绕过合规治理**——租户数据
+出境必须走 `predict.run` 三闸，平台审计才有痕迹；v1 grants 是**部署期静态治理**（config
+改授权须重启），非交互式 consent 流；dataScope 是**声明式**——网关校验「声明 ⊆ 白名单」，
+不解析 PQL 验证取数与声明一致（严格对账留待上游裁定）；平台 `fetch` 无出站白名单
+（既有事实，出境管控完整闭环需独立需求）。
 
 ### bridge —— 进程内 dispatch（v0.1.131，代理/编排 handler 必读）
 
@@ -4174,6 +4247,7 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | `db.explain` 归一计划（G3，v0.1.108） | 跨方言执行计划归一：`{plan: PlanNode}`（`category` 枚举 + 原文 `operation` + 字段级 null 的 cost/rows/width）。授权面与 db.query 同门（守卫/REQ-05 配额/trace 复用同一通路），「能 explain」不蕴含「能真跑」（EXPLAIN 归只读，无 ANALYZE 不执行内层语句）；Deny 租户站点内层语句剥前缀过守卫；Tx 臂（attached session）无语句超时，opts.timeout_ms 不生效。sqlite/未知方言 → `OJ_DB_UNSUPPORTED`（`e.data.capability="explain"`）；版本错位用 `typeof db.explain === "function"` 探测。见 `db-guide.md` §3.2 |
 | `db.ddlDiff` 反向 DDL（U-14，v0.1.109；v0.1.112 加 rename/schema 定向；v0.1.113 REQ-09 剩余收口） | `{objectType:"table", name, from, to}` → `{diff, statements, warnings}`：结构化四维 diff（columns/constraints/indexes/foreignKeys × added/removed/changed）+ 有序可重放 statements（DROP：FK→约束→索引→列 → 列变更 → ADD → 约束/索引 → FK 最后；`from=null` → CREATE TABLE 主键内联）。**纯渲染零 DB I/O**，执行走 `db.exec` + `allow_ddl`。**缺省维度 = 不参与 diff；空数组 = DROP 全量**（省略 `indexes` 绝不生成 DROP INDEX 全家桶）。注入防线：标识符方言引号+翻倍（NUL/控制字符拒，不复用 charset 白名单）；verbatim 片段（nativeType/default/definition）拒含 `;`。方言差：pg 改类型 `USING col::type`；mysql 位置差 `AFTER`/`FIRST`（pg 无列位置 DDL → 忽略）；identity 翻转出 changed（field=`identity`）+ PG ADD/DROP IDENTITY（identity 为 pg-only，mysql 参数错误）；同名 changed 约束/索引/FK 先 DROP 再 ADD；mysql 约束 DROP 按类型（pk→DROP PRIMARY KEY / uq→DROP INDEX / ck→DROP CHECK）；建表路径 diff 同 alter 形状（四维 added/removed/changed）；列维度任一端缺省 = 不参与（不产全量 ADD/DROP COLUMN）；不生成序列对象。**列改名（REQ-13，v0.1.112）**：`to.columns[].previousName` 产单条 `RENAME COLUMN`（PG/MySQL 8.0+，改名不动数据，索引/约束成员自动跟随）——六类边界报错（from 找不到/一对多/目标冲突/占用旧名/两列互换/同名列跳过），`diff.columns.renamed` 恒在（含 `from`/`to`）；**不填 `previousName` 的同型一删一增 = 疑似改名 → `warnings`**（数据会按删+增丢失，告警不静默；多列场景按 removed 列聚类——一列一条，列名给出全部同型新增候选）；列定义比较时 definition 里的旧列名做词边界替换（窄窗：字符串字面量撞列名可能漏发 DDL）。**schema 定向（REQ-09-2）**：可选 `schema` 段 → 表引用渲染 `"schema"."name"` / `` `schema`.`name` ``（NUL/控制字符拒，报错点名 schema；diff 输出键仍裸名）。**建表保真（REQ-09 §4.2，v0.1.113）**：`to` 顶层 `partitionBy`（文本原样拼 `)` 后，两方言）+ `options`（仅 MySQL，`engine`/`charset`/`collate`/`comment` 固定序，comment 单引号翻倍；PG 出现 → 参数错误；非对象/非字符串值/NUL 同参数错误，不静默忽略）；与 `catalog("ddl")` 互为逆运算。**分区/表选项变更（§4.3）**：`from != null` 有差异 → `OJ_DB_UNSUPPORTED`（`capability="ddl_diff_partition"`/`"ddl_diff_table_options"`）。**非表对象（§4.4）**：`objectType` 扩 `"view"\|"index"\|"sequence"\|"routine"\|"trigger"`——view 支持 create/definition 文本 diff（PG `CREATE OR REPLACE VIEW`、MySQL `ALTER VIEW`，挂 `diff.definition`）/drop；其余四型 create（`definition` 原样）+ drop（MySQL index drop 需 `from.table`；routine drop 需 `from.type`+`from.args` 签名——MySQL 分支裸 `DROP FUNCTION/PROCEDURE name`（签名是 PG 专属语法）；MySQL 无序列，sequence 在任何路径都参数错误）；`definition`/`partitionBy` 是**语句体**——含 `;`/换行合法（拒 NUL/限 64 KiB），与列 default 等**嵌入片段**的 `;` 拒绝不同档。**表改名（§4.1）**：spec 顶层 `previousName` → `ALTER TABLE old RENAME TO new` 恒首条（RENAME TO 目标恒裸名，schema 段只限定旧引用；`diff.renamed` 恒在与 diff.columns 平级）。**table 的 `to:null` 参数错误**（不产 DROP TABLE）。**限制**：MySQL 分区 DDL 不受 prepared 协议支持——`db.exec` 重放含分区的建表语句会 1064，走迁移/raw 通道。create 路径不渲染 `FIRST`/`AFTER`（位置由声明序决定）。sqlite/未知方言 → `OJ_DB_UNSUPPORTED`（`capability="ddl_diff"`）；版本错位探 `typeof db.ddlDiff === "function"`。MySQL DDL 隐式提交（Tx 臂断事务，同 explain 表口径）。见 `db-guide.md` §3.3 |
 | `mgmt` 管理面（v0.1.100，M1 宿主面） | 缺省 disabled（`mgmt.*` 报 `mgmt is disabled…`）；`mgmt.axes` 收编的轴从 `axis()` 公开面消失（旁路封堵）；未声明 op → 结构化 `OJ_DB_UNSUPPORTED`（`e.data.capability` = op 名）；register 探活失败即拒；双档 allow（read/write，缺省 fail-closed，enabled 时 allow 全缺拒启）。**readOnly 是插件自报、宿主不可验证**（connector 须第一方）。mongo 真 connector（M2）未交付。见 `db-guide.md` §11.8 |
+| `predict` 预测网关边界（v0.1.145，REQ-PREDICT） | 引擎缺席报 `OJ_PREDICT_ENGINE`（能力缺席不静默降级）；`predict.axis` 收编出 `axis()`（`axis("predict")` 报 `unknown generic axis 'predict'`，`ojInfo().generic_axes` 不含）——引擎只可经 `predict.run` 三闸触达；**grants 是部署期静态治理**（config + `not_after_ms` unix 毫秒，过期 fail-closed；改授权须重启），非交互式 consent；**dataScope 是声明式**——校验「声明 ⊆ 白名单」不解析 PQL 验证取数一致（引擎契约自律）；超时是放弃等待非取消（外部引擎自备服务端超时）；审计 detail 零凭据、PQL 只出 sha256 前 12 hex。引擎契约与合规边界见 `docs/plugins/predict.md` |
 | `http.file(i)` 对流式大文件报错（v0.1.38） | > `max_upload` 的 multipart 文件由服务端流式落 blob（字节不进 handler）——报错文案指路 `files[i].key`/`.url`；小文件行为不变 |
 | `bus` 缺省进程内，跨实例不互通 | 需要跨实例广播配 `broker.kind` |
 | `kv.cas/setNX/getSet/lock` 在内存 KV（未配 `redis.default`）下**进程本地**（v0.1.138） | 内存 KV 的原子原语与锁只在**本进程内**互斥——多实例部署下 `kv.lock` 会**各自成功**（假单飞）。需要跨实例协调（锁/单飞/序号去重）必须配 `redis.default`；用「锁是本地」的内存 KV 跑多实例压实类任务是数据损坏级错误 |

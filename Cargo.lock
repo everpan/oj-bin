@@ -4316,7 +4316,7 @@ dependencies = [
 
 [[package]]
 name = "oj"
-version = "0.1.144"
+version = "0.1.145"
 dependencies = [
  "async-trait",
  "axum",
@@ -4549,6 +4549,24 @@ dependencies = [
 [[package]]
 name = "oj-plugin-test-mini-nosym"
 version = "0.1.0"
+
+[[package]]
+name = "oj-plugin-test-mini-predict"
+version = "0.1.0"
+dependencies = [
+ "oj-plugin-ffi",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "oj-predict"
+version = "0.1.0"
+dependencies = [
+ "oj-plugin-ffi",
+ "serde_json",
+ "sha2 0.10.9",
+]
 
 [[package]]
 name = "once_cell"

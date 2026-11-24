@@ -5412,3 +5412,82 @@ e2e_driver_smoke 腿真 JVM 实证（三驱动同目录共处注册）。
 | 多家驱动放一个目录行为诡异 | 装载按文件名排序、同名不同版先到先得——「一目录一版本」；非自包含驱动（DM/Oracle 等）建议单部署单厂商 |
 | 构造器报 `OJ_DB_UNSUPPORTED` | 预期门控（方言恒 `"jdbc"`）：正解裸 `?` SQL；`db.export` 流式泵不受门控 |
 | 老 jar 缺 ServiceLoader 条目 | DSN 信封 `"props":{"driver_class":"<驱动类名>"}` 逃生舱 |
+
+---
+
+## 场景 85：预测执行合规网关——`predict.run` + 内置 mock 引擎离线全链（v0.1.145）
+
+要给 agent（ReAct）一个「预测」工具，但预测要吃租户数据——出境必须走受控面：
+`predict.run` 宿主网关三闸（dataScope 白名单 fail-closed / consent 授权表 / 引擎在位
++ 超时 + ticket 契约）+ PREDICT_AUDIT/PREDICT_DENY 全程审计。内置 oj-predict mock
+引擎确定性、无外呼、不触租户数据——本场景零外部依赖可照抄；真实引擎（KumoRFM 等）
+由部署侧按同一契约自备插件（见 `docs/plugins/predict.md` 引擎契约节）。
+
+### ① 配置
+
+```yaml
+plugins_dir: bin/plugins        # oj-predict 在 bin/plugins/<host-triple>/
+predict:
+  timeout_ms: 15000
+  policy:
+    allowed_sources:
+      - "db:crm.*"              # 精确串或 db:<库名>.* 尾通配
+    grants:
+      - id: "g-forecast-2026"
+        scopes: ["forecast.monthly"]
+        not_after_ms: 1798761600000
+```
+
+### ② 代码（src/forecast/run/api.ts）
+
+```ts
+export async function post() {
+  const out = await predict.run({
+    pql: "FORECAST revenue NEXT 3",
+    dataScope: { sources: ["db:crm.orders"], maxRows: 10 },
+    consent: { grantId: "g-forecast-2026", scopes: ["forecast.monthly"] },
+  });
+  // out.result：mock 引擎 {engine:"mock", deterministic:true, rows:[{period,value}…]}
+  // out.trace ：{id:"pt-…", status:"ok", engineMs, grantId, sources, ticket:"gt-…"}
+  return json.ok({ rows: out.result.rows, trace: out.trace });
+}
+```
+
+三闸的失败形态（每条都有审计，先拒后审、绝不裁剪放行）：
+
+```ts
+// 越界（白名单只有 db:crm.*，声明了 db:hr.*）：
+//   throw code:"OJ_PREDICT_SCOPE"，e.data.violations:["db:hr.employees"]，
+//   审计 PREDICT_DENY reason=scope
+// 授权不过（grant 不存在 / 过期 / scopes 不足）：
+//   throw code:"OJ_PREDICT_CONSENT"，e.data.reason ∈ no_such_grant|expired|scopes_insufficient
+// 引擎缺席 / 超时 / ticket 不符：
+//   throw code:"OJ_PREDICT_ENGINE"（缺席文案明示收编语义：引擎只可经网关触达）
+```
+
+### ③ 验证
+
+```bash
+cargo xtask build               # oj-predict 归置 bin/plugins/
+./bin/oj serve -c config.yaml --api-path src
+curl -X POST http://localhost:9778/v1/api/forecast/run/      # rows + trace.status=="ok"
+```
+
+拒绝腿换 handler 里 `dataScope.sources=["db:hr.employees"]` 再 curl（500 信封
+`OJ_PREDICT_SCOPE`）；审计查询（任意 handler）：
+
+```ts
+const denies = await audit.query({ kind: "PREDICT_DENY", limit: 10 });
+// denies[0].detail: {status:"denied", reason:"scope", pqlSha256, sources, grantId, violations}
+```
+
+### ④ 常见坑
+
+| 坑 | 解 |
+|---|---|
+| `axis("predict")` 直调报 `unknown generic axis 'predict'` | 预期封堵不是 bug：引擎轴收编出 `axis()` 公开面（特权旁路红线），只可经 `predict.run` |
+| 报 `predict engine plugin not assembled` | 引擎插件没装配：装 oj-predict（或契约兼容引擎）并确认 `predict.axis` 与插件轴名一致；跨插件同名轴是装配冲突 fail-fast |
+| `OJ_PREDICT_CONSENT` reason=expired | `not_after_ms` 是 unix **毫秒**；`now >= not_after_ms` 即过期（fail-closed）。改授权表改 config 后重启（静态治理，非交互式 consent） |
+| 引擎错误消息里看不到我的 PQL | 有意脱敏：网关剥 PQL 原文 + 300 字符截断——引擎把请求内容回显进错误文案也不会泄漏租户数据；审计里 PQL 只出 sha256 前 12 hex |
+| 超时后引擎侧还在算 | 网关超时是**放弃等待非取消**——外部引擎适配器自备服务端超时；mock/联调无此问题 |
+| 想绕过网关自建 `fetch` 外呼预测服务 | 红线：= 绕过合规治理（租户数据出境无审计痕迹）；出境走 predict.run 三闸。平台 fetch 无出站白名单是既有事实（独立需求） |

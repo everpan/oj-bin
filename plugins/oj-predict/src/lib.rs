@@ -25,9 +25,9 @@ extern "C" fn call(op: RString, args: RString) -> FfiFuture {
         let obj: Value = serde_json::from_slice(args[..].as_bytes()).unwrap_or(Value::Null);
         match &op[..] {
             "run" => run(obj),
-            other => oj_plugin_ffi::ready_err(format!(
-                "oj-predict: unknown op '{other}' (known: run)"
-            )),
+            other => {
+                oj_plugin_ffi::ready_err(format!("oj-predict: unknown op '{other}' (known: run)"))
+            }
         }
     })
 }
@@ -144,10 +144,18 @@ mod tests {
     /// maxRows 驱动条数（1..=100 clamp）。
     #[test]
     fn run_honors_max_rows_with_clamp() {
-        let one = call_str("run", r#"{"pql":"X","ticket":"t","dataScope":{"maxRows":1}}"#).unwrap();
+        let one = call_str(
+            "run",
+            r#"{"pql":"X","ticket":"t","dataScope":{"maxRows":1}}"#,
+        )
+        .unwrap();
         let v: Value = serde_json::from_slice(&one).unwrap();
         assert_eq!(v["result"]["rows"].as_array().map(Vec::len), Some(1));
-        let big = call_str("run", r#"{"pql":"X","ticket":"t","dataScope":{"maxRows":99999}}"#).unwrap();
+        let big = call_str(
+            "run",
+            r#"{"pql":"X","ticket":"t","dataScope":{"maxRows":99999}}"#,
+        )
+        .unwrap();
         let v: Value = serde_json::from_slice(&big).unwrap();
         assert_eq!(v["result"]["rows"].as_array().map(Vec::len), Some(100));
     }
