@@ -60,10 +60,13 @@ error 中契约违例另带 reason），零凭据，PQL 原文不出审计（只
 `unknown generic axis 'predict'`，`ojInfo().generic_axes` 也不含它。引擎只能经
 `predict.run` 网关触达——三闸不可绕过。
 
-装配期两道 fail-fast（G2 评审收口）：
+装配期 fail-fast（G2 评审收口 + nit 尾巴）：
 - `predict.axis` 与 `mgmt.axes` **重叠** → 拒启——重叠会让引擎静默归 mgmt，
   `mgmt.call` 可零三闸触达引擎（合规旁路）；
-- 跨插件同名轴（第二家 predict 引擎同名注册）→ 拒启（单轴单提供者）。
+- 跨插件同名轴（第二家 predict 引擎同名注册）→ 拒启（单轴单提供者）；
+- `timeout_ms: 0` → 拒启（恒立即超时）；`grants` 重复 id → 拒启（first-wins
+  会静默遮蔽其余授权）；
+- `policy` 非空但无引擎提供该轴 → WARN 提示（运行期首调才报 not assembled）。
 
 ## 引擎契约（部署侧自备引擎照此实现）
 

@@ -622,6 +622,22 @@ fn predict_timeout_ms_zero_fails_fast() {
     assert!(err.contains("predict.timeout_ms"), "{err}");
 }
 
+/// 重复 grant id 会让网关 first-wins 静默取第一条（治理语义漂移）→ 装配期 fail-fast。
+#[test]
+fn predict_grant_duplicate_id_fails_fast() {
+    let mut cfg = Config::default();
+    let g = |scopes: &str| only_js::bridge::predict::ConsentGrant {
+        id: "g".into(),
+        scopes: vec![scopes.into()],
+        not_after_ms: None,
+    };
+    cfg.predict.policy.grants = vec![g("s"), g("t")];
+    let err = build_registries(&cfg, &[])
+        .err()
+        .expect("dup grant id must fail-fast");
+    assert!(err.contains("duplicate grant id 'g'"), "{err}");
+}
+
 /// 跨插件同名轴（含第二家 predict 引擎同名注册）→ 装配期 fail-fast（G2 should）。
 #[test]
 fn generic_axis_double_provider_fails_fast() {

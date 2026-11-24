@@ -61,6 +61,14 @@ devkit 四件已同步）**：
   收敛不挂死 / ticket_mismatch + missing_result 契约违例双分支 / bad_payload /
   引擎缺席「not assembled」独立站）+ 审计腿升级 status 字段级断言（denied/ok/
   timeout/error 分形全钉，timeout 误标 ok 抓得住）。
+- **评审 nit 尾巴清零**（同版本内）：`grants` 重复 id 装配期 fail-fast（first-wins
+  静默遮蔽）；`policy` 非空但无引擎 → 装配期 WARN；大小写不敏感撞 `predict.axis`
+  的泛型轴（如 "Predict"）装配期 WARN（会落公开面）；e2e 补 maxRows 网关透传断言
+  与 `scopes_insufficient` 拒绝腿（审计 DENY 计数 3→4）；mini-predict 夹具补空
+  pql 拒绝（与生产 oj-predict 同语义，消除夹具-生产契约分叉）；**maxRows 透传
+  断言抓到真缺陷并修复**——`DataScope.max_rows` 缺 `rename = "maxRows"`，handler
+  传的 `maxRows` 恒被 serde 丢弃（None 透传引擎），本版内已修。并发 predict.run
+  无串扰腿仍缺（nit，Arc 只读注册表风险低）——登记为已知尾巴。
 
 ## v0.1.144（2026-11-24，未打标签）
 

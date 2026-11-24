@@ -1885,6 +1885,19 @@ fn build_registries(cfg: &Config, loaded: &[LoadedPlugin]) -> Result<Registries,
                 .to_string(),
         );
     }
+    {
+        // 重复 grant id 会让网关 first-wins 静默取第一条（治理语义漂移）→ 装配期 fail-fast。
+        let mut grant_ids = std::collections::HashSet::new();
+        for g in &cfg.predict.policy.grants {
+            if !grant_ids.insert(g.id.as_str()) {
+                return Err(format!(
+                    "predict.policy.grants: duplicate grant id '{}' (first-wins would silently \
+                     shadow the rest; give each grant a unique id)",
+                    g.id
+                ));
+            }
+        }
+    }
     let mut seen: HashMap<&str, &str> = HashMap::new();
     let mut generic = Vec::new();
     let mut mgmt_generic = Vec::new();
@@ -1903,9 +1916,28 @@ fn build_registries(cfg: &Config, loaded: &[LoadedPlugin]) -> Result<Registries,
             } else if axis == predict_claimed {
                 predict_generic.push((axis.clone(), p.descriptor.name[..].to_string(), *vt));
             } else {
+                // 大小写不敏感撞 predict 轴名（如 "Predict"）：精确匹配不命中收编，
+                // 该轴会落公开面 axis()——提示而非拦截（契约要求轴名 = predict.axis）。
+                if axis.eq_ignore_ascii_case(predict_claimed) && !predict_claimed.is_empty() {
+                    eprintln!(
+                        "WARN: generic axis '{axis}' differs from predict.axis '{predict_claimed}' \
+                         only by case and will stay on the public axis() surface"
+                    );
+                }
                 generic.push((axis.clone(), p.descriptor.name[..].to_string(), *vt));
             }
         }
+    }
+    if !cfg.predict.policy.allowed_sources.is_empty()
+        && predict_generic.is_empty()
+        && !loaded.is_empty()
+    {
+        // fail-closed 语义正确（首调即 no_engine），仅按 audit 段同款给装配期提示。
+        eprintln!(
+            "WARN: predict.policy is configured but no plugin provides the '{}' axis — \
+             predict.run will reject with 'not assembled'",
+            cfg.predict.axis
+        );
     }
     Ok(Registries {
         es,

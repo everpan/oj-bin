@@ -2103,9 +2103,11 @@ const out = await predict.run({
    引擎缺席时抛 `code:"OJ_PREDICT_ENGINE"`、message
    `"predict engine plugin not assembled (install plugins/oj-predict or a contract-compatible engine; axis is gateway-reserved and not reachable via axis())"`
    ——**能力缺席，绝不静默降级**（落 PREDICT_AUDIT status=denied reason=no_engine；
-   此腿无 trace）。装配期两道 fail-fast：`predict.axis` 与 `mgmt.axes` 重叠 → 拒启
+   此腿无 trace）。装配期 fail-fast：`predict.axis` 与 `mgmt.axes` 重叠 → 拒启
    （重叠会让引擎静默归 mgmt——`mgmt.call` 可零三闸触达引擎 = 合规旁路）；
-   `predict.timeout_ms: 0` → 拒启（恒立即超时）。
+   `predict.timeout_ms: 0` → 拒启（恒立即超时）；`grants` 出现重复 id → 拒启
+   （first-wins 会静默遮蔽其余授权）。`policy` 非空但无引擎提供该轴 → 装配期
+   WARN 提示（运行期首调才报 not assembled）。
 2. **dataScope 白名单（闸 1，fail-closed）**：`sources` 逐条对 `predict.policy.allowed_sources`
    （精确串——**区分大小写**——或 `db:<库名>.*` 尾通配）；**任一条越界 → 整体拒绝**
    （绝不裁剪放行）：抛

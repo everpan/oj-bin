@@ -4068,7 +4068,7 @@ async fn predict_gateway_end_to_end() {
                    if (op === "ok") {
                      const out = await predict.run({
                        pql: "FORECAST revenue NEXT 3",
-                       dataScope: { sources: ["db:crm.orders"] },
+                       dataScope: { sources: ["db:crm.orders"], maxRows: 10 },
                        consent: grant,
                      });
                      json.ok(out);
@@ -4089,6 +4089,13 @@ async fn predict_gateway_end_to_end() {
                    } else if (op === "expired") {
                      try {
                        await predict.run({ pql: "P3", dataScope: { sources: ["db:crm.orders"] }, consent: { grantId: "g-old", scopes: ["forecast.monthly"] } });
+                       json.ok({ leaked: true });
+                     } catch (e) {
+                       json.ok({ code: e.code, data: JSON.parse(e.data || "{}") });
+                     }
+                   } else if (op === "scopesShort") {
+                     try {
+                       await predict.run({ pql: "P6", dataScope: { sources: ["db:crm.orders"] }, consent: { grantId: "g-2026", scopes: ["forecast.daily"] } });
                        json.ok({ leaked: true });
                      } catch (e) {
                        json.ok({ code: e.code, data: JSON.parse(e.data || "{}") });
@@ -4191,6 +4198,8 @@ async fn predict_gateway_end_to_end() {
     assert_eq!(s, 200, "{v}");
     assert_eq!(v["data"]["result"]["engine"], "mini", "{v}");
     assert_eq!(v["data"]["result"]["echoPqlLen"], 23, "{v}");
+    // maxRows 网关透传（评审 nit 收口）：引擎收到的 dataScope.maxRows 是 handler 声明值。
+    assert_eq!(v["data"]["result"]["maxRows"], 10, "{v}");
     assert_eq!(v["data"]["trace"]["status"], "ok", "{v}");
     assert_eq!(v["data"]["trace"]["grantId"], "g-2026", "{v}");
     assert_eq!(v["data"]["trace"]["sources"][0], "db:crm.orders", "{v}");
@@ -4218,6 +4227,11 @@ async fn predict_gateway_end_to_end() {
     let (_s, v) = req(addr, "GET", "/v1/api/p/?op=expired", None).await;
     assert_eq!(v["data"]["code"], "OJ_PREDICT_CONSENT", "{v}");
     assert_eq!(v["data"]["data"]["reason"], "expired", "{v}");
+
+    // 4b) consent scopes 不足（g-2026 不含 forecast.daily）。
+    let (_s, v) = req(addr, "GET", "/v1/api/p/?op=scopesShort", None).await;
+    assert_eq!(v["data"]["code"], "OJ_PREDICT_CONSENT", "{v}");
+    assert_eq!(v["data"]["data"]["reason"], "scopes_insufficient", "{v}");
 
     // 5) 引擎超时有界：SLEEP5000 vs timeout_ms 300 → OJ_PREDICT_ENGINE。
     let (_s, v) = req(addr, "GET", "/v1/api/p/?op=timeout", None).await;
@@ -4287,7 +4301,7 @@ async fn predict_gateway_end_to_end() {
     let (s9, v) = req(addr, "GET", "/v1/api/p/?op=audit", None).await;
     assert_eq!(s9, 200, "{v}");
     let denies = v["data"]["denies"].as_i64().unwrap_or(0);
-    assert_eq!(denies, 3, "deny audit missing: {v}");
+    assert_eq!(denies, 4, "deny audit missing: {v}");
     // AUDIT 族恰 7 条：ok / timeout / sanitize·panic·wrongticket·noresult（error×4）
     // / badpayload（denied）。
     let audits = v["data"]["audits"].as_i64().unwrap_or(0);
@@ -4296,6 +4310,10 @@ async fn predict_gateway_end_to_end() {
     assert!(reasons.iter().any(|r| r == "scope"), "{v}");
     assert!(reasons.iter().any(|r| r == "consent.no_such_grant"), "{v}");
     assert!(reasons.iter().any(|r| r == "consent.expired"), "{v}");
+    assert!(
+        reasons.iter().any(|r| r == "consent.scopes_insufficient"),
+        "{v}"
+    );
     let statuses = v["data"]["auditStatuses"]
         .as_array()
         .cloned()

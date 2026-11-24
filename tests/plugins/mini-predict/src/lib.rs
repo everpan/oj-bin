@@ -42,7 +42,14 @@ fn engine_run(obj: Value) -> FfiFuture {
         .and_then(|d| d.get("sources"))
         .cloned()
         .unwrap_or(Value::Null);
+    // maxRows 网关透传腿：原样回显，e2e 断言网关组装的 engine_args 带了 maxRows。
+    let max_rows = obj.get("dataScope").and_then(|d| d.get("maxRows")).cloned();
     oj_plugin_ffi::spawn_ffi_future(rt(), async move {
+        // 引擎契约（评审 nit 收口）：pql 须非空——与生产 oj-predict 同语义，
+        // 消除「夹具与生产插件对空 pql 行为相反」的分叉。
+        if pql.trim().is_empty() {
+            return Err("mini-predict: pql must be a non-empty string".to_string());
+        }
         // timeout 腿：PQL 形如 "SLEEP5000…" → 异步睡（网关侧 timeout_ms 截断）。
         if let Some(rest) = pql.strip_prefix("SLEEP") {
             let ms: u64 = rest
@@ -84,7 +91,12 @@ fn engine_run(obj: Value) -> FfiFuture {
                 .into_bytes());
         }
         Ok(serde_json::json!({
-            "result": { "engine": "mini", "echoPqlLen": pql.chars().count(), "sources": sources },
+            "result": {
+                "engine": "mini",
+                "echoPqlLen": pql.chars().count(),
+                "sources": sources,
+                "maxRows": max_rows,
+            },
             "ticket": ticket,
         })
         .to_string()

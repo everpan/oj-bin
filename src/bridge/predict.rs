@@ -172,7 +172,7 @@ struct DataScope {
     #[serde(default)]
     sources: Vec<String>,
     /// 声明行数上界（透传引擎，引擎契约负责遵守；网关不解析返回集）。
-    #[serde(default)]
+    #[serde(default, rename = "maxRows")]
     max_rows: Option<u64>,
 }
 
