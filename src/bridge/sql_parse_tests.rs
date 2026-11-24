@@ -160,3 +160,146 @@ async fn sql_parse_reuses_lazy_module_on_second_call() {
     assert_eq!(v["data"]["t1"], "select");
     assert_eq!(v["data"]["t2"], "select");
 }
+
+/// S1（golden 全量锚）：spec 原例的列级血缘——CTE 穿透一层、别名解析正确。
+#[tokio::test(flavor = "current_thread")]
+async fn sql_parse_golden_lineage_spec_example() {
+    let (b, _) = new_bridge();
+    let cap = b
+        .run_with(
+            r#"const r = sql.parse("WITH recent AS (SELECT order_id, amount FROM orders WHERE created_at > '2026-01-01') SELECT r.order_id, c.name FROM recent r JOIN customers c ON r.order_id = c.order_id", { dialect: "postgresql" });
+               json.ok({ lineage: r.lineage });"#,
+            RequestInfo::default(),
+        )
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(
+        v["data"]["lineage"],
+        json!([
+            {"output": {"table": "recent", "column": "order_id"},
+             "sources": [{"table": "orders", "column": "order_id"}]},
+            {"output": {"table": "customers", "column": "name"},
+             "sources": [{"table": "customers", "column": "name"}]},
+        ]),
+        "spec golden lineage (CTE pass-through + alias resolution): {v}"
+    );
+}
+
+/// S3：FROM 派生子查询穿透一层（匿名 CTE 同机制）；output.table 无名源为 null。
+#[tokio::test(flavor = "current_thread")]
+async fn sql_parse_lineage_from_subquery_pass_through() {
+    let (b, _) = new_bridge();
+    let cap = b
+        .run_with(
+            r#"const r = sql.parse("SELECT x.id FROM (SELECT id FROM orders) x WHERE x.id > 1", { dialect: "postgresql" });
+               json.ok({ lineage: r.lineage });"#,
+            RequestInfo::default(),
+        )
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(
+        v["data"]["lineage"],
+        json!([
+            {"output": {"table": null, "column": "id"},
+             "sources": [{"table": "orders", "column": "id"}]},
+        ]),
+        "derived-subquery alias resolves one level to the inner base table: {v}"
+    );
+}
+
+/// S3b：链式 CTE 单层边界——b→a（CTE 引 CTE）停在 a 名上，不递归第二层。
+#[tokio::test(flavor = "current_thread")]
+async fn sql_parse_lineage_chained_cte_stops_at_boundary() {
+    let (b, _) = new_bridge();
+    let cap = b
+        .run_with(
+            r#"const r = sql.parse("WITH a AS (SELECT id FROM t1), b AS (SELECT id FROM a) SELECT b.id FROM b", { dialect: "postgresql" });
+               json.ok({ lineage: r.lineage });"#,
+            RequestInfo::default(),
+        )
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(
+        v["data"]["lineage"],
+        json!([
+            {"output": {"table": "b", "column": "id"},
+             "sources": [{"table": "a", "column": "id"}]},
+        ]),
+        "chained CTE resolves one level and stops at the boundary CTE name: {v}"
+    );
+}
+
+/// S4：DDL 语义——postgresql 与 snowflake CREATE TABLE 均解析，columns/lineage 空。
+#[tokio::test(flavor = "current_thread")]
+async fn sql_parse_ddl_multi_dialect_empty_lineage() {
+    let (b, _) = new_bridge();
+    let cap = b
+        .run_with(
+            r#"const pg = sql.parse("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(50))", { dialect: "postgresql" });
+               const sf = sql.parse("CREATE TABLE t (id INT)", { dialect: "snowflake" });
+               json.ok({
+                 pgTables: pg.tables, pgLineage: pg.lineage, pgColumns: pg.columns,
+                 sfType: sf.ast.type, sfTables: sf.tables, sfLineage: sf.lineage,
+               });"#,
+            RequestInfo::default(),
+        )
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(
+        v["data"]["pgTables"],
+        json!([{"name": "t", "schema": null, "alias": null}]),
+        "CREATE TABLE target lands in tables: {v}"
+    );
+    assert_eq!(
+        v["data"]["pgLineage"],
+        json!([]),
+        "DDL lineage is empty: {v}"
+    );
+    assert_eq!(
+        v["data"]["pgColumns"],
+        json!([]),
+        "DDL columns are empty: {v}"
+    );
+    assert_eq!(v["data"]["sfType"], "create");
+    assert_eq!(
+        v["data"]["sfTables"],
+        json!([{"name": "t", "schema": null, "alias": null}])
+    );
+    assert_eq!(v["data"]["sfLineage"], json!([]));
+}
+
+/// S9：中文标识符逐字保留（引号标识符，postgresql 方言）。
+#[tokio::test(flavor = "current_thread")]
+async fn sql_parse_unicode_identifiers_verbatim() {
+    let (b, _) = new_bridge();
+    let cap = b
+        .run_with(
+            r#"const r = sql.parse("SELECT \"订单号\" FROM \"订单表\" WHERE \"客户\" = '张三'", { dialect: "postgresql" });
+               json.ok({ columns: r.columns, lineage: r.lineage, tables: r.tables });"#,
+            RequestInfo::default(),
+        )
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(
+        v["data"]["columns"],
+        json!([{"table": "订单表", "column": "订单号"}, {"table": "订单表", "column": "客户"}]),
+        "unicode identifiers kept verbatim (quotes stripped): {v}"
+    );
+    assert_eq!(
+        v["data"]["lineage"],
+        json!([
+            {"output": {"table": "订单表", "column": "订单号"},
+             "sources": [{"table": "订单表", "column": "订单号"}]},
+        ]),
+        "lineage names verbatim: {v}"
+    );
+    assert_eq!(
+        v["data"]["tables"],
+        json!([{"name": "订单表", "schema": null, "alias": null}])
+    );
+}
