@@ -105,7 +105,7 @@ db:
   ```yaml
   plugins:
     oj-db-jdbc:
-      drivers_dir: /abs/path/jdbc/drivers   # 缺省 <插件目录>/jdbc/drivers
+      drivers_dir: /abs/path/jdbc/drivers   # 缺省 drivers/（相对 oj 进程 CWD）——建议恒显式绝对路径
       java_bin: /path/to/java               # 可选，最高优先
       java_opts: ["-Xmx512m"]               # 可选；UTC 与 file.encoding 由插件强制前置
   ```
@@ -175,7 +175,7 @@ BLOB/BINARY → `"$blob:<base64>"`；ARRAY → JSON 数组；STRUCT/OTHER → st
 ## 错误归类与排障
 
 JDBC `SQLException` → 宿主结构化信封（`e.code`/`e.retryable`/
-`e.sessionDisposition`/`e.data.vendor_code`），SQLState class 表镜像
+`e.sessionDisposition`/`e.data.vendor_code`/`e.data.vendor`），SQLState class 表镜像
 oj-db-mysql：
 
 | SQLState class | category | retryable | session |
@@ -193,6 +193,12 @@ oj-db-mysql：
 表后静默误判 retryable**，直接 internal；`error_code` 原样留在
 `e.data.vendor_code` 供排障。错误消息里的 `user:pass@` 连接串自动脱敏成
 `://***@`（host/库名保留——排障要知道连的是哪个库）。
+
+**`e.data.vendor` 方言族诊断名**（v0.1.144）：所有 handle 级结构化错误信封的
+`data.vendor` 附 `vendor_of(url)` 识别的方言族（postgresql/mysql/oracle/dameng/
+kingbase/mssql + 七方言 snowflake/databricks/clickhouse/trino/kyuubi/heavydb/
+duckdb；未知前缀原样透出）——多 vendor 共处部署的排障定位锚点。仅诊断，
+不影响 category/retryable 分类。
 
 | 症状 | 解 |
 |---|---|
@@ -214,9 +220,13 @@ oj-db-mysql：
 ### 随包三件套（Apache-2.0，允许随二进制再分发；合计 ~45MB）
 
 ```bash
-cargo xtask jdbc-drivers          # 一键下载 + 归位 <bin>/plugins/<triple>/jdbc/drivers/，幂等
+cargo xtask jdbc-drivers          # 一键下载 + 归位 <bin>/plugins/<triple>/jdbc/drivers/，幂等（逐 jar 过 Maven .sha1 校验，残缺自动重下）
 cargo xtask jdbc-drivers --dir /opt/oj/jdbc-drivers   # 自定义目录
 ```
+
+> 该缺省目录只是**下载落位**——运行期不会自动发现：sidecar 的 `drivers_dir`
+> 须在 config 显式指到同一目录（`--dir` 与 `drivers_dir:` 对齐，或缺省布局下
+> 写全绝对路径），见下方自备四步第 2 步。
 
 | 方言 | 坐标 / pinned | jar 体积 | 最低 JDK | 驱动类 | URL 形态 |
 |---|---|---|---|---|---|
@@ -225,8 +235,9 @@ cargo xtask jdbc-drivers --dir /opt/oj/jdbc-drivers   # 自定义目录
 | Kyuubi | `org.apache.kyuubi:kyuubi-hive-jdbc-shaded:1.12.0` | 21MB | 8+ | `org.apache.kyuubi.jdbc.KyuubiHiveDriver` | `jdbc:kyuubi://host:10009/db` |
 
 三个 jar 均自包含 shaded，**可同目录共处**（e2e_driver_smoke 真 JVM 实证：单
-UCL 三驱动同时注册；`jdbc:` 诊断方言族 snowflake/databricks/clickhouse/trino/
-kyuubi/heavydb/duckdb 随错误文案与日志透出）。
+UCL 三驱动同时注册；运行条件 = 桥 jar + 三驱动在场，该腿 env-gated 不入 CI 门禁；
+`jdbc:` 诊断方言族 snowflake/databricks/clickhouse/trino/kyuubi/heavydb/duckdb
+随错误信封 `data.vendor` 与日志透出）。
 
 **jar 形态陷阱（实测钉死）**：
 - ClickHouse **必须 `-all-dependencies`**——`-all` classifier 不内嵌 slf4j，两个
@@ -238,6 +249,10 @@ kyuubi/heavydb/duckdb 随错误文案与日志透出）。
   release notes 并重跑 smoke 腿。
 
 ### 自备四件（体积或上游状态所致，oj 不随包）
+
+> 装载证据口径（诚实登记）：HeavyDB/Snowflake/Databricks 的 smoke 臂在
+> e2e_driver_smoke 在位（env 注入即实证），本轮无 jar/实例，**未实跑**——
+> Snowflake/Databricks 装载证据为 env-gated 待补，HeavyDB 仅承诺 jar 可装载。
 
 | 方言 | 坐标 | jar 体积 | 许可证 | 判定 |
 |---|---|---|---|---|
@@ -319,6 +334,9 @@ kyuubi/heavydb/duckdb 随错误文案与日志透出）。
   信封契约仍成立）；依赖 SQLState 分流的调用方对 DuckDB 需按 message 判别。
 - **DDL 受影响行数跨厂不一**：DM/H2 回 0，DuckDB 回 -1（SUCCESS_NO_INFO）——
   DDL 成败以不抛错为准，勿按计数分支。
+- **Trino connect 是懒连接**（v0.1.144 实测）：connect 只建对象不开 TCP——
+  对不可达端点 connect 也会成功，网络错误落在首个查询（如 `select 1`）。
+  健康探针勿以 connect 成功为连通判据，至少补一刀查询。
 
 ## 升级须知：`.so` 与 jar 版本锁死
 

@@ -473,6 +473,8 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | DuckDB 大查询顶爆 JVM 堆（v0.1.144） | **全量内存无流式**：结果集全量物化，`db.stream` 对它只是分批搬运不省内存；约束冲突不回 SQLState（错误落 `internal` 兜底，按 message 判别）；内存库 `jdbc:duckdb:` 离线可用——七方言唯一零服务端可全链自测的方言 |
 | 一个 drivers 目录放多家驱动后行为诡异（v0.1.144） | 装载按文件名排序、共享一个 UCL、**同名不同版先到先得**——「一目录一版本」；随包三件套（自包含 shaded）可共处（实测），DM/金仓/Oracle 等非自包含驱动仍建议单部署单厂商 |
 | HeavyDB（OmniSci/MapD）驱动装不上（v0.1.144） | 上游 2026-05-27 官宣废弃，Maven 停在 2022 的 6.1.0 且是 thin jar（需 `-Pfatjar` 自构）——oj 只承诺通用连接 + 用户自备 jar，插件诊断方言族为 `heavydb`（旧前缀 mapd/omnisci 同臂识别） |
+| Trino `connect` 成功却连不上服务器（v0.1.144） | **懒连接**：Trino 驱动 connect 只建对象不开 TCP，不可达端点 connect 也成功，网络错误落在首个查询——健康探针至少补一刀 `select 1`，勿以 connect 成功为连通判据 |
+| jdbc 错误里找不到是哪家的库出错（v0.1.144） | 结构化错误信封 `data.vendor` 附方言族诊断名（postgresql/…/duckdb 七方言全表，URL 前缀识别、未知原样透出）——多 vendor 共处部署用它定位 |
 
 ## 手册
 

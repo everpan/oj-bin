@@ -37,6 +37,9 @@
 1. **ClickHouse 错选 thin jar**（0.3MB 缺依赖 → `ClassNotFoundException`）——pin：Task 1 的
    vendor_of 对 `ch:`/`clickhouse:` 前缀映射 + Task 4 文档陷阱行写明**必须 `-all` classifier**；
    Task 3 smoke 腿用 `-all` jar 实证可装载。
+   > 执行修正（v0.1.144 实证）：classifier 应为 **`-all-dependencies`**（`-all` 不内嵌
+   > slf4j，驱动实例化即 `NoClassDefFoundError`）——见「执行偏差记录」§1，下文 `-all`
+   > 字样均以该节为准。
 2. **Kyuubi 错选 hive-jdbc thin**（171KB 依赖地狱，平面目录不可用）——pin：Task 1 vendor_of
    `kyuubi:` 前缀映射 + Task 3 smoke 腿用 shaded jar + Task 4 陷阱行。
 3. **Trino 版本/JDK 漂移**（周级发版，470+ 要求 Java 11）——pin：Task 2 下载命令钉死
@@ -177,3 +180,23 @@ pinned 版本表（命令内单源，测试断言这些字面量）：
    自备四件分开）；devkit 四件、CHANGELOG、bump 0.1.144、门禁全绿（only-js 1170 /
    oj 全套含 e2e / db-jdbc 含两新腿真 JVM / xtask 13 devkit 契约 / clippy -D warnings /
    fmt）。tag 待用户确认。
+
+## 评审裁决记录（2026-11-24，三路 APPROVE-WITH-FIXES）
+
+**架构师 / 工程师 / 测试工程师**一致通过，合并 must/should 修复清单及处置：
+
+| # | 来源 | 级别 | 项 | 处置 |
+|---|---|---|---|---|
+| 1 | 架构师 | must | `drivers_dir` 缺省口径三处矛盾（sidecar.rs:68 相对 CWD 的 `drivers/` vs jdbc.md 两处宣称 `<插件目录>/jdbc/drivers`）+ xtask 注释误称与 PluginLoader 同形 | 采纳：jdbc.md 统一为 CWD-relative 真相（建议显式绝对路径）；随包节加「下载落位 ≠ 运行期自动发现」提示框；xtask 注释改为如实说明（PluginLoader 只扫 `.so`） |
+| 2 | 架构师+测试工程师 | must-pin | Snowflake/Databricks 零测试腿 | 采纳：e2e_driver_smoke specs 补两 env-gated 臂（无 jar 诚实 skip）；jdbc.md 登记「未实跑」不虚报覆盖 |
+| 3 | 工程师+测试工程师 | should | `vendor_of()` 生产死代码 vs 文档宣称接线 | 采纳接线（评审前裁决）：错误信封 `data.vendor` 附方言族——connect 按 `vendor_of(url)`、handle/stream 错误随条目携带；e2e_duckdb + smoke 结构化断言钉死（实证：trino 查询路径 / clickhouse、kyuubi 连接路径全中） |
+| 4 | 工程师 | should | smoke 失败路径泄漏临时目录 + 首败截断 | 采纳：逐方言错误累积 Vec，全部跑完 → `remove_dir_all` → 一次收敛 panic；探针 `expect_err` 改 match 收 Err |
+| 5 | 工程师 | should | xtask 幂等跳过信任残file / curl 无超时 / `--dir` 缺值静默回落 | 采纳：逐 jar 过 Maven `.sha1`（在场残缺自动重下 + 新下载落盘即校验，实跑三 jar `sha1 ok`）；curl `--connect-timeout 15 --max-time 300`；`--dir` 缺值显式报错 |
+| 6 | 架构师 | should | Trino 懒连接只进 CHANGELOG/README | 采纳：jdbc.md 限制表 + api-manual §13 + SKILL 陷阱行三处登记 |
+| 7 | 测试工程师 | should-pin | 共处实证缺运行条件 / Review Focus 1 仍写 `-all` | 采纳：jdbc.md 注明「桥 jar + 三驱动在场，env-gated 非 CI 门禁」；计划 Review Focus 1 加偏差 §1 指针 |
+| 8 | 架构师 | nit | e2e_duckdb skip 文案歧义 | 采纳：改为「放进 bin/plugins/*/jdbc/drivers/ 可享回落探测」如实表述 |
+| 9 | 架构师 | nit | 下载无 checksum 校验 | 以 #5 的自动 `.sha1` 校验覆盖（强于注释提醒） |
+| 10 | 工程师 | nit | e2e_duckdb `count()` panic 绕过清理 | **不取**：$TMPDIR 临时目录 OS 兜底，catch_unwind 包装不值得 |
+
+修复轮门禁复跑：db-jdbc 36 单测 + 5 集成套（含两真 JVM 腿）全绿 / xtask 13 /
+clippy workspace `-D warnings` / fmt。

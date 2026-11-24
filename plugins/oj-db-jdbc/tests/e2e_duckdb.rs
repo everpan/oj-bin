@@ -109,8 +109,8 @@ fn skip(msg: &str) {
             然后 export OJ_JDBC_BRIDGE_JAR=$PWD/java/jdbc-bridge/build/libs/oj-jdbc-bridge.jar\n\
          2. DuckDB jar: cargo xtask jdbc-drivers 不含 DuckDB（81MB 自备），自 Maven 中央\n\
             下载 org.duckdb:duckdb_jdbc（如 https://repo1.maven.org/maven2/org/duckdb/\n\
-            duckdb_jdbc/2.0.1.0/duckdb_jdbc-2.0.1.0.jar）或先跑 cargo xtask jdbc-drivers\n\
-            享发行布局回落探测，然后 export OJ_JDBC_DUCKDB_JAR=<下载路径>\n\
+            duckdb_jdbc/2.0.1.0/duckdb_jdbc-2.0.1.0.jar）；放进 bin/plugins/*/jdbc/\n\
+            drivers/ 可享本腿的发行布局回落探测，或 export OJ_JDBC_DUCKDB_JAR=<路径>\n\
          3. 需 PATH 或 JAVA_HOME 可解析 java"
     );
 }
@@ -345,9 +345,12 @@ async fn chain(bridge: &Path, drivers: &Path) -> Result<(), String> {
     );
     let e = drive(&mut f).await.expect_err("重复主键 insert 必须失败");
     let env: Value = serde_json::from_str(&e).map_err(|_| format!("错误信封非 JSON: {e}"))?;
+    // data.vendor = vendor_of(url) 方言族诊断名（v0.1.144 接线：所有 handle 级结构化
+    // 错误信封携带）——多 vendor 共处部署的排障定位锚点。
     assert2(
         env["category"] == json!("internal")
             && env["retryable"] == json!(false)
+            && env["data"]["vendor"] == json!("duckdb")
             && env["message"]
                 .as_str()
                 .is_some_and(|m| m.contains("Constraint Error") || m.contains("primary key")),

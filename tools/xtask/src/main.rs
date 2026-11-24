@@ -609,7 +609,9 @@ const JDBC_BUNDLED: &[(&str, &str)] = &[
 ];
 
 /// drivers 目录解析：显式 `--dir` 原样；缺省按发行布局
-/// `<bin>/plugins/<host-triple>/jdbc/drivers/`（与 PluginLoader 发现路径同形）。
+/// `<bin>/plugins/<host-triple>/jdbc/drivers/`。注意：该目录只是**下载落位缺省**，
+/// 运行期 PluginLoader 只发现 `.so` 插件、不会自动扫它——sidecar 的 drivers_dir
+/// 仍须经 db 配置（`drivers_dir:`）显式指向（docs/plugins/jdbc.md 自备四步）。
 fn jdbc_drivers_dir(explicit: Option<&Path>) -> PathBuf {
     match explicit {
         Some(d) => d.to_path_buf(),
@@ -621,21 +623,83 @@ fn jdbc_drivers_dir(explicit: Option<&Path>) -> PathBuf {
     }
 }
 
-/// 下载随包三件套进 drivers 目录（幂等：同名 jar 在场即跳过），
-/// 随后打印自备四件指引。走系统 curl（xtask 零新增 HTTP 依赖）。
+/// 本地文件 sha1（走系统 shasum/sha1sum——xtask 与主命令同走系统工具，零新增依赖）。
+fn sha1_of(path: &Path) -> Result<String, String> {
+    let tools: [&[&str]; 2] = [&["shasum", "-a", "1"], &["sha1sum"]];
+    for tool in tools {
+        if let Ok(out) = Command::new(tool[0])
+            .args(tool[1..].iter())
+            .arg(path)
+            .output()
+            && out.status.success()
+        {
+            return Ok(String::from_utf8_lossy(&out.stdout)
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_string());
+        }
+    }
+    Err("PATH 上无 shasum/sha1sum，无法校验".into())
+}
+
+/// Maven Central 的 `<url>.sha1` 伴随校验和。
+fn fetch_sha1(url: &str) -> Result<String, String> {
+    let out = Command::new("curl")
+        .args([
+            "-fsSL",
+            "--retry",
+            "3",
+            "--connect-timeout",
+            "15",
+            "--max-time",
+            "60",
+        ])
+        .arg(format!("{url}.sha1"))
+        .output()
+        .map_err(|e| format!("spawn curl: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("sha1 获取失败: {url}.sha1"));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_string())
+}
+
+/// 下载随包三件套进 drivers 目录（幂等：同名 jar 在场先过 sha1 校验——残缺/
+/// 篡改即重下，评审修复；新下载落盘后同样校验），随后打印自备四件指引。
+/// 走系统 curl（xtask 零新增 HTTP 依赖）。
 fn jdbc_drivers(explicit: Option<&Path>) -> Result<(), String> {
     let dir = jdbc_drivers_dir(explicit);
     fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     for (name, path) in JDBC_BUNDLED {
         let dest = dir.join(name);
-        if dest.is_file() {
-            println!("skip {} (exists)", dest.display());
-            continue;
-        }
         let url = format!("https://repo1.maven.org/maven2/{path}");
+        let expected = fetch_sha1(&url)?;
+        if dest.is_file() {
+            let actual = sha1_of(&dest)?;
+            if actual == expected {
+                println!("skip {} (sha1 ok)", dest.display());
+                continue;
+            }
+            println!("{} sha1 不符（残缺或损坏），重下", dest.display());
+        }
         println!("fetch {url}");
         let status = Command::new("curl")
-            .args(["-fSL", "--retry", "3", "--silent", "--show-error", "-o"])
+            .args([
+                "-fSL",
+                "--retry",
+                "3",
+                "--connect-timeout",
+                "15",
+                "--max-time",
+                "300",
+                "--silent",
+                "--show-error",
+                "-o",
+            ])
             .arg(&dest)
             .arg(&url)
             .status()
@@ -644,7 +708,14 @@ fn jdbc_drivers(explicit: Option<&Path>) -> Result<(), String> {
             let _ = fs::remove_file(&dest);
             return Err(format!("download failed: {url}"));
         }
-        println!("→ {}", dest.display());
+        let actual = sha1_of(&dest)?;
+        if actual != expected {
+            let _ = fs::remove_file(&dest);
+            return Err(format!(
+                "sha1 不符: {url}（期望 {expected}，实际 {actual}）"
+            ));
+        }
+        println!("→ {} (sha1 ok)", dest.display());
     }
     println!(
         "\n自备四件（不随包；坐标与指引见 docs/plugins/jdbc.md 分发矩阵）：\n  \
@@ -695,11 +766,17 @@ fn main() -> Result<(), String> {
             smoke(Path::new(bin))
         }
         "jdbc-drivers" => {
-            let dir = args
-                .iter()
-                .position(|a| a == "--dir")
-                .and_then(|i| args.get(i + 1))
-                .map(PathBuf::from);
+            // --dir 后缺值（含紧随另一 flag）→ 显式报错，不静默回落缺省目录。
+            let dir = match args.iter().position(|a| a == "--dir") {
+                Some(i) => {
+                    let v = args
+                        .get(i + 1)
+                        .filter(|s| !s.starts_with("--"))
+                        .ok_or("jdbc-drivers: --dir 需要一个路径值（如 --dir /tmp/oj-drivers）")?;
+                    Some(PathBuf::from(v))
+                }
+                None => None,
+            };
             jdbc_drivers(dir.as_deref())
         }
         _ => {

@@ -16,7 +16,7 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
-## 下一版（未发布）
+## v0.1.144（2026-11-24，未打标签）
 
 **REQ-A4 Phase 3：oj-db-jdbc 七方言覆盖（上游 UPSTREAM-REQS §3.1 五条验收对照；devkit
 四件已同步）**：
@@ -41,6 +41,17 @@
   driver`）+ HeavyDB env-gated 可选腿；xtask 版本表单测。
 - 多实例一致性（验收第 5 条）与连通性探针（第 3 条）口径固化进 jdbc.md/场景 84：config
   声明式天然一致、`db.client.register` 进程内 StableState 各池同见、`select 1` 即探针。
+- 评审收口（架构师/工程师/测试工程师三路 APPROVE-WITH-FIXES）：`vendor_of()` 接线进
+  错误信封——所有 handle 级结构化错误 `data.vendor` 附方言族诊断名（连接错误按 URL、
+  handle 错误随条目携带，e2e_duckdb 与 smoke 腿断言钉死）；smoke 腿补 Snowflake /
+  Databricks env-gated 臂（无 jar 环境诚实 skip，文档登记「未实跑」不虚报覆盖）+
+  逐方言错误累积一次报全（不再首败截断）+ 失败路径先清理临时目录再收敛；xtask 下载
+  逐 jar 过 Maven `.sha1` 校验（残缺/篡改自动重下）+ curl 超时 + `--dir` 缺值显式
+  报错；`drivers_dir` 缺省口径三处文档统一（相对 oj 进程 CWD 的 `drivers/`，建议显式
+  绝对路径，下载落位 ≠ 运行期自动发现）；Trino 懒连接（connect 成功 ≠ 连通）登记进
+  jdbc.md 限制表 / api-manual §13 / SKILL 陷阱速查。
+
+## v0.1.143（2026-11-24，未打标签）
 
 **REQ-PARSE Phase 2：平台 SQL 解析服务 `sql.parse`**（下游血缘采集/SQL 审计需求；devkit
 四件已同步）：
@@ -69,6 +80,8 @@
   字符串拒绝；walker 阶段栈耗尽收敛为 `engine`（结构化，进程不受影响）；`SELECT *` 契约
   钉为 `output.column:"*"`。
 
+## v0.1.142（2026-11-24，未打标签）
+
 **REQ-HNSW Phase 1：数据命令按 `manifest.yaml` 的 `db:` 绑定路由到命名连接**（下游
 oj-wiki-docs 平台能力需求；devkit 四件已同步，`--db` 语义变更是用户可见变更）：
 
@@ -83,8 +96,6 @@ oj-wiki-docs 平台能力需求；devkit 四件已同步，`--db` 语义变更�
   `oj migrate`；启动门禁的绑定路由在后续版本跟进（SKILL.md 陷阱速查已登记）。
 - 测试：双 sqlite 命名库夹具新增路由/失败语义用例 11 条（含跨组部分失败、reconcile 路由、
   baseline/seed/fixture 落库点、dist 产物 manifest 形态固化）。
-
-## v0.1.142（2026-11-24，未打标签）
 
 **代码评审（v0.1.138..v0.1.141，high）三项修复**（无 ABI / JS API 变化，仅行为纠正）：
 

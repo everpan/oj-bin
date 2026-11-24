@@ -48,6 +48,8 @@ struct HandleEntry {
     /// connect 时的 sidecar 世代；每次 vtable 调用前 check_generation——世代不匹配
     /// 立即报 reconnect，绝不把旧 JVM 的连接号隐式落到新 JVM（spec §5.1）。
     generation: u64,
+    /// 方言族诊断名（vendor_of(url)，v0.1.144 REQ-A4）：随错误信封 data.vendor 透出。
+    vendor: &'static str,
 }
 
 static HANDLES: OnceLock<Mutex<HashMap<u64, HandleEntry>>> = OnceLock::new();
@@ -88,6 +90,19 @@ fn entry(handle: u64) -> Result<HandleEntry, String> {
         .ok_or_else(|| format!("db: unknown handle {handle}"))?;
     sc()?.check_generation(e.generation)?;
     Ok(e)
+}
+
+/// 错误信封补方言族诊断名（REQ-A4，v0.1.144）：结构化信封 → `data.vendor` 注入
+/// vendor_of(url) 的方言族（多 vendor 共处部署排障定位）；非 JSON（Rust 侧纯文本
+/// 协议错误）原样透出。仅诊断，不影响 category/retryable 分类。
+fn vendored(e: String, vendor: &str) -> String {
+    if let Ok(mut env) = serde_json::from_str::<Value>(&e)
+        && env.get("data").is_some_and(Value::is_object)
+    {
+        env["data"]["vendor"] = Value::from(vendor);
+        return env.to_string();
+    }
+    e
 }
 
 /// 参数预处理（jsint 大整数通道 + BigInteger 回绕防护）：
@@ -155,12 +170,16 @@ pub extern "C" fn connect(cfg: RString) -> FfiFuture {
             let sc = sc()?;
             let dsn = dsn::parse_dsn(&cfg[..])?;
             let mut args = serde_json::Map::new();
+            // match 两臂必有 URL；取局部副本供 vendor_of 诊断与错误信封注入。
+            let url;
             match dsn {
-                dsn::ParsedDsn::Bare(url) => {
-                    args.insert("url".into(), Value::String(url));
+                dsn::ParsedDsn::Bare(u) => {
+                    url = u;
+                    args.insert("url".into(), Value::String(url.clone()));
                 }
                 dsn::ParsedDsn::Envelope(e) => {
-                    args.insert("url".into(), Value::String(e.url));
+                    url = e.url;
+                    args.insert("url".into(), Value::String(url.clone()));
                     if let Some(u) = e.user {
                         args.insert("user".into(), Value::String(u));
                     }
@@ -178,7 +197,11 @@ pub extern "C" fn connect(cfg: RString) -> FfiFuture {
                     }
                 }
             }
-            let ok = sc.request("connect", Value::Object(args)).await?;
+            let vendor = dsn::vendor_of(&url);
+            let ok = sc
+                .request("connect", Value::Object(args))
+                .await
+                .map_err(|e| vendored(e, vendor))?;
             let java_handle = ok
                 .get("handle")
                 .and_then(Value::as_u64)
@@ -189,6 +212,7 @@ pub extern "C" fn connect(cfg: RString) -> FfiFuture {
                 HandleEntry {
                     java_handle,
                     generation: sc.generation(),
+                    vendor,
                 },
             );
             Ok(format!(r#"{{"handle":{handle}}}"#).into_bytes())
@@ -206,7 +230,8 @@ pub extern "C" fn query(handle: u64, sql: RString, params: RString) -> FfiFuture
                     "query",
                     json!({"handle": e.java_handle, "sql": &sql[..], "params": params}),
                 )
-                .await?;
+                .await
+                .map_err(|err| vendored(err, e.vendor))?;
             ok.get("rows")
                 .map(|r| r.to_string().into_bytes())
                 .ok_or_else(|| r#"sidecar query: response missing "rows""#.to_string())
@@ -224,7 +249,8 @@ pub extern "C" fn exec(handle: u64, sql: RString, params: RString) -> FfiFuture 
                     "exec",
                     json!({"handle": e.java_handle, "sql": &sql[..], "params": params}),
                 )
-                .await?;
+                .await
+                .map_err(|err| vendored(err, e.vendor))?;
             Ok(ok.to_string().into_bytes())
         })
     })
@@ -236,7 +262,8 @@ pub extern "C" fn begin(handle: u64) -> FfiFuture {
             let e = entry(handle)?;
             let ok = sc()?
                 .request("begin", json!({"handle": e.java_handle}))
-                .await?;
+                .await
+                .map_err(|err| vendored(err, e.vendor))?;
             Ok(ok.to_string().into_bytes())
         })
     })
@@ -255,7 +282,8 @@ pub extern "C" fn tx_query(handle: u64, tx_id: u64, sql: RString, params: RStrin
                         "sql": &sql[..], "params": params,
                     }),
                 )
-                .await?;
+                .await
+                .map_err(|err| vendored(err, e.vendor))?;
             ok.get("rows")
                 .map(|r| r.to_string().into_bytes())
                 .ok_or_else(|| r#"sidecar tx_query: response missing "rows""#.to_string())
@@ -276,7 +304,8 @@ pub extern "C" fn tx_exec(handle: u64, tx_id: u64, sql: RString, params: RString
                         "sql": &sql[..], "params": params,
                     }),
                 )
-                .await?;
+                .await
+                .map_err(|err| vendored(err, e.vendor))?;
             Ok(ok.to_string().into_bytes())
         })
     })
@@ -291,7 +320,8 @@ pub extern "C" fn tx_commit(handle: u64, tx_id: u64) -> FfiFuture {
                     "tx_commit",
                     json!({"handle": e.java_handle, "tx_id": tx_id}),
                 )
-                .await?;
+                .await
+                .map_err(|err| vendored(err, e.vendor))?;
             Ok(ok.to_string().into_bytes())
         })
     })
@@ -306,7 +336,8 @@ pub extern "C" fn tx_rollback(handle: u64, tx_id: u64) -> FfiFuture {
                     "tx_rollback",
                     json!({"handle": e.java_handle, "tx_id": tx_id}),
                 )
-                .await?;
+                .await
+                .map_err(|err| vendored(err, e.vendor))?;
             Ok(ok.to_string().into_bytes())
         })
     })
@@ -391,6 +422,8 @@ struct StreamEntry {
     /// stream_open 时的 sidecar 世代；每次 stream 槽调用前 check_generation——
     /// 与 handle 闸同纪律（spec §5.1：绝不把旧 JVM 的流号落到新 JVM）。
     generation: u64,
+    /// 沿自所属 handle 的方言族诊断名（错误信封 data.vendor）。
+    vendor: &'static str,
 }
 
 static STREAMS: OnceLock<Mutex<HashMap<u64, StreamEntry>>> = OnceLock::new();
@@ -435,7 +468,8 @@ pub extern "C" fn stream_open(handle: u64, sql: RString, params: RString) -> Ffi
                     "stream_open",
                     json!({"handle": e.java_handle, "sql": &sql[..], "params": params}),
                 )
-                .await?;
+                .await
+                .map_err(|err| vendored(err, e.vendor))?;
             // R7：取消是 ok 值 {"error":"cancelled"} → 归一 Err；其余 ok 错误值同理
             // 转 Err（宿主 stream_open 不读 ok 信封错误，只认 stream_id/unsupported）。
             if let Some(err) = ok.get("error") {
@@ -455,6 +489,7 @@ pub extern "C" fn stream_open(handle: u64, sql: RString, params: RString) -> Ffi
                     java_handle: e.java_handle,
                     java_stream_id,
                     generation: e.generation,
+                    vendor: e.vendor,
                 },
             );
             Ok(format!(r#"{{"stream_id":{stream_id}}}"#).into_bytes())
@@ -471,7 +506,8 @@ pub extern "C" fn stream_next(_handle: u64, stream_id: u64) -> FfiFuture {
                     "stream_next",
                     json!({"handle": se.java_handle, "stream_id": se.java_stream_id}),
                 )
-                .await?;
+                .await
+                .map_err(|err| vendored(err, se.vendor))?;
             // R7：被取消的 next 回 ok 值 {"error":"cancelled"} → 归一 Err。
             // 其余信封（{"rows":[...]}/{"done":true}）原样透传，宿主逐帧解释。
             if ok.get("error") == Some(&Value::String("cancelled".to_string())) {
@@ -491,7 +527,8 @@ pub extern "C" fn stream_cancel(_handle: u64, stream_id: u64) -> FfiFuture {
                     "stream_cancel",
                     json!({"handle": se.java_handle, "stream_id": se.java_stream_id}),
                 )
-                .await?;
+                .await
+                .map_err(|err| vendored(err, se.vendor))?;
             Ok(ok.to_string().into_bytes())
         })
     })

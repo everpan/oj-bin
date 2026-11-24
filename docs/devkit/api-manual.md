@@ -2249,9 +2249,11 @@ json.ok(plugins());
   不受 known-dialect 门控）。**七方言覆盖（v0.1.144，REQ-A4）**：Snowflake /
   Databricks / ClickHouse / Trino / Kyuubi / HeavyDB / DuckDB 经同一桥接入——
   随包三件套 `cargo xtask jdbc-drivers`（Trino/ClickHouse/Kyuubi），其余自备
-  （DuckDB 内存库离线可用，HeavyDB 上游废弃）；错误文案与日志按 URL 前缀透出
-  诊断方言族（snowflake/databricks/clickhouse/trino/kyuubi/heavydb/duckdb），
-  `db.dialect()` 恒 `"jdbc"` 不变。元数据摄取（catalog 形态）用 `db.query` 跑
+  （DuckDB 内存库离线可用，HeavyDB 上游废弃）；错误信封 `data.vendor` 与日志按
+  URL 前缀透出诊断方言族（snowflake/databricks/clickhouse/trino/kyuubi/heavydb/
+  duckdb；多 vendor 共处排障定位锚点），`db.dialect()` 恒 `"jdbc"` 不变。
+  注意 Trino connect 是懒连接（只建对象不开 TCP）——连通性探针至少补一刀
+  `select 1`，勿以 connect 成功为判据。元数据摄取（catalog 形态）用 `db.query` 跑
   `information_schema` 查询，见场景 84。完整手册见仓库 `docs/plugins/jdbc.md`
   七方言分发矩阵。
 
