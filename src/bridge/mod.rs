@@ -79,6 +79,7 @@ pub mod oidc;
 mod placeholder;
 pub mod platform;
 pub mod plugin_loader;
+pub mod predict;
 mod plugins_op;
 mod query;
 mod registry;
@@ -2158,3 +2159,7 @@ mod compaction_reader_tests;
 #[cfg(test)]
 #[path = "sql_parse_tests.rs"]
 mod sql_parse_tests;
+
+#[cfg(test)]
+#[path = "predict_tests.rs"]
+mod predict_tests;

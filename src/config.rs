@@ -1571,6 +1571,11 @@ pub struct Config {
     /// `axis()` 公开面——特权旁路封堵）；运行期 register/call 走双档 allow。缺省关。
     #[serde(default, deserialize_with = "null_as_default")]
     pub mgmt: crate::bridge::db_policy::MgmtSection,
+    /// 预测执行合规网关（REQ-PREDICT，v0.1.145，`predict:` 段）：dataScope 白名单 +
+    /// consent 授权表 + 引擎轴收编名。段缺席 = 网关存在但策略为空（一切请求被拒，
+    /// fail-closed），见 `bridge::predict::PredictSection`。
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub predict: crate::bridge::predict::PredictSection,
     /// SQL 执行追踪（v0.1.51）：`enabled` 缺省时 dev 自动开、release 自动关；其余字段见 `SqlTraceCfg`。
     #[serde(default, deserialize_with = "null_as_default")]
     pub db_trace: SqlTraceCfg,
@@ -1624,6 +1629,7 @@ pub fn known_top_level_keys() -> &'static [&'static str] {
         "db_session",
         "audit",
         "mgmt",
+        "predict",
     ]
 }
 
