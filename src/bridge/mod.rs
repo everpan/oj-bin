@@ -772,33 +772,34 @@ const BRIDGE_ESM: &[deno_core::ExtensionFileSource] = &[deno_core::ExtensionFile
 /// （每个池化 runtime 都要解析一遍，吃掉冷启动优化）。注册为
 /// `lazy_loaded_esm_files`，首次 `sql.parse` 经 `core.createLazyLoader`
 /// （op_lazy_load_esm，同步装载+求值、loader 自带 memo）拉取。
-/// `ascii_str_include!` 编译期做 7-bit ASCII 校验并以 v8 外部单字节常量零拷贝进
-/// runtime；allow 的是这份 2.5MB const-eval 的有界一次性编译成本
-/// （`long_running_const_eval`）。运行期零读盘，无需 patch。
+/// vendor 走 `Computed`（`LazyLock` 内 `include_str!` → `Arc<str>`，进程内一次拷贝）
+/// 而非 `ascii_str_include!` 常量：2.5MB 的 const-eval 会触发 rustc 的
+/// `long_running_const_eval`（该 lint 对 `#[allow]` 不生效，rustc#125290），
+/// 编译期白扫一遍 2.5MB 也不值得。ASCII 门禁由 mod_tests 的 7-bit 守卫承担。
+/// 小文件（impl 门面）仍走 `ascii_str_include!` 零拷贝常量。运行期零读盘，无需 patch。
 /// 注意 `core.loadExtScript` 是 classic-script 通道，看不到 lazy ESM。
-#[allow(long_running_const_eval)]
-const BRIDGE_LAZY_ESM: &[deno_core::ExtensionFileSource] = &[
-    deno_core::ExtensionFileSource::new(
-        "ext:bridge_ext/sql_parse_impl.js",
-        deno_core::ascii_str_include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/bridge/sql_parse_impl.js"
-        )),
-    ),
-    deno_core::ExtensionFileSource::new(
-        "ext:bridge_ext/vendor_sql_parser.js",
-        deno_core::ascii_str_include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/bridge/vendor_sql_parser.js"
-        )),
-    ),
-];
+static BRIDGE_LAZY_ESM: std::sync::LazyLock<Vec<deno_core::ExtensionFileSource>> =
+    std::sync::LazyLock::new(|| {
+        vec![
+            deno_core::ExtensionFileSource::new(
+                "ext:bridge_ext/sql_parse_impl.js",
+                deno_core::ascii_str_include!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/src/bridge/sql_parse_impl.js"
+                )),
+            ),
+            deno_core::ExtensionFileSource::new_computed(
+                "ext:bridge_ext/vendor_sql_parser.js",
+                std::sync::Arc::from(include_str!("vendor_sql_parser.js")),
+            ),
+        ]
+    });
 
 /// 构造 `bridge_ext`（bootstrap.js 编进二进制）。所有运行入口都应经此函数取扩展。
 pub fn bridge_ext_init(stable: Arc<StableState>) -> deno_core::Extension {
     let mut ext = bridge_ext::init(stable);
     ext.esm_files = std::borrow::Cow::Borrowed(BRIDGE_ESM);
-    ext.lazy_loaded_esm_files = std::borrow::Cow::Borrowed(BRIDGE_LAZY_ESM);
+    ext.lazy_loaded_esm_files = std::borrow::Cow::Owned(BRIDGE_LAZY_ESM.clone());
     ext
 }
 

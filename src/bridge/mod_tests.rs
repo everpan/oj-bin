@@ -37,11 +37,20 @@ fn vendor_sql_parser_js_is_7bit_ascii() {
 /// 顺序无关，但 impl 必须在场（bootstrap 门面拉取的就是它）。
 #[test]
 fn bridge_lazy_esm_source_is_embedded() {
-    assert_eq!(BRIDGE_LAZY_ESM.len(), 2);
-    assert!(BRIDGE_LAZY_ESM.iter().all(|f| f.is_runtime_loadable()));
-    let specs: Vec<_> = BRIDGE_LAZY_ESM.iter().map(|f| f.specifier).collect();
+    let lazy = BRIDGE_LAZY_ESM.clone();
+    assert_eq!(lazy.len(), 2);
+    assert!(lazy.iter().all(|f| f.is_runtime_loadable()));
+    let specs: Vec<_> = lazy.iter().map(|f| f.specifier).collect();
     assert!(specs.contains(&"ext:bridge_ext/vendor_sql_parser.js"));
     assert!(specs.contains(&"ext:bridge_ext/sql_parse_impl.js"));
+    // vendor 源可直接 load（内嵌非路径），且与磁盘文件逐字一致。
+    let vendor = lazy
+        .iter()
+        .find(|f| f.specifier == "ext:bridge_ext/vendor_sql_parser.js")
+        .unwrap();
+    let loaded = vendor.load().unwrap();
+    let s: &str = loaded.as_ref();
+    assert_eq!(s, include_str!("vendor_sql_parser.js"));
 }
 
 fn new_bridge() -> (Bridge, Arc<InMemoryAccessor>) {
