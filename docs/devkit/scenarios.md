@@ -5311,7 +5311,7 @@ async function post(): Promise<void> {
     json.ok({ tables: r.tables.length, columns: r.columns.length });
   } catch (e: any) {
     if (e && e.code === "OJ_SQL_PARSE") {
-      // 结构化拒绝：e.reason ∈ input|dialect|budget|syntax（|engine 预留）
+      // 结构化拒绝：e.reason ∈ input|dialect|budget|syntax|engine（engine=资源限制）
       json.fail(400, `sql 解析拒绝: ${e.reason} ${e.message}`);
       return;
     }

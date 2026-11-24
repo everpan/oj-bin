@@ -1699,10 +1699,10 @@ sql.parse(sqlText: string, opts?: { dialect?: string }): {
 
 **返回字段**：
 
-- `tables`：基表（含 create/insert/update 目标与嵌套子查询内的基表）；**CTE 名与派生子查询别名不入列**；基表别名如实保留（`FROM customers c` → `alias:"c"`）。
+- `tables`：基表（含 create/insert/update 目标与嵌套子查询内的基表）；**CTE 名与派生子查询别名不入列**；基表别名如实保留（`FROM customers c` → `alias:"c"`；自连接 `FROM emp a JOIN emp b` 两条别名条目都在，裸列相应诚实降级 null）。
 - `columns`：全语句引用到的列（含 WHERE/ON）；限定列经别名归一，裸列在单源作用域归属、多源（join）降级 `table:null`（无 schema 知识，不猜）；去重，语句级平面投影（不做逐作用域解析——逐作用域精度看 `lineage`）。
-- `ctes`：顶层 WITH 名（按出现序）。
-- `lineage`：仅顶层 SELECT，每个输出列一条。`output.table` 记**别名背后的来源名**（CTE 名保留如 `recent`；匿名派生子查询为 null），不记别名本身；`sources` 为穿透**单层** CTE / 派生子查询后的基表来源，链式 CTE 停在边界名（不递归第二层）；`SELECT *` 等无名表达式 `output.column` 为 null。
+- `ctes`：**语句级** WITH 名（按出现序）——子查询/CTE 体内声明的 WITH 不入列、不遮蔽同名基表。
+- `lineage`：仅顶层 SELECT，每个输出列一条。`output.table` 记**别名背后的来源名**（CTE 名保留如 `recent`；匿名派生子查询为 null），不记别名本身；`sources` 为穿透**单层** CTE / 派生子查询后的基表来源，链式 CTE 停在边界名（不递归第二层）；`SELECT *` 以 `output.column:"*"` 呈现（含全列语义）；`COUNT(*)` 等表达式输出 `output.column` 为 null。
 - `ast`：解析器原生 AST（JSON 安全克隆）。体积可达输入 ~10 倍——契约含 `ast` 即调用方付费，**不截断**；预算按输入字符计。
 
 **口径与限制**：
@@ -1714,15 +1714,15 @@ sql.parse(sqlText: string, opts?: { dialect?: string }): {
 - **每 runtime 各自懒加载**：vendored 包 ~2.5MB，首次 `sql.parse` 每 runtime 拉取一次（loader 自带 memo）——池化 N 个 runtime 各持一份已解析代码，内存代价换冷启动零回退。
 
 **错误**（Error own props：`code:"OJ_SQL_PARSE"` + `reason` + 上下文字段；`reason` ∈
-`input|dialect|budget|syntax|engine`，engine 为保留档当前无触发路径）：
+`input|dialect|budget|syntax|engine`）：
 
 | reason | 触发 | 附加字段 |
 |---|---|---|
 | `input` | sqlText 非字符串 / 空串纯空白 | — |
-| `dialect` | dialect 缺失 / 不在支持表 | `supported`（全表）；未知时附原始 `dialect` |
+| `dialect` | dialect 缺失 / 非字符串 / 不在支持表 | `supported`（全表）；未知/非串时附原始 `dialect` |
 | `budget` | 输入 > 1 MiB（1048576 字符） | `length`、`max`、`dialect` |
-| `syntax` | 解析失败（含多语句） | `location`（{start,end}×{offset,line,column}，解析器给出行列时）、`dialect`；多语句附 `statements` |
-| `engine` | （保留档） | — |
+| `syntax` | 解析失败（含多语句；纯注释 = 0 条语句同样拒绝） | `location`（{start,end}×{offset,line,column}，解析器给出行列时）、`dialect`；多语句附 `statements` |
+| `engine` | 解析器/契约抽取的资源限制（深嵌套栈耗尽），进程不受影响 | `dialect` |
 
 ```ts
 // 查询历史血缘摄入（替换掩码正则路径的典型形态）

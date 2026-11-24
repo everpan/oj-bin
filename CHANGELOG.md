@@ -37,8 +37,13 @@
   记 tarball URL + npm integrity + 五步再 vendor 流程）经 deno_core lazy-ESM
   （`createLazyLoader`）内嵌进二进制——首次调用才编译进堆，冷启动零回归；血缘 walker
   `src/bridge/sql_parse_impl.js` 纯同步纯函数，无 op 无 I/O。
-- 测试：`src/bridge/sql_parse_tests.rs` 17 条（契约面/血缘 golden/边界输入/预算/深嵌栈/幂等/
+- 测试：`src/bridge/sql_parse_tests.rs` 22 条（契约面/血缘 golden/边界输入/预算/深嵌栈/幂等/
   注释透明/Unicode 标识符），mod_tests 增 7-bit ASCII 与内嵌源守卫。
+- 评审收口（架构师/工程师/测试工程师三路）：自连接别名不再塌缩（`FROM emp a JOIN emp b`
+  两条别名条目都进 tables、裸列诚实降级 null）；WITH 收集绑定语句级（子查询/CTE 体内的
+  WITH 不泄漏进 `ctes`、不遮蔽同名基表）；三段限定列（`a.b.c`）不再登记幻影表；方言非
+  字符串拒绝；walker 阶段栈耗尽收敛为 `engine`（结构化，进程不受影响）；`SELECT *` 契约
+  钉为 `output.column:"*"`。
 
 **REQ-HNSW Phase 1：数据命令按 `manifest.yaml` 的 `db:` 绑定路由到命名连接**（下游
 oj-wiki-docs 平台能力需求；devkit 四件已同步，`--db` 语义变更是用户可见变更）：
