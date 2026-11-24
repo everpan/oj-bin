@@ -249,6 +249,8 @@ mod tests {
             mgmt_section: Arc::new(Default::default()),
             mgmt_axes: Arc::new(std::collections::HashMap::new()),
             mgmt: Arc::new(crate::bridge::mgmt::MgmtRegistry::new(8, 4)),
+            predict_section: Arc::new(crate::bridge::predict::PredictSection::default()),
+            predict_axes: Arc::new(std::collections::HashMap::new()),
             db_access_rt: Arc::new(std::sync::Mutex::new(HashMap::new())),
             db_backend: Arc::new(crate::bridge::db_backend::DbBackendRegistry::builtin()),
             config_dir: Arc::new(std::path::PathBuf::from(".")),

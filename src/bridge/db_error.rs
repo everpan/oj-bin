@@ -167,6 +167,19 @@ impl From<BridgeError> for JsErrorBox {
     }
 }
 
+/// 非 db 轴的结构化宿主错误（v0.1.145 起 predict 网关的 `OJ_PREDICT_*` 同一透传
+/// 机制复用）：code/data 自定义、retryable=false、sessionDisposition=keep。
+/// JS 侧 `e.code` / `e.data`（JSON 串）属性语义与 db 轴完全一致。
+pub fn structured_js_error(code: &'static str, message: String, data: Value) -> JsErrorBox {
+    JsErrorBox::from_err(OjDbJsError {
+        code,
+        message,
+        data: serde_json::to_string(&data).unwrap_or_else(|_| "{}".to_string()),
+        retryable: false,
+        disposition: "keep",
+    })
+}
+
 /// category → 信封 `code` 固定映射（JS 面 / `_sql` 信封 / sql_trace 同源）。
 pub fn code_of(category: DbErrorCategory) -> &'static str {
     match category {

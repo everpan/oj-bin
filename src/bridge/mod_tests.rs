@@ -837,6 +837,8 @@ async fn oj_require_cjs_interop_end_to_end() {
         mgmt_section: Arc::new(db_policy::MgmtSection::default()),
         mgmt_axes: Arc::new(HashMap::new()),
         mgmt: Arc::new(mgmt::MgmtRegistry::new(8, 4)),
+        predict_section: Arc::new(predict::PredictSection::default()),
+        predict_axes: Arc::new(HashMap::new()),
         db_access_rt: Arc::new(Mutex::new(HashMap::new())),
         db_backend: Arc::new(db_backend::DbBackendRegistry::builtin()),
         config_dir: Arc::new(std::path::PathBuf::from(".")),

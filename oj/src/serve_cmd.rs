@@ -1615,6 +1615,9 @@ pub struct Registries {
     pub generic: Vec<(String, String, &'static oj_plugin_ffi::GenericVtable)>,
     /// U-15：`mgmt.axes` 收编的管理面泛型轴（**不进**公开 `generic`——特权旁路封堵）。
     pub mgmt_generic: Vec<(String, String, &'static oj_plugin_ffi::GenericVtable)>,
+    /// REQ-PREDICT（v0.1.145）：`predict.axis`（默认 "predict"）收编的预测引擎轴
+    /// （**不进**公开 `generic`——`axis()` 不可达，只可经 `predict.run` 网关触达）。
+    pub predict_generic: Vec<(String, String, &'static oj_plugin_ffi::GenericVtable)>,
 }
 
 /// 装配层把宿主侧解析出的跨后端参数经 cfg JSON 注入插件（spec §3 有意的边界；
@@ -1864,9 +1867,12 @@ fn build_registries(cfg: &Config, loaded: &[LoadedPlugin]) -> Result<Registries,
     // U-15：`mgmt.axes` 收编的轴**不进** `axis()` 公开面（特权旁路封堵，评审阻断①），
     // 单独归集给管理面注册表（`StableState.mgmt_axes`）。
     let mgmt_claimed = &cfg.mgmt.axes;
+    // REQ-PREDICT（v0.1.145）：`predict.axis` 单值收编（预测引擎轴；不进公开面）。
+    let predict_claimed = cfg.predict.axis.as_str();
     let mut seen: HashMap<&str, &str> = HashMap::new();
     let mut generic = Vec::new();
     let mut mgmt_generic = Vec::new();
+    let mut predict_generic = Vec::new();
     for p in loaded {
         for (axis, vt) in &p.generic_axes {
             if let Some(prev) = seen.insert(axis, &p.descriptor.name[..]) {
@@ -1878,6 +1884,8 @@ fn build_registries(cfg: &Config, loaded: &[LoadedPlugin]) -> Result<Registries,
             }
             if mgmt_claimed.contains(axis) {
                 mgmt_generic.push((axis.clone(), p.descriptor.name[..].to_string(), *vt));
+            } else if axis == predict_claimed {
+                predict_generic.push((axis.clone(), p.descriptor.name[..].to_string(), *vt));
             } else {
                 generic.push((axis.clone(), p.descriptor.name[..].to_string(), *vt));
             }
@@ -1895,6 +1903,7 @@ fn build_registries(cfg: &Config, loaded: &[LoadedPlugin]) -> Result<Registries,
         ldap,
         generic,
         mgmt_generic,
+        predict_generic,
     })
 }
 

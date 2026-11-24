@@ -20,7 +20,9 @@ use serde::{Deserialize, Serialize};
 
 /// config `predict:` 段（顶层；全部字段 serde default——段缺席 = 网关存在但
 /// 策略为空 = 一切 dataScope/consent 被拒，fail-closed）。
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// Default 手工实现：serde 的 `default = "…"` 只在反序列化路径生效，`Config::default()`
+/// （oj serve 测试/嵌入式装配）走这里——axis 缺省名必须与 serde 路径一致。
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PredictSection {
     /// 收编的引擎泛型轴名（不进 `axis()` 公开面）。默认 "predict"。
     #[serde(default = "default_axis")]
@@ -30,6 +32,16 @@ pub struct PredictSection {
     pub timeout_ms: u64,
     #[serde(default)]
     pub policy: PredictPolicy,
+}
+
+impl Default for PredictSection {
+    fn default() -> Self {
+        Self {
+            axis: default_axis(),
+            timeout_ms: default_timeout_ms(),
+            policy: PredictPolicy::default(),
+        }
+    }
 }
 
 fn default_axis() -> String {
@@ -86,7 +98,10 @@ fn source_allowed(source: &str, allowed: &str) -> bool {
     if source == allowed {
         return true;
     }
-    let Some(base) = allowed.strip_suffix(".*").and_then(|b| b.strip_prefix("db:")) else {
+    let Some(base) = allowed
+        .strip_suffix(".*")
+        .and_then(|b| b.strip_prefix("db:"))
+    else {
         return false;
     };
     match source.strip_prefix("db:").and_then(|r| r.split_once('.')) {
@@ -124,4 +139,312 @@ pub fn validate_consent<'a>(
         return Err(ConsentDeny::ScopesInsufficient);
     }
     Ok(g)
+}
+
+// ---------------------------------------------------------------------------
+// 宿主网关 op（Task 2）：predict.run 三闸 → 审计 → 收编引擎轴 dispatch
+// ---------------------------------------------------------------------------
+
+use std::cell::RefCell;
+use std::hash::{BuildHasher, Hasher};
+use std::rc::Rc;
+use std::sync::Arc;
+
+use deno_core::{OpState, op2};
+use deno_error::JsErrorBox;
+use serde_json::Value;
+
+use super::StableState;
+
+/// JS 入参（`predict.run({pql, dataScope, consent})`）。
+#[derive(Debug, Deserialize)]
+struct RunArgs {
+    pql: String,
+    #[serde(default, rename = "dataScope")]
+    data_scope: DataScope,
+    #[serde(default)]
+    consent: ConsentReq,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct DataScope {
+    /// 声明触达的数据源（`db:<name>.<table>` / `db:<name>.*`）——白名单逐条校验。
+    #[serde(default)]
+    sources: Vec<String>,
+    /// 声明行数上界（透传引擎，引擎契约负责遵守；网关不解析返回集）。
+    #[serde(default)]
+    max_rows: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ConsentReq {
+    #[serde(default, rename = "grantId")]
+    grant_id: String,
+    #[serde(default)]
+    scopes: Vec<String>,
+}
+
+/// 错误码（`e.code` 属性，db 轴 OJ_DB_* 同透传机制）。
+const CODE_SCOPE: &str = "OJ_PREDICT_SCOPE";
+const CODE_CONSENT: &str = "OJ_PREDICT_CONSENT";
+const CODE_ENGINE: &str = "OJ_PREDICT_ENGINE";
+
+/// 每调用随机 u64（SipHash 随机键，无 rng 依赖）——ticket 与 trace id 的熵源。
+fn random_u64() -> u64 {
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
+}
+
+fn ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// PQL sha256 前 12 hex（审计/trace 指纹；原文不进审计与错误消息）。
+fn pql_fingerprint(pql: &str) -> String {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(pql.as_bytes());
+    let d = h.finalize();
+    d.iter().map(|b| format!("{b:02x}")).collect::<String>()[..12].to_string()
+}
+
+/// 引擎错误消息脱敏：剥 PQL 原文（引擎回显场景）+ 截断 300 字符。
+fn redact_engine_msg(msg: &str, pql: &str) -> String {
+    let mut m = if !pql.is_empty() && msg.contains(pql) {
+        msg.replace(pql, "<pql>")
+    } else {
+        msg.to_string()
+    };
+    if m.chars().count() > 300 {
+        m = m.chars().take(300).collect();
+    }
+    m
+}
+
+/// 审计单出口（mgmt::mgmt_emit 同款形态）：零凭据 detail JSON。
+fn emit(st: &StableState, owner: &super::handle_core::Owner, kind: &str, detail: &Value) {
+    super::audit::emit(&st.audit, kind, owner, "predict", &detail.to_string());
+}
+
+fn deny_detail(
+    fp: &str,
+    sources: &[String],
+    grant_id: &str,
+    reason: &str,
+    violations: &[String],
+) -> Value {
+    serde_json::json!({
+        "status": "denied",
+        "reason": reason,
+        "pqlSha256": fp,
+        "sources": sources,
+        "grantId": grant_id,
+        "violations": violations,
+    })
+}
+
+#[op2]
+#[serde]
+pub async fn op_predict_run(
+    state: Rc<RefCell<OpState>>,
+    #[string] payload: String,
+) -> Result<serde_json::Value, JsErrorBox> {
+    // 借用纪律：OpState 守卫不跨 await——先取 Arc 克隆再放借。
+    let st = {
+        let s = state.borrow();
+        s.borrow::<Arc<StableState>>().clone()
+    };
+    let owner = super::db_session::owner_of(&state.borrow());
+    let args: RunArgs = serde_json::from_str(&payload).map_err(|e| {
+        super::db_error::structured_js_error(
+            CODE_ENGINE,
+            format!("predict.run: payload must be {{pql, dataScope, consent}} ({e})"),
+            serde_json::json!({}),
+        )
+    })?;
+    let fp = pql_fingerprint(&args.pql);
+    let sources = args.data_scope.sources.clone();
+    let grant_id = args.consent.grant_id.clone();
+    let started = std::time::Instant::now();
+
+    // 闸 0：引擎在位（收编注册表；axis() 公开面不可达）。
+    let engine = st.predict_axes.get(&st.predict_section.axis).map(|h| h.vt);
+    let Some(engine) = engine else {
+        emit(
+            &st,
+            &owner,
+            "PREDICT_AUDIT",
+            &deny_detail(&fp, &sources, &grant_id, "no_engine", &[]),
+        );
+        return Err(super::db_error::structured_js_error(
+            CODE_ENGINE,
+            "predict engine plugin not assembled (install plugins/oj-predict or a contract-compatible engine; axis is gateway-reserved and not reachable via axis())".to_string(),
+            serde_json::json!({}),
+        ));
+    };
+
+    let finish_trace = |status: &str, engine_ms: u128, violations: Vec<String>| {
+        serde_json::json!({
+            "id": format!("pt-{:016x}", random_u64()),
+            "status": status,
+            "engineMs": engine_ms,
+            "grantId": grant_id,
+            "sources": sources,
+            "ticket": "",
+            "violations": violations,
+        })
+    };
+
+    // 闸 1：dataScope 白名单（fail-closed，部分越界整体拒绝并点名）。
+    let allowed = &st.predict_section.policy.allowed_sources;
+    let refs: Vec<&str> = sources.iter().map(String::as_str).collect();
+    if let Err(violations) = validate_scope(&refs, allowed) {
+        emit(
+            &st,
+            &owner,
+            "PREDICT_DENY",
+            &deny_detail(&fp, &sources, &grant_id, "scope", &violations),
+        );
+        return Err(super::db_error::structured_js_error(
+            CODE_SCOPE,
+            format!(
+                "predict.run: dataScope exceeds policy.allowed_sources (violations: {violations:?}); the whole request is denied, not trimmed"
+            ),
+            serde_json::json!({ "violations": violations }),
+        ));
+    }
+
+    // 闸 2：consent 授权表（存在 / 未过期 / scopes 覆盖）。
+    let now = ms_now();
+    let scope_refs: Vec<&str> = args.consent.scopes.iter().map(String::as_str).collect();
+    if let Err(deny) = validate_consent(
+        &grant_id,
+        &scope_refs,
+        &st.predict_section.policy.grants,
+        now,
+    ) {
+        let reason = match deny {
+            ConsentDeny::NoSuchGrant => "no_such_grant",
+            ConsentDeny::Expired => "expired",
+            ConsentDeny::ScopesInsufficient => "scopes_insufficient",
+        };
+        emit(
+            &st,
+            &owner,
+            "PREDICT_DENY",
+            &deny_detail(&fp, &sources, &grant_id, &format!("consent.{reason}"), &[]),
+        );
+        return Err(super::db_error::structured_js_error(
+            CODE_CONSENT,
+            format!(
+                "predict.run: consent not granted (reason: {reason}); execution skipped and audited"
+            ),
+            serde_json::json!({ "reason": reason }),
+        ));
+    }
+
+    // dispatch：收编引擎轴，有界超时。ticket 随调用下发、插件契约要求回显。
+    let ticket = format!("gt-{:016x}", random_u64());
+    let engine_args = serde_json::json!({
+        "pql": args.pql,
+        "dataScope": { "sources": sources, "maxRows": args.data_scope.max_rows },
+        "ticket": ticket,
+    });
+    let budget = std::time::Duration::from_millis(st.predict_section.timeout_ms);
+    let dispatched = tokio::time::timeout(
+        budget,
+        super::generic_axis::call_axis(engine, "run", &engine_args.to_string()),
+    )
+    .await;
+    let engine_ms = started.elapsed().as_millis();
+    let out = match dispatched {
+        Err(_elapsed) => {
+            emit(
+                &st,
+                &owner,
+                "PREDICT_AUDIT",
+                &serde_json::json!({
+                    "status": "timeout", "pqlSha256": fp, "sources": sources,
+                    "grantId": grant_id, "ms": engine_ms, "timeoutMs": st.predict_section.timeout_ms,
+                }),
+            );
+            return Err(super::db_error::structured_js_error(
+                CODE_ENGINE,
+                format!(
+                    "predict.run: engine timed out after {} ms (observable via audit PREDICT_AUDIT status=timeout)",
+                    st.predict_section.timeout_ms
+                ),
+                serde_json::json!({ "timeoutMs": st.predict_section.timeout_ms }),
+            ));
+        }
+        Ok(Err(e)) => {
+            let msg = redact_engine_msg(&e.to_string(), &args.pql);
+            emit(
+                &st,
+                &owner,
+                "PREDICT_AUDIT",
+                &serde_json::json!({
+                    "status": "error", "pqlSha256": fp, "sources": sources,
+                    "grantId": grant_id, "ms": engine_ms,
+                }),
+            );
+            return Err(super::db_error::structured_js_error(
+                CODE_ENGINE,
+                format!("predict.run: engine failed: {msg}"),
+                serde_json::json!({}),
+            ));
+        }
+        Ok(Ok(v)) => v,
+    };
+
+    // 引擎契约校验：{"result": …, "ticket": 回显}——ticket 不符 = 非契约引擎。
+    if out.get("ticket").and_then(serde_json::Value::as_str) != Some(ticket.as_str()) {
+        emit(
+            &st,
+            &owner,
+            "PREDICT_AUDIT",
+            &serde_json::json!({
+                "status": "error", "pqlSha256": fp, "sources": sources,
+                "grantId": grant_id, "ms": engine_ms, "reason": "ticket_mismatch",
+            }),
+        );
+        return Err(super::db_error::structured_js_error(
+            CODE_ENGINE,
+            "predict.run: engine did not echo the gateway ticket (contract violation; see docs/plugins/predict.md engine contract)".to_string(),
+            serde_json::json!({}),
+        ));
+    }
+    let Some(result) = out.get("result").cloned() else {
+        emit(
+            &st,
+            &owner,
+            "PREDICT_AUDIT",
+            &serde_json::json!({
+                "status": "error", "pqlSha256": fp, "sources": sources,
+                "grantId": grant_id, "ms": engine_ms, "reason": "missing_result",
+            }),
+        );
+        return Err(super::db_error::structured_js_error(
+            CODE_ENGINE,
+            "predict.run: engine response missing \"result\" (contract violation)".to_string(),
+            serde_json::json!({}),
+        ));
+    };
+
+    emit(
+        &st,
+        &owner,
+        "PREDICT_AUDIT",
+        &serde_json::json!({
+            "status": "ok", "pqlSha256": fp, "sources": sources,
+            "grantId": grant_id, "ms": engine_ms,
+        }),
+    );
+    let mut trace = finish_trace("ok", engine_ms, vec![]);
+    trace["ticket"] = serde_json::Value::String(ticket);
+    Ok(serde_json::json!({ "result": result, "trace": trace }))
 }

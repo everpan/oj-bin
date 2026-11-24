@@ -79,8 +79,8 @@ pub mod oidc;
 mod placeholder;
 pub mod platform;
 pub mod plugin_loader;
-pub mod predict;
 mod plugins_op;
+pub mod predict;
 mod query;
 mod registry;
 pub mod relay;
@@ -303,6 +303,11 @@ pub struct StableState {
     pub mgmt_section: Arc<db_policy::MgmtSection>,
     pub mgmt_axes: generic_axis::GenericAxisRegistry,
     pub mgmt: Arc<mgmt::MgmtRegistry>,
+    /// 预测合规网关（REQ-PREDICT v0.1.145）：`predict:` 段 + 装配期收编的引擎轴
+    /// （`axis == cfg.predict.axis` 的泛型轴，**不进** `axis()` 公开面——特权旁路
+    /// 封堵）。策略空表 = 一切 dataScope/consent 被拒（fail-closed）。
+    pub predict_section: Arc<predict::PredictSection>,
+    pub predict_axes: generic_axis::GenericAxisRegistry,
     /// 运行期凭据密钥（U-10 v0.1.101）：`secret.seal/open` 的装配期数据源。
     /// None = 无密钥装配（op 层 fail-closed）。私钥**永不出 Rust 边界**。
     pub secret_keys: Option<Arc<crate::secret::RuntimeKeys>>,
@@ -419,6 +424,9 @@ pub struct Extras {
     pub mgmt_section: Option<Arc<db_policy::MgmtSection>>,
     pub mgmt_axes: Option<generic_axis::GenericAxisRegistry>,
     pub mgmt: Option<Arc<mgmt::MgmtRegistry>>,
+    /// 预测合规网关（REQ-PREDICT v0.1.145）。None = 缺省段 + 空收编表（全拒）。
+    pub predict_section: Option<Arc<predict::PredictSection>>,
+    pub predict_axes: Option<generic_axis::GenericAxisRegistry>,
     /// 运行期凭据密钥（U-10 v0.1.101，`secret.seal/open`）。None = 装配无密钥，
     /// 两个 op fail-closed（报 not configured）。
     pub secret_keys: Option<Arc<crate::secret::RuntimeKeys>>,
@@ -722,6 +730,7 @@ deno_core::extension!(
         mq::op_tasks_sleep,
         ldap::op_ldap_call,
         generic_axis::op_axis_call,
+        predict::op_predict_run,
         fs::op_fs_resolve,
         exec::op_exec_run,
         exec::op_exec_spawn,
@@ -1093,6 +1102,11 @@ impl Bridge {
                 mgmt_section.max_per_owner,
             ))
         });
+        let predict_section = extras.predict_section.clone().unwrap_or_default();
+        let predict_axes = extras
+            .predict_axes
+            .clone()
+            .unwrap_or_else(|| Arc::new(HashMap::new()));
         let secret_keys = extras.secret_keys.clone();
         // 每代装配槽：装配层穿参（Extras.assembly，跨 Bridge 单实例）优先；
         // 缺省 = registry 参数 + Extras fallback 字段包初代（oj test / 嵌入式形态）。
@@ -1154,6 +1168,8 @@ impl Bridge {
             mgmt_section,
             mgmt_axes,
             mgmt,
+            predict_section,
+            predict_axes,
             secret_keys,
             db_access_rt: extras
                 .db_access_rt

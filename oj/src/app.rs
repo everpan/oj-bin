@@ -1379,6 +1379,12 @@ pub async fn assemble_backend(
     // U-15：管理面收编轴（`mgmt:` 段 `axes` 名单）——**不进** `axis()` 公开面，仅供 mgmt 面。
     let mgmt_axes =
         only_js::bridge::generic_axis::registry_from(std::mem::take(&mut registries.mgmt_generic));
+    // REQ-PREDICT（v0.1.145）：预测引擎收编轴（`predict.axis`）——**不进** `axis()`
+    // 公开面，只可经 `predict.run` 网关触达（特权旁路封堵）。
+    let predict_axes = only_js::bridge::generic_axis::registry_from(std::mem::take(
+        &mut registries.predict_generic,
+    ));
+    let predict_section = Arc::new(cfg.predict.clone());
     let mgmt_section = Arc::new(cfg.mgmt.clone());
     // 管理面登记表（进程级）：装配层构造一次，热更前后同一 Arc（与 tx_sessions 同款）。
     let mgmt = Arc::new(only_js::bridge::mgmt::MgmtRegistry::new(
@@ -1797,6 +1803,8 @@ pub async fn assemble_backend(
         let exec_sessions = exec_sessions.clone();
         let mgmt_section = mgmt_section.clone();
         let mgmt_axes = mgmt_axes.clone();
+        let predict_section = predict_section.clone();
+        let predict_axes = predict_axes.clone();
         let secret_keys = secret_keys.clone();
         let mgmt = mgmt.clone();
         let client_dbs = client_dbs.clone();
@@ -1869,6 +1877,8 @@ pub async fn assemble_backend(
                     import_registry: Some(import_registry.clone()),
                     mgmt_section: Some(mgmt_section.clone()),
                     mgmt_axes: Some(mgmt_axes.clone()),
+                    predict_section: Some(predict_section.clone()),
+                    predict_axes: Some(predict_axes.clone()),
                     mgmt: Some(mgmt.clone()),
                     // 运行期凭据密钥（U-10）：与 StableState.secret_keys 同源。
                     secret_keys: secret_keys.clone(),
@@ -1941,6 +1951,8 @@ pub async fn assemble_backend(
         import_registry: import_registry.clone(), // 与 make_bridge 的 Extras.import_registry 同一注册表。
         mgmt_section: mgmt_section.clone(), // 与 make_bridge 的 Extras.mgmt_section 同一 Arc。
         mgmt_axes: mgmt_axes.clone(),       // 与 make_bridge 的 Extras.mgmt_axes 同一注册表。
+        predict_section: predict_section.clone(), // 与 Extras.predict_section 同一 Arc。
+        predict_axes: predict_axes.clone(), // 与 Extras.predict_axes 同一注册表。
         mgmt: mgmt.clone(),                 // 与 make_bridge 的 Extras.mgmt 同一登记表。
         secret_keys: secret_keys.clone(),   // 与 make_bridge 的 Extras.secret_keys 同源。
         db_access_rt: db_access_rt.clone(), // 与 make_bridge 的 Extras.db_access_rt 同源（同一 Arc）。

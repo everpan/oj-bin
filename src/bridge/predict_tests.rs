@@ -3,7 +3,7 @@
 //! - 部分越界必须**整体拒绝**并点名越界项，绝不静默裁剪后继续执行；
 //! - 拒绝路径结构化（拒绝原因可审计），无任何「放行但记警告」形态。
 
-use super::predict::{validate_consent, validate_scope, ConsentDeny, ConsentGrant};
+use super::predict::{ConsentDeny, ConsentGrant, validate_consent, validate_scope};
 
 fn grant(id: &str, scopes: &[&str], not_after_ms: Option<u64>) -> ConsentGrant {
     ConsentGrant {

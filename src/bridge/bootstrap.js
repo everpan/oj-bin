@@ -56,6 +56,7 @@ import {
   op_db_access_revoke,
   op_db_epoch,
   op_audit_query,
+  op_predict_run,
   op_db_session_begin,
   op_db_session_attach,
   op_db_session_detach,
@@ -1083,6 +1084,16 @@ globalThis.axis = (name) => new Proxy({}, {
     return (...args) => op_axis_call(String(name), op, ojStringify(args));
   },
 });
+
+// ----- predict: gated predictive execution (REQ-PREDICT, config `predict:`) -----
+// The ONLY sanctioned path to a prediction engine: consent + dataScope policy checks,
+// audit on allow AND deny, timeout bounded, engine axis is gateway-reserved (direct
+// axis() access is blocked at assembly). Returns { result, trace }. See
+// docs/plugins/predict.md. Engine absent -> OJ_PREDICT_ENGINE (capability absent,
+// no silent fallback).
+globalThis.predict = {
+  run: (opts) => op_predict_run(ojStringify(opts ?? {})),
+};
 
 // ----- vars: deployment-time constants (config `vars:` section) -----
 // Synchronous read (no I/O -- the table is frozen at assembly). FAIL-CLOSED: only keys

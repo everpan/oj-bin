@@ -4015,3 +4015,232 @@ export default { get };
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
 }
+
+// ---------- predict 合规网关（REQ-PREDICT v0.1.145）：mini-predict 夹具 → predict.run ----------
+
+/// 编译 mini-predict 夹具产物路径（全进程一次；照 mini-generic 同款形态）。
+fn predict_plugin_artifact() -> PathBuf {
+    static ONCE: OnceLock<PathBuf> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+        let status = std::process::Command::new("cargo")
+            .args(["build", "-p", "oj-plugin-test-mini-predict"])
+            .current_dir(&root)
+            .status()
+            .expect("invoke cargo build for mini-predict");
+        assert!(status.success(), "mini-predict build failed");
+        let (prefix, ext) = if cfg!(target_os = "windows") {
+            ("", "dll")
+        } else if cfg!(target_os = "macos") {
+            ("lib", "dylib")
+        } else {
+            ("lib", "so")
+        };
+        root.join("target/debug")
+            .join(format!("{prefix}oj_plugin_test_mini_predict.{ext}"))
+    })
+    .clone()
+}
+
+/// predict 合规网关 e2e（九子用例）：mini-predict echo 引擎经 `predict:` 段收编
+/// 装配 → JS `predict.run` 全链。合规红线逐条钉死：
+/// - ok 路径 result+trace 形状（ticket 回程一致）；
+/// - dataScope 部分越界**整体拒绝**并点名（绝不裁剪放行）；
+/// - consent 未知 grant / 过期 → 拒绝 + 结构化 reason；
+/// - 引擎超时有界（timeout_ms 300 < SLEEP5000）且可观测；
+/// - 引擎错误消息剥 PQL 原文（脱敏）；
+/// - 拒绝与失败均落 audit（PREDICT_DENY / PREDICT_AUDIT 可查）；
+/// - `axis("predict")` 直连引擎必被收编封堵（unknown axis）；ojInfo 不见 predict。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn predict_gateway_end_to_end() {
+    let _g = lock();
+    let t = tmp_project(&[
+        (
+            "src/p/manifest.yaml",
+            "name: p\ndesc: predict gateway e2e\nversion: 0.1.0\n",
+        ),
+        (
+            "src/p/api.ts",
+            r#"async function get() {
+                 const op = http.query.op;
+                 const grant = { grantId: "g-2026", scopes: ["forecast.monthly"] };
+                 try {
+                   if (op === "ok") {
+                     const out = await predict.run({
+                       pql: "FORECAST revenue NEXT 3",
+                       dataScope: { sources: ["db:crm.orders"] },
+                       consent: grant,
+                     });
+                     json.ok(out);
+                   } else if (op === "scope") {
+                     try {
+                       await predict.run({ pql: "P1", dataScope: { sources: ["db:crm.orders", "db:hr.salary"] }, consent: grant });
+                       json.ok({ leaked: true });
+                     } catch (e) {
+                       json.ok({ code: e.code, data: JSON.parse(e.data || "{}") });
+                     }
+                   } else if (op === "noGrant") {
+                     try {
+                       await predict.run({ pql: "P2", dataScope: { sources: ["db:crm.orders"] }, consent: { grantId: "nope", scopes: ["forecast.monthly"] } });
+                       json.ok({ leaked: true });
+                     } catch (e) {
+                       json.ok({ code: e.code, data: JSON.parse(e.data || "{}") });
+                     }
+                   } else if (op === "expired") {
+                     try {
+                       await predict.run({ pql: "P3", dataScope: { sources: ["db:crm.orders"] }, consent: { grantId: "g-old", scopes: ["forecast.monthly"] } });
+                       json.ok({ leaked: true });
+                     } catch (e) {
+                       json.ok({ code: e.code, data: JSON.parse(e.data || "{}") });
+                     }
+                   } else if (op === "timeout") {
+                     try {
+                       await predict.run({ pql: "SLEEP5000", dataScope: { sources: ["db:crm.orders"] }, consent: grant });
+                       json.ok({ leaked: true });
+                     } catch (e) {
+                       json.ok({ code: e.code, msg: String(e) });
+                     }
+                   } else if (op === "sanitize") {
+                     try {
+                       await predict.run({ pql: "FAIL_ECHO SECRET-ORDERS-42", dataScope: { sources: ["db:crm.orders"] }, consent: grant });
+                       json.ok({ leaked: true });
+                     } catch (e) {
+                       json.ok({ code: e.code, msg: String(e) });
+                     }
+                   } else if (op === "axisBypass") {
+                     try {
+                       await axis("predict").run({ pql: "P4" });
+                       json.ok({ leaked: true });
+                     } catch (e) {
+                       json.ok({ err: String(e) });
+                     }
+                   } else if (op === "ojinfo") {
+                     json.ok({ genericAxes: ojInfo().genericAxes ?? ojInfo().generic_axes });
+                   } else if (op === "audit") {
+                     const evs = await audit.query({ kind: "PREDICT_DENY", limit: 10 });
+                     const oks = await audit.query({ kind: "PREDICT_AUDIT", limit: 10 });
+                     json.ok({ denies: evs.length, audits: oks.length,
+                               reasons: evs.map(e => JSON.parse(e.detail || "{}").reason) });
+                   } else {
+                     json.fail("unknown op");
+                   }
+                 } catch (e) {
+                   json.ok({ outer: String(e) });
+                 }
+               }
+               export default { get };"#,
+        ),
+    ]);
+    let pdir = t.join("plugins").join(host_triple());
+    std::fs::create_dir_all(&pdir).unwrap();
+    std::fs::copy(
+        predict_plugin_artifact(),
+        pdir.join(plugin_file("mini-predict")),
+    )
+    .unwrap();
+    let mut cfg = base_cfg(&t);
+    cfg.plugins_dir = Some(t.join("plugins"));
+    // `predict:` 段：白名单 + 授权表（g-2026 有效 / g-old 已过期）+ 300ms 预算。
+    cfg.predict.timeout_ms = 300;
+    cfg.predict.policy.allowed_sources = vec!["db:crm.*".to_string()];
+    cfg.predict.policy.grants = vec![
+        only_js::bridge::predict::ConsentGrant {
+            id: "g-2026".into(),
+            scopes: vec!["forecast.monthly".into()],
+            not_after_ms: None,
+        },
+        only_js::bridge::predict::ConsentGrant {
+            id: "g-old".into(),
+            scopes: vec!["forecast.monthly".into()],
+            not_after_ms: Some(1000),
+        },
+    ];
+    let (addr, h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into())
+        .await
+        .unwrap();
+
+    // 1) ok 路径：result 透传 + trace 形状（status/grantId/sources/ticket 回程一致）。
+    let (s, v) = req(addr, "GET", "/v1/api/p/?op=ok", None).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["data"]["result"]["engine"], "mini", "{v}");
+    assert_eq!(v["data"]["result"]["echoPqlLen"], 23, "{v}");
+    assert_eq!(v["data"]["trace"]["status"], "ok", "{v}");
+    assert_eq!(v["data"]["trace"]["grantId"], "g-2026", "{v}");
+    assert_eq!(v["data"]["trace"]["sources"][0], "db:crm.orders", "{v}");
+    assert!(
+        v["data"]["trace"]["ticket"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("gt-")),
+        "{v}"
+    );
+
+    // 2) dataScope 部分越界：整体拒绝 + violations 点名（绝不裁剪）。
+    let (_s, v) = req(addr, "GET", "/v1/api/p/?op=scope", None).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["data"]["code"], "OJ_PREDICT_SCOPE", "{v}");
+    assert_eq!(
+        v["data"]["data"]["violations"],
+        serde_json::json!(["db:hr.salary"]),
+        "{v}"
+    );
+
+    // 3/4) consent：未知 grant / 过期。
+    let (_s, v) = req(addr, "GET", "/v1/api/p/?op=noGrant", None).await;
+    assert_eq!(v["data"]["code"], "OJ_PREDICT_CONSENT", "{v}");
+    assert_eq!(v["data"]["data"]["reason"], "no_such_grant", "{v}");
+    let (_s, v) = req(addr, "GET", "/v1/api/p/?op=expired", None).await;
+    assert_eq!(v["data"]["code"], "OJ_PREDICT_CONSENT", "{v}");
+    assert_eq!(v["data"]["data"]["reason"], "expired", "{v}");
+
+    // 5) 引擎超时有界：SLEEP5000 vs timeout_ms 300 → OJ_PREDICT_ENGINE。
+    let (_s, v) = req(addr, "GET", "/v1/api/p/?op=timeout", None).await;
+    assert_eq!(v["data"]["code"], "OJ_PREDICT_ENGINE", "{v}");
+    assert!(
+        v["data"]["msg"]
+            .as_str()
+            .unwrap_or("")
+            .contains("timed out"),
+        "{v}"
+    );
+
+    // 6) 引擎错误脱敏：PQL 原文（SECRET-ORDERS-42）不得出现在错误消息。
+    let (_s, v) = req(addr, "GET", "/v1/api/p/?op=sanitize", None).await;
+    assert_eq!(v["data"]["code"], "OJ_PREDICT_ENGINE", "{v}");
+    let msg = v["data"]["msg"].as_str().unwrap_or("");
+    assert!(msg.contains("engine boom"), "{v}");
+    assert!(!msg.contains("SECRET-ORDERS-42"), "PQL leaked: {v}");
+
+    // 7) axis("predict") 直连 = unknown axis（收编封堵——特权旁路红线）。
+    let (_s, v) = req(addr, "GET", "/v1/api/p/?op=axisBypass", None).await;
+    assert!(
+        v["data"]["err"]
+            .as_str()
+            .unwrap_or("")
+            .contains("unknown generic axis 'predict'"),
+        "{v}"
+    );
+
+    // 8) ojInfo().generic_axes 不含 predict（收编语义与 mgmt 同款）。
+    let (_s, v) = req(addr, "GET", "/v1/api/p/?op=ojinfo", None).await;
+    let axes = v["data"]["genericAxes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(!axes.iter().any(|a| a == "predict"), "{v}");
+
+    // 9) 审计：PREDICT_DENY（scope/consent.no_such_grant/consent.expired）与
+    //    PREDICT_AUDIT（ok/timeout/error）双族可查。
+    let (_s, v) = req(addr, "GET", "/v1/api/p/?op=audit", None).await;
+    assert_eq!(s, 200, "{v}");
+    let denies = v["data"]["denies"].as_i64().unwrap_or(0);
+    assert!(denies >= 3, "deny audit missing: {v}");
+    let audits = v["data"]["audits"].as_i64().unwrap_or(0);
+    assert!(audits >= 2, "ok/timeout audit missing: {v}");
+    let reasons = v["data"]["reasons"].as_array().cloned().unwrap_or_default();
+    assert!(reasons.iter().any(|r| r == "scope"), "{v}");
+    assert!(reasons.iter().any(|r| r == "consent.no_such_grant"), "{v}");
+    assert!(reasons.iter().any(|r| r == "consent.expired"), "{v}");
+
+    h.abort();
+    let _ = std::fs::remove_dir_all(&t);
+}

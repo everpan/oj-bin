@@ -60,6 +60,8 @@ fn stable_min(platform: Option<Arc<PlatformGrant>>, old: PerGenAssembly) -> Stab
         mgmt_section: Arc::new(only_js::bridge::db_policy::MgmtSection::default()),
         mgmt_axes: only_js::bridge::generic_axis::registry_from(vec![]),
         mgmt: Arc::new(only_js::bridge::mgmt::MgmtRegistry::new(16, 4)),
+        predict_section: Arc::new(only_js::bridge::predict::PredictSection::default()),
+        predict_axes: only_js::bridge::generic_axis::registry_from(vec![]),
         secret_keys: None,
         db_access_rt: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         db_backend: Arc::new(only_js::bridge::DbBackendRegistry::default()),
