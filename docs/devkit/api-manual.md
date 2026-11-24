@@ -1104,6 +1104,7 @@ const n = await db.exec("update user set name = ? where id = ?", ["b", 1]);
 | `fs.readFile/readTextFile/writeFile/writeTextFile/mkdir/remove/rename/stat/readDir` | 本地文件系统（`fs:` 段启用，v0.1.53）；jail 到 `fs.root`，未配置/越界抛 `NotCapable` |
 | `exec.run(argv, opts?)` | 外部命令执行（v0.1.75，`platform.exec` 段授权）：argv 模板白名单 + 路径占位符校验，无 shell；未配置/未授权抛 `NotCapable`，见下「exec」 |
 | `yaml.parse(text)` / `yaml.stringify(value)` | YAML 读写原语（v0.1.75，无特权，始终可用）：三预算防炸弹解析（1 MiB 输入 / 10 万节点含 alias 展开 / 深度 128）+ Rust 阻塞池执行不卡 isolate；stringify 仅承诺机器产物往返，见下「yaml」 |
+| `sql.parse(sqlText, opts?)` | 一等 SQL 解析服务（v0.1.143，无特权，始终可用）：多方言结构化 `{dialect,tables,columns,ctes,lineage,ast}`（vendored node-sql-parser，纯函数无副作用），列级血缘直接供查询历史摄入等场景替换掩码正则；见下「sql.parse」 |
 | `server.reloadConfig(force?)` | 进程内触发热更（v0.1.75，`platform.modules` 特权；v0.1.123 起 `force` 参）：与 `POST {base}/_system/config` 同一 executor 与串行锁，返回恒定形状（`generation` + 三清单 `applied`/`restart_pending`/`kept_listener`，`unchanged` 时三清单空）；`force=true` 跳过幂等闸门强制换代（`unchanged` 恒 false、`applied` 可空）；`oj test` / 嵌入式抛 `reload not available`，见下「server」 |
 | `bus.publish / subscribe / kind` | 主题广播（HTTP 发布、WS 订阅） |
 | `es.search / index / del` | Elasticsearch 薄客户端（`es:` 段启用） |
@@ -1669,6 +1670,71 @@ yaml.stringify(value: object): Promise<string>;  // 仅承诺机器产物（mani
 | `yaml.parse: invalid YAML at line N column M: <detail>` | 语法错（带行列） |
 | `yaml.parse: timed out after 5s` | hang 兜底（预算内正常解析为毫秒级） |
 | `yaml.stringify: <e>` | 不可序列化值 |
+
+### sql.parse —— 一等 SQL 解析服务（v0.1.143，无特权，始终可用）
+
+```ts
+sql.parse(sqlText: string, opts?: { dialect?: string }): {
+  dialect: string;
+  tables: { name: string; schema: string | null; alias: string | null }[];
+  columns: { table: string | null; column: string }[];
+  ctes: string[];
+  lineage: {
+    output: { table: string | null; column: string | null };
+    sources: { table: string; column: string }[];
+  }[];
+  ast: object;
+};
+```
+
+纯函数解析原语（vendored node-sql-parser 5.4.0，Apache-2.0，二进制内嵌懒加载）——无 I/O、
+无副作用、不取租户数据，**同步**返回（解析跑在当前 runtime，预算内输入为毫秒级）。多方言
+把 SQL 解析为结构化结果，直接替换模块内掩码正则 / 手写 tokenizer 路径（典型：查询历史
+`registerSql` 的列级血缘摄入）。
+
+**方言**（`opts.dialect` 必填，无魔法默认）：`mysql` `mariadb` `postgresql` `sqlite`
+`snowflake` `transactsql` `trino` `bigquery` `hive` `flinksql` `db2` `redshift` `athena`
+`noql`；别名 `pg → postgresql`、`mssql → transactsql`。duckdb 5.4.0 不支持（未来 vendor
+升级带来则方言表先行）。
+
+**返回字段**：
+
+- `tables`：基表（含 create/insert/update 目标与嵌套子查询内的基表）；**CTE 名与派生子查询别名不入列**；基表别名如实保留（`FROM customers c` → `alias:"c"`）。
+- `columns`：全语句引用到的列（含 WHERE/ON）；限定列经别名归一，裸列在单源作用域归属、多源（join）降级 `table:null`（无 schema 知识，不猜）；去重，语句级平面投影（不做逐作用域解析——逐作用域精度看 `lineage`）。
+- `ctes`：顶层 WITH 名（按出现序）。
+- `lineage`：仅顶层 SELECT，每个输出列一条。`output.table` 记**别名背后的来源名**（CTE 名保留如 `recent`；匿名派生子查询为 null），不记别名本身；`sources` 为穿透**单层** CTE / 派生子查询后的基表来源，链式 CTE 停在边界名（不递归第二层）；`SELECT *` 等无名表达式 `output.column` 为 null。
+- `ast`：解析器原生 AST（JSON 安全克隆）。体积可达输入 ~10 倍——契约含 `ast` 即调用方付费，**不截断**；预算按输入字符计。
+
+**口径与限制**：
+
+- **单语句**：一次一句；多语句（`;` 分隔）报 `syntax`（附 `statements` 计数）。
+- **预算 1 MiB 输入**（1048576 字符），先于解析拒绝；解析同步跑在 runtime 线程（长解析由调用方超时面兜底）。
+- **DDL（create/alter/drop）**：tables 含目标表，**columns/lineage 恒空**（create_definitions 是 schema 定义而非引用）。
+- **postgresql 双引号标识符**按列引用处理（pg 双引号即标识符）；标识符一律去引号**逐字保留**（中文名原样；mysql 反引号同）。
+- **每 runtime 各自懒加载**：vendored 包 ~2.5MB，首次 `sql.parse` 每 runtime 拉取一次（loader 自带 memo）——池化 N 个 runtime 各持一份已解析代码，内存代价换冷启动零回退。
+
+**错误**（Error own props：`code:"OJ_SQL_PARSE"` + `reason` + 上下文字段；`reason` ∈
+`input|dialect|budget|syntax|engine`，engine 为保留档当前无触发路径）：
+
+| reason | 触发 | 附加字段 |
+|---|---|---|
+| `input` | sqlText 非字符串 / 空串纯空白 | — |
+| `dialect` | dialect 缺失 / 不在支持表 | `supported`（全表）；未知时附原始 `dialect` |
+| `budget` | 输入 > 1 MiB（1048576 字符） | `length`、`max`、`dialect` |
+| `syntax` | 解析失败（含多语句） | `location`（{start,end}×{offset,line,column}，解析器给出行列时）、`dialect`；多语句附 `statements` |
+| `engine` | （保留档） | — |
+
+```ts
+// 查询历史血缘摄入（替换掩码正则路径的典型形态）
+const r = sql.parse(sqlText, { dialect: db.dialect() }); // 方言随连接
+for (const e of r.lineage) {
+  // e.output {table, column} ← e.sources [{table, column}]
+  await db.table("query_lineage").insert({
+    output_table: e.output.table, output_column: e.output.column,
+    source_table: e.sources[0]?.table ?? null, source_column: e.sources[0]?.column ?? null,
+  });
+}
+```
 
 ### server —— 平台级控制（v0.1.75，platform 特权）
 

@@ -465,6 +465,9 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | rotate 完立刻用旧 bearer 再 rotate 报 409（v0.1.132） | 幂等护栏：同一 name 任意时刻至多一行 active，不要再换。旧 bearer 在**24h 宽限内**仍可过 jti 门（在途请求平滑），过期自动 40311——不是 bug。**v0.1.136 起宽限内的旧 bearer 调 `GET current` 也 40311**（被轮换凭据无权读出新令牌）——最新 token 以 rotate 响应为准立即回写共享存储；多实例拿到 409 就重读共享存储（rotator 已写入），不要拿旧票去刷 current |
 | 「先 SELECT 校验状态再 UPDATE 翻转」防并发（v0.1.133 rotate 竞态收口） | **防不住**：SELECT 与 UPDATE 之间无锁，两个并发请求都通过校验后各自 UPDATE+INSERT。并发栅栏必须做进**写语句**——条件 UPDATE（`WHERE … AND (status IS NULL OR status='active')`）按影响行数判胜负：行锁串行化后后到者命中 0 行 → 409，参考 `sample/src/system/service-token/rotate/api.ts` |
 | 给 rotate/current 端点发 scopes 豁免就当免认证（v0.1.132） | **不是**：豁免的只有 scopes 动词档位（read 档也要能自轮换）；jti 门照常——吊销的、宽限过期的旧 bearer 一律 40311 换不动（fail-closed） |
+| 拿 `sql.parse` 当全量递归血缘用（v0.1.143） | **单层口径**：`lineage` 只穿透一层 CTE / 派生子查询，链式 CTE 停在边界名（如 `b→a` 停在 `{table:"a"}` 不追到 `t1`）——无 schema 知识下的诚实边界，别拿它替代逐层物化的血缘引擎 |
+| `sql.parse` 对 DDL 返回空 columns/lineage、对多语句直接抛错（v0.1.143） | 契约：create/alter/drop 只出 tables（create_definitions 是 schema 定义非引用）；多语句（`;` 分隔）一次一句显式拒绝（`reason:"syntax"` + `statements` 计数）——批量 SQL 先按语句拆分再逐句解析 |
+| `sql.parse` 传 `pg`/`mssql` 以为没识别、或传 `duckdb` 报错（v0.1.143） | `pg→postgresql`、`mssql→transactsql` 是内置别名（返回的 `dialect` 为归一后名）；**duckdb 5.4.0 不支持**——方言缺失/未知抛 `reason:"dialect"` 且 `supported` 带全表，无魔法默认方言，必须显式传 |
 
 ## 手册
 

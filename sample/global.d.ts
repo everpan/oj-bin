@@ -589,6 +589,39 @@ interface YamlApi {
   stringify(value: object): Promise<string>;
 }
 
+// sql.parse：一等 SQL 解析服务（无特权；vendored node-sql-parser，纯函数同步）。
+// dialect 必填无默认；多语句拒绝；预算 1 MiB 输入；DDL 的 columns/lineage 恒空；
+// lineage 单层 CTE/派生子查询穿透；错误 Error own props {code:"OJ_SQL_PARSE", reason, ...}。
+interface SqlParseSource {
+  table: string;
+  column: string;
+}
+interface SqlParseResult {
+  /** 规范化后的方言名（别名 pg/mssql 已归一）。 */
+  dialect: string;
+  /** 基表（CTE 名与派生子查询别名不入列；别名如实保留）。 */
+  tables: { name: string; schema: string | null; alias: string | null }[];
+  /** 全语句引用到的列（含 WHERE/ON；多源裸列 table 为 null）。 */
+  columns: { table: string | null; column: string }[];
+  /** 顶层 WITH 名（按出现序）。 */
+  ctes: string[];
+  /** 顶层 SELECT 逐输出列血缘（单层穿透；DDL 恒空数组）。 */
+  lineage: {
+    output: { table: string | null; column: string | null };
+    sources: SqlParseSource[];
+  }[];
+  /** 解析器原生 AST（JSON 安全克隆；体积可达输入 ~10 倍，不截断）。 */
+  ast: object;
+}
+interface SqlApi {
+  /**
+   * 解析 SQL。失败 throw Error，own props：
+   * code:"OJ_SQL_PARSE"、reason:"input"|"dialect"|"budget"|"syntax"|"engine"、
+   * dialect?/supported?/location?/length?/max?/statements?（按 reason 附带）。
+   */
+  parse(sqlText: string, opts?: { dialect?: string }): SqlParseResult;
+}
+
 // server.*：平台级控制（platform 特权）。
 // reloadConfig：进程内触发热更（与 `POST {base}/_system/config` 同一 executor 与串行锁）；
 // tasks/WS 上下文无归属 → NotCapable；`oj test` / 嵌入式 → `reload not available`；
@@ -1237,6 +1270,8 @@ declare global {
   const exec: ExecApi;
   // YAML 读写原语（无特权；见 YamlApi JSDoc 与 api-manual §6「yaml」）。
   const yaml: YamlApi;
+  // 一等 SQL 解析服务（无特权；见 SqlApi JSDoc 与 api-manual §6「sql.parse」）。
+  const sql: SqlApi;
   // server.*：平台级控制（platform 特权；见 ServerApi JSDoc 与 api-manual §6「server」）。
   const server: ServerApi;
   const bus: BusApi;

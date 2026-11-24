@@ -45,6 +45,7 @@
 | [42](#场景-42运行期动态登记数据源-client-轴v0191) | 运行期把 DSN 登记为命名库：`db.client.register("rep", dsn)` → `DB("rep")` 直接可用（复用 L1 访问控制 + L2 内省）；未声明 `db_access.<name>` 的动态库默认 deny | §6 db / `db.client` |
 | [73](#场景-73装完部署后让-seed-随迁移即时灌oj-migrate---with-seedv01125) | 带 `seed.sql` 的模块装完数据面空：`oj migrate --with-seed` 把迁移+seed 一起做完（严格 migrate→seed、幂等、fail-closed 门禁、`--format json` 顶层 `seed`、exit code 成败真源） | §3 数据层 / §10 `oj migrate --with-seed` |
 | [74](#场景-74普通请求里对别的租户做窄范围写语句级-fortenantidv01129) | 服务端派生别的租户 id（企微 `corp_id`），普通请求里只删**那一个租户**的 refresh token，又不想关掉整个请求的租户防护 | §8 鉴权与多租户 / §6 db |
+| [83](#场景-83sql-审计入湖前先解析出表列血缘sqlparsev01143) | SQL 审计入湖前先解析：`sql.parse` 抽 tables/columns/lineage 存审计行（v0.1.143；单层血缘口径，勿当全量递归血缘用） | §6 sql.parse |
 
 ---
 
@@ -5283,3 +5284,61 @@ curl 'http://localhost:9778/v1/api/dm/query/?id=1'   # → {"code":0,"msg":"ok",
 | DM 整数列回 string / DECIMAL 回 number | 按 scale 分流：scale>0 → string（保精度）；scale==0 → number。别 `Number()` 大数，用 `toBigInt` |
 | DM 幂等写撞墙 | DM 不支持 `INSERT IGNORE`/`ON DUPLICATE KEY`/`RETURNING`——用 MERGE INTO 或事务内先查后写；多行 values 组数必须与参数个数同构（否则「序列号无效」） |
 | 引号标识符对不上 | DM 默认 CASE_SENSITIVE=1：`"name"` ≠ `NAME`——裸 SQL 统一不引用或统一大写 |
+
+## 场景 83：SQL 审计入湖前先解析出表/列血缘——`sql.parse`（v0.1.143）
+
+> 何时抄我：要给业务侧提交的 SQL（动态报表、集成脚本、审批工单）做审计/血缘归档——
+> 入湖前先解析出「动了哪些表、读了哪些列、输出列从哪来」。纯 JS 同步调用，不碰数据库。
+
+### ① handler
+
+```ts
+// src/audit/sql-ingest/api.ts —— 审计入湖前的解析归档步骤
+async function post(): Promise<void> {
+  const body = http.body() as { sql?: string; dialect?: string };
+  try {
+    const r = sql.parse(body.sql!, { dialect: body.dialect || "mysql" });
+    // r.tables:  [{name, schema, alias}]            —— 基表（CTE 名不混入）
+    // r.columns: [{table, column}]                  —— 全量引用列（table 可为 null=多源裸列）
+    // r.lineage: [{output:{table,column}, sources:[{table,column}]}] —— 输出列血缘
+    await DB("audit").table("sql_audit").insert({
+      sql_text: body.sql,
+      tables: JSON.stringify(r.tables),
+      columns: JSON.stringify(r.columns),
+      lineage: JSON.stringify(r.lineage),
+      created_at: new Date().toISOString(),
+    });
+    json.ok({ tables: r.tables.length, columns: r.columns.length });
+  } catch (e: any) {
+    if (e && e.code === "OJ_SQL_PARSE") {
+      // 结构化拒绝：e.reason ∈ input|dialect|budget|syntax（|engine 预留）
+      json.fail(400, `sql 解析拒绝: ${e.reason} ${e.message}`);
+      return;
+    }
+    throw e;
+  }
+}
+```
+
+### ② 验证
+
+```bash
+curl -X POST http://localhost:9778/v1/api/audit/sql-ingest/ \
+  -H 'content-type: application/json' \
+  -d '{"sql":"WITH t AS (SELECT id FROM orders) SELECT t.id FROM t","dialect":"mysql"}'
+# → {"code":0,"data":{"tables":1,"columns":1}}；audit 库 sql_audit 行里
+#   lineage = [{"output":{"table":"t","column":"id"},"sources":[{"table":"orders","column":"id"}]}]
+```
+
+验证口径：CTE 输出列穿透一层落到 `orders.id`；`tables` 只有基表 `orders`（`t` 是 CTE 不算表）。
+
+### ③ 常见坑
+
+| 坑 | 解 |
+|---|---|
+| 拿 lineage 当全量递归血缘 | **单层口径**：只穿透一层 CTE/派生子查询，链式 CTE 停在边界名。要全量得逐层物化（CTE 结果本身再 parse 一次） |
+| 多语句 SQL 直接 400 | 契约一次一句（`reason:"syntax"` + `statements` 计数）。批量先按语句拆分逐条解析入湖 |
+| DDL 拿不到列 | create/alter/drop 只出 `tables`（目标表），`columns`/`lineage` 恒空——schema 定义不是列引用 |
+| 传 `pg`/`mssql` 后入湖方言对不上 | 返回的 `dialect` 是归一后名（`postgresql`/`transactsql`）——入湖存返回值，别存入参 |
+| 忘传 dialect | 无魔法默认，必抛 `reason:"dialect"`；错误对象带 `supported` 全表可回给前端做下拉 |
+| 大 SQL 打挂服务 | >1 MiB 在解析前拒绝（`reason:"budget"`），快速返回不占 CPU；AST 可达输入 10 倍大，勿把 `ast` 整体入湖，只存 tables/columns/lineage |

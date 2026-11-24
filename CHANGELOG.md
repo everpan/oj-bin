@@ -18,6 +18,28 @@
 
 ## 下一版（未发布）
 
+**REQ-PARSE Phase 2：平台 SQL 解析服务 `sql.parse`**（下游血缘采集/SQL 审计需求；devkit
+四件已同步）：
+
+- handler 新增全局 `sql.parse(sqlText, { dialect })`：同步返回
+  `{dialect, tables, columns, ctes, lineage, ast}`——tables 恰为基表（CTE 名不混入，保留
+  schema 与别名）、columns 为全量引用列（多源裸列诚实降级 `table:null`）、lineage 为输出列
+  血缘（单层 CTE/派生子查询穿透，链式停在边界名，多源裸列 `sources:[]`）。
+- 方言表 14 名（mysql/mariadb/postgresql/sqlite/snowflake/transactsql/trino/bigquery/
+  hive/flinksql/db2/redshift/athena/noql）+ `pg`/`mssql` 别名（返回归一后名）；无魔法默认
+  方言，缺失/未知抛 `reason:"dialect"` 且错误对象带 `supported` 全表。
+- 预算与契约：输入 >1 MiB 在解析前拒绝（`reason:"budget"`）；单语句——多语句（`;` 分隔）
+  `reason:"syntax"` + `statements` 计数；DDL（create/alter/drop）只出 tables，
+  columns/lineage 恒空。
+- 语法错误结构化：`OJ_SQL_PARSE` + `reason:"syntax"` + `location {start,end}×{offset,line,
+  column}`，深嵌套等解析器内部失败同样收敛为结构化错误、runtime 存活。
+- 实现：vendored node-sql-parser 5.4.0（Apache-2.0，`src/bridge/vendor_sql_parser.js`，头注
+  记 tarball URL + npm integrity + 五步再 vendor 流程）经 deno_core lazy-ESM
+  （`createLazyLoader`）内嵌进二进制——首次调用才编译进堆，冷启动零回归；血缘 walker
+  `src/bridge/sql_parse_impl.js` 纯同步纯函数，无 op 无 I/O。
+- 测试：`src/bridge/sql_parse_tests.rs` 17 条（契约面/血缘 golden/边界输入/预算/深嵌栈/幂等/
+  注释透明/Unicode 标识符），mod_tests 增 7-bit ASCII 与内嵌源守卫。
+
 **REQ-HNSW Phase 1：数据命令按 `manifest.yaml` 的 `db:` 绑定路由到命名连接**（下游
 oj-wiki-docs 平台能力需求；devkit 四件已同步，`--db` 语义变更是用户可见变更）：
 
