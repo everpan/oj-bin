@@ -657,9 +657,34 @@ fn diff_configs(
             continue;
         }
         match *key {
-            "db" | "redis" | "blob" | "es" | "broker" | "smtp" | "ldap" | "auth" | "kafkas"
-            | "rabbits" | "plugins" | "plugins_dir" | "secrets" => {
-                restart_pending.push((*key).to_string())
+            "db" | "redis" | "blob" | "es" | "broker" | "smtp" | "ldap" | "kafkas" | "rabbits"
+            | "plugins" | "plugins_dir" | "secrets" => restart_pending.push((*key).to_string()),
+            "auth" => {
+                // v0.1.146（上游提案 no-restart-after-market-install 方案 A）：键粒度——
+                // `auth.anonymous_paths` 自 v0.1.122 D4 起随换代即时生效（宿主前置
+                // 管线随影子装配 per-App 重建，reload.swap 后即刻放行）；其余键
+                // （jwt_secret / signing_method / token 时长 / cookie）走 oj-auth
+                // 插件 init 期冻结 cfg（reload 复用 Backend 不重 init）——仅这些
+                // 非anon 键变化才报 restart_pending，仅 anon 变化归 applied。
+                // 市场首装只接线 anonymous_paths → 不再产生无谓的「重启要求」。
+                let strip_anon = |v: Option<&serde_yaml::Value>| -> Option<serde_yaml::Value> {
+                    // 剥 anon 后剩空 mapping = 其余键全缺省 == 段缺席（缺席也是全缺省）。
+                    v.and_then(|a| {
+                        let mut m = a.clone();
+                        if let Some(map) = m.as_mapping_mut() {
+                            map.remove(serde_yaml::Value::from("anonymous_paths"));
+                        }
+                        match m.as_mapping() {
+                            Some(map) if map.is_empty() => None,
+                            _ => Some(m),
+                        }
+                    })
+                };
+                if strip_anon(o) == strip_anon(n) {
+                    applied.push((*key).to_string());
+                } else {
+                    restart_pending.push((*key).to_string());
+                }
             }
             // 特权面段（ojm PR-3 安全阻塞项 3 修复，显式验收项）：platform.modules
             // （reloadConfig 等平台 API 资格）与 fs（jail 授权面）若随热更生效 =

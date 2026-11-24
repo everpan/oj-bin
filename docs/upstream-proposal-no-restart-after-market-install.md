@@ -89,3 +89,15 @@
 4. `runInstall` 终态判定注释：把"匿名接线/路由等 restart_pending 段"改为"新模块路由/模块注册须宿主重启才全量生效（匿名接线随换代即时生效，不在此列）"。
 
 > 因门禁约束，本改动仅存在于下游工作区，`ojm build` 会因 `src/app` 漂移而失败。上游下发含同类修正的新版本后，执行 `ojm init --yes` 恢复基线即可（注意该命令会丢弃 `src/app`、`src/oj-market` 的本地改动）。
+
+## 6. 上游落地状态（oj v0.1.146）
+
+- **方案 A1（oj 侧）已落地**：`reloadConfig` 的 `restart_pending` 对 `auth` 段降为键粒度——
+  仅 `auth.anonymous_paths` 变化归 `applied`（匿名清单自 oj v0.1.122 起随换代即时生效）；
+  `jwt_secret`/`signing_method`/token 时长/`cookie` 任一冻结键变化仍整段报 pending（oj-auth
+  插件 cfg init 期冻结）。剥离 anon 后剩余空 mapping 视同段缺席。
+- **方案 B 前提更正**：oj 内核 reload 执行器每次换代**本来就做全量影子装配 + Router
+  swap**（`App::from_config` 重建路由/挂载/前置管线后整表换装）——「HTTP 路由表/挂载点
+  未重建」在当前内核不成立。首装 partial 的真实根因只有 A1 一条：`auth` 段误标 pending
+  使安装器判 partial。装器侧（本仓下游）按方案 A2 降级后，首装即可 `done` 免重启。
+- 方案 C（seed 幂等重放）/ A2（装器降级）/ D（supervisor）仍属装器/部署侧，不在 oj 内核。

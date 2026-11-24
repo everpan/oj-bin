@@ -16,6 +16,27 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.146（2026-11-24，未打标签）
+
+**上游提案 `docs/upstream-proposal-no-restart-after-market-install.md` 方案 A（oj 侧）
+落地——auth 段 restart_pending 键粒度化**：
+
+- reloadConfig 的 `restart_pending` 对 `auth` 段从**整段**降为**键粒度**：仅
+  `auth.anonymous_paths` 变化（新增/删改匿名端点）归 `applied`——匿名清单自
+  v0.1.122 起随换代即时生效（宿主前置管线随影子装配 per-App 重建，swap 后即刻
+  放行）；`jwt_secret` / `signing_method` / token 时长 / `cookie` 走 oj-auth 插件
+  init 期冻结 cfg（热更复用 Backend 不重 init），**任一冻结键变化仍整段报
+  pending**（混合变化 fail-closed，重启一次性生效）。剥离 anon 后剩余为空
+  mapping 视同段缺席（缺席 = 全缺省，不算冻结键变化）。
+- 效果：市场首装只给新模块接线 `anonymous_paths` 时不再产生 `restart_pending` →
+  安装器可判 `done` 免重启。**新模块路由/模块注册本就随 reload 全量影子装配 +
+  Router swap 即时生效**——提案 §4.B「路由表未重建」的前提在当前内核不成立，
+  首装 partial 的真实根因只有 auth 段误标（提案文档已补落地状态节更正口径）。
+- 测试：`diff_configs` auth 键粒度四腿（仅 anon → applied / 冻结键 → pending /
+  混合 → pending / 段缺席 + 仅 anon → applied）。
+- devkit 四件同步：api-manual §server 三清单 auth 键粒度段、sample/global.d.ts
+  `ServerReloadResult` 注释、SKILL 陷阱一行、README。
+
 ## v0.1.145（2026-11-24，未打标签）
 
 **REQ-PREDICT Phase 4：预测执行与合规网关（上游 UPSTREAM-REQS §3.2 五条验收对照；

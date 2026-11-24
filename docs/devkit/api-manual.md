@@ -3283,7 +3283,8 @@ mounts:
 
 - **幂等**：归一后落盘文件 sha256 **与 manifests 锁（`dist/manifests.yaml`，release 树）双双未变** → 返回 `{"code":0,"msg":"unchanged","generation":<n>}`，不装配、不 swap。（v0.1.122 起锁纳入变化检测：只改锁不改 config 也会触发装配——装/卸模块免重启的检测面。）`unchanged` 的语义是「**活代已与盘上一致**」（闸门状态只在 commit 成功时更新）——调用方（如安装器）应把它当**幂等成功**处理，要强制重装配用 `?force=1`，不要改 config 凑 diff。force 不改变闸门基线。
 - **段 diff 三清单**（每次成功 swap 返回）：
-  - `restart_pending`：后端段（`db`/`redis`/`blob`/`es`/`broker`/`smtp`/`ldap`/`auth`/`kafkas`/`rabbits`/`plugins`/`plugins_dir`/`secrets`）、**特权面段（`platform`/`fs`）**与**冻结段（`vars`/`oidc`/`db_query`/`db_trace`/`ws`，v0.1.122 起）**——已验证合法，但本代沿用旧连接池/旧插件后端/旧授权面/旧装配期常量，**重启后生效**。特权面段不热生效是安全语义：特权模块不能热改自己的 API/exec/fs 白名单（防自提权）；冻结段不热生效是「装配期冻结」红线（**v0.1.122 行为修正**：旧版把 `vars` 等静默误标进 `applied`，实际并未热生效——现如实归入 `restart_pending`）。
+  - `restart_pending`：后端段（`db`/`redis`/`blob`/`es`/`broker`/`smtp`/`ldap`/`kafkas`/`rabbits`/`plugins`/`plugins_dir`/`secrets`）、**特权面段（`platform`/`fs`）**与**冻结段（`vars`/`oidc`/`db_query`/`db_trace`/`ws`，v0.1.122 起）**——已验证合法，但本代沿用旧连接池/旧插件后端/旧授权面/旧装配期常量，**重启后生效**。特权面段不热生效是安全语义：特权模块不能热改自己的 API/exec/fs 白名单（防自提权）；冻结段不热生效是「装配期冻结」红线（**v0.1.122 行为修正**：旧版把 `vars` 等静默误标进 `applied`，实际并未热生效——现如实归入 `restart_pending`）。
+  - **`auth` 段键粒度（v0.1.146）**：`auth.anonymous_paths` 自 v0.1.122 起随换代即时生效（宿主前置管线随影子装配 per-App 重建）——**仅 anonymous_paths 变化归 `applied`**（市场首装给新模块接线匿名端点不再产生无谓的重启要求）；`jwt_secret`/`signing_method`/token 时长/`cookie` 走 oj-auth 插件 init 期冻结 cfg（热更复用 Backend 不重 init），**任一冻结键变化仍整段报 `restart_pending`**（含混合变化，fail-closed 一次性重启生效）。剥离 anon 后剩余为空 mapping 视同段缺席（缺席 = 全缺省，不算冻结键变化）。
   - `kept_listener`：`server` 段（port/host/证书路径）——listener 永生，本代沿旧，改了也**下个进程**才生效。
   - `applied`：其余段（`mounts`/`tenant`/`tasks`）——本代即生效；v0.1.122 起追加 **manifests 锁 diff 条目**（见下「热装配」）。
 

@@ -622,6 +622,51 @@ fn predict_timeout_ms_zero_fails_fast() {
     assert!(err.contains("predict.timeout_ms"), "{err}");
 }
 
+/// v0.1.146（上游提案 no-restart-after-market-install 方案 A）：diff_configs 的
+/// auth 段键粒度——仅 anonymous_paths 变化 = applied（v0.1.122 D4 起随换代即时
+/// 生效，宿主前置管线随影子装配重建）；冻结键（jwt_secret 等）变化仍报
+/// restart_pending（oj-auth 插件 init 期冻结 cfg，reload 复用 Backend）。
+#[test]
+fn diff_configs_auth_key_granularity() {
+    let d = |s: &str| serde_yaml::from_str::<serde_yaml::Value>(s).unwrap();
+    // ① 仅 anonymous_paths 变化（市场首装接线新模块的匿名端点）→ applied。
+    let old = d("auth:\n  jwt_secret: k1\n  anonymous_paths:\n    - /a/*\n");
+    let new = d("auth:\n  jwt_secret: k1\n  anonymous_paths:\n    - /a/*\n    - /newmod/ping/*\n");
+    let (applied, pending, _) = diff_configs(&old, &new);
+    assert!(applied.contains(&"auth".to_string()), "applied={applied:?}");
+    assert!(
+        !pending.contains(&"auth".to_string()),
+        "pending={pending:?}"
+    );
+    // ② 冻结键（jwt_secret）变化 → restart_pending（插件 cfg 冻结）。
+    let old = d("auth:\n  jwt_secret: k1\n  anonymous_paths: []\n");
+    let new = d("auth:\n  jwt_secret: k2\n  anonymous_paths: []\n");
+    let (applied, pending, _) = diff_configs(&old, &new);
+    assert!(pending.contains(&"auth".to_string()), "pending={pending:?}");
+    assert!(
+        !applied.contains(&"auth".to_string()),
+        "applied={applied:?}"
+    );
+    // ③ 混合（anon + secret 同改）→ pending（fail-closed，重启一次性生效）。
+    let old = d("auth:\n  jwt_secret: k1\n  anonymous_paths: []\n");
+    let new = d("auth:\n  jwt_secret: k2\n  anonymous_paths:\n    - /x/*\n");
+    let (applied, pending, _) = diff_configs(&old, &new);
+    assert!(pending.contains(&"auth".to_string()), "pending={pending:?}");
+    assert!(
+        !applied.contains(&"auth".to_string()),
+        "applied={applied:?}"
+    );
+    // ④ 旧代无 auth 段、新代仅 anonymous_paths → applied（纯新增匿名端点）。
+    let old = d("smtp: {}\n");
+    let new = d("auth:\n  anonymous_paths:\n    - /p/*\n");
+    let (applied, pending, _) = diff_configs(&old, &new);
+    assert!(applied.contains(&"auth".to_string()), "applied={applied:?}");
+    assert!(
+        !pending.contains(&"auth".to_string()),
+        "pending={pending:?}"
+    );
+}
+
 /// 重复 grant id 会让网关 first-wins 静默取第一条（治理语义漂移）→ 装配期 fail-fast。
 #[test]
 fn predict_grant_duplicate_id_fails_fast() {
