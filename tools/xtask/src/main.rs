@@ -582,7 +582,9 @@ fn home_dir() -> PathBuf {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: cargo xtask <bin | plugin <name> [--check] | build | smoke --bin <path> | jdbc-drivers [--dir <path>]>");
+    eprintln!(
+        "usage: cargo xtask <bin | plugin <name> [--check] | build | smoke --bin <path> | jdbc-drivers [--dir <path>]>"
+    );
     std::process::exit(2)
 }
 
@@ -594,9 +596,11 @@ const JDBC_BUNDLED: &[(&str, &str)] = &[
         "trino-jdbc-484.jar",
         "io/trino/trino-jdbc/484/trino-jdbc-484.jar",
     ),
+    // 注意 classifier 必须是 -all-dependencies（内嵌 slf4j）；-all 缺 slf4j 两个
+    // 驱动类实例化即 NoClassDefFoundError（e2e_driver_smoke 实证，v0.1.144）。
     (
-        "clickhouse-jdbc-0.11.2-all.jar",
-        "com/clickhouse/clickhouse-jdbc/0.11.2/clickhouse-jdbc-0.11.2-all.jar",
+        "clickhouse-jdbc-0.11.2-all-dependencies.jar",
+        "com/clickhouse/clickhouse-jdbc/0.11.2/clickhouse-jdbc-0.11.2-all-dependencies.jar",
     ),
     (
         "kyuubi-hive-jdbc-shaded-1.12.0.jar",
@@ -722,11 +726,21 @@ mod tests {
     fn given_jdbc_bundled_table_when_iterated_then_three_pinned_jars() {
         // REQ-A4 随包三件套：pinned 字面量（Maven Central 检索实证 2026-11-24）。
         // 升级任何一行必须同时改 docs/plugins/jdbc.md 矩阵表并重跑 smoke 腿。
-        assert_eq!(JDBC_BUNDLED.len(), 3, "bundled set is Trino+ClickHouse+Kyuubi only");
+        assert_eq!(
+            JDBC_BUNDLED.len(),
+            3,
+            "bundled set is Trino+ClickHouse+Kyuubi only"
+        );
         let names: Vec<_> = JDBC_BUNDLED.iter().map(|(n, _)| *n).collect();
         assert!(names.contains(&"trino-jdbc-484.jar"), "{names:?}");
-        assert!(names.contains(&"clickhouse-jdbc-0.11.2-all.jar"), "{names:?}");
-        assert!(names.contains(&"kyuubi-hive-jdbc-shaded-1.12.0.jar"), "{names:?}");
+        assert!(
+            names.contains(&"clickhouse-jdbc-0.11.2-all-dependencies.jar"),
+            "{names:?}"
+        );
+        assert!(
+            names.contains(&"kyuubi-hive-jdbc-shaded-1.12.0.jar"),
+            "{names:?}"
+        );
         for (name, url) in JDBC_BUNDLED {
             let want = format!("https://repo1.maven.org/maven2/{url}");
             assert!(
@@ -743,7 +757,14 @@ mod tests {
         let explicit = std::path::Path::new("/opt/oj/jdbc-drivers");
         assert_eq!(jdbc_drivers_dir(Some(explicit)), explicit.to_path_buf());
         let def = jdbc_drivers_dir(None);
-        assert_eq!(def, bin_dir().join("plugins").join(host_triple()).join("jdbc").join("drivers"));
+        assert_eq!(
+            def,
+            bin_dir()
+                .join("plugins")
+                .join(host_triple())
+                .join("jdbc")
+                .join("drivers")
+        );
     }
 
     #[test]
