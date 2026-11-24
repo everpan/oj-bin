@@ -204,15 +204,85 @@ oj-db-mysql：
 | 查询结果整数列变成 string / DECIMAL 变 number | 正常分流：scale>0 → string（保精度），scale==0 → 整数族；别用 `Number()` 强转大数，用 `toBigInt` |
 | sidecar 慢查询钉死 | 非 stream 的 `db.query`/`db.exec` 无语句级取消（看门狗只杀 JS 侧，JVM 里语句继续跑）——强制 `props.socketTimeout`，大结果走 `db.stream`；详见「限制」 |
 
-## 限制与已知边界（交付前必读）
+## 七方言 jar 分发矩阵（v0.1.144，REQ-A4）
+
+> 上游 REQ-A4 七种非原生数据源经本插件接入。代码侧零方言分支（Java 桥通用，
+> Rust 侧 `vendor_of()` 诊断表识别方言族）；**工作量与风险全在驱动 jar 的分发**。
+> 版本/体积/许可证均为 Maven Central 直接检索实证（2026-11-24），升级任何一行
+> 先重跑 `e2e_driver_smoke` 腿。
+
+### 随包三件套（Apache-2.0，允许随二进制再分发；合计 ~45MB）
+
+```bash
+cargo xtask jdbc-drivers          # 一键下载 + 归位 <bin>/plugins/<triple>/jdbc/drivers/，幂等
+cargo xtask jdbc-drivers --dir /opt/oj/jdbc-drivers   # 自定义目录
+```
+
+| 方言 | 坐标 / pinned | jar 体积 | 最低 JDK | 驱动类 | URL 形态 |
+|---|---|---|---|---|---|
+| Trino | `io.trino:trino-jdbc:484` | 10.6MB | 11+（470 起） | `io.trino.jdbc.TrinoDriver` | `jdbc:trino://host:8080/catalog/schema` |
+| ClickHouse | `com.clickhouse:clickhouse-jdbc:0.11.2` **`-all-dependencies`** | 13.8MB | 8+ | `com.clickhouse.jdbc.ClickHouseDriver` | `jdbc:ch:http://host:8123/db`（或 `jdbc:clickhouse:`） |
+| Kyuubi | `org.apache.kyuubi:kyuubi-hive-jdbc-shaded:1.12.0` | 21MB | 8+ | `org.apache.kyuubi.jdbc.KyuubiHiveDriver` | `jdbc:kyuubi://host:10009/db` |
+
+三个 jar 均自包含 shaded，**可同目录共处**（e2e_driver_smoke 真 JVM 实证：单
+UCL 三驱动同时注册；`jdbc:` 诊断方言族 snowflake/databricks/clickhouse/trino/
+kyuubi/heavydb/duckdb 随错误文案与日志透出）。
+
+**jar 形态陷阱（实测钉死）**：
+- ClickHouse **必须 `-all-dependencies`**——`-all` classifier 不内嵌 slf4j，两个
+  驱动类实例化即 `NoClassDefFoundError`，DriverManager 报 `No suitable driver`
+  （症状与没装 jar 一模一样）；thin 版（0.3MB）缺全部依赖同理。
+- Kyuubi **必须 `kyuubi-hive-jdbc-shaded`**——别选 `org.apache.hive:hive-jdbc`
+  （thin 171KB，依赖地狱，平面目录不可用）。
+- Trino 周级发版 + JDK 基线历史上从 8 提到 11（470 起）——升级 pinned 版本须读
+  release notes 并重跑 smoke 腿。
+
+### 自备四件（体积或上游状态所致，oj 不随包）
+
+| 方言 | 坐标 | jar 体积 | 许可证 | 判定 |
+|---|---|---|---|---|
+| Snowflake | `net.snowflake:snowflake-jdbc:4.4.1` | **99MB** | Apache-2.0 | 自备/可选包（体积） |
+| Databricks | `com.databricks:databricks-jdbc:3.4.5` | 43MB | Apache-2.0 | 自备/可选包（体积；Java 11+） |
+| DuckDB | `org.duckdb:duckdb_jdbc:2.0.1.0` | **81MB** | MIT | 自备/可选包（体积 + 内嵌全平台 native）；**离线可用**（内存库零服务端，e2e_duckdb 腿实证全链） |
+| HeavyDB | `ai.heavy:heavyai-jdbc:6.1.0` | 4.5MB thin | Apache-2.0 | **上游 2026-05-27 官宣废弃**，Maven 停更，thin jar 缺 Thrift 依赖需 `-Pfatjar` 自构——oj 只承诺通用连接 + 用户自备 jar，e2e 降级为 env-gated 可选腿 |
+
+自备四步（照抄）：
+
+1. 建目录并放 jar（**一目录一版本**——同 vendor 同名不同版先到先得，装载按文件名
+   排序）：
+   ```bash
+   mkdir -p /opt/oj/jdbc-drivers && cp snowflake-jdbc-4.4.1.jar /opt/oj/jdbc-drivers/
+   ```
+2. config.yaml 指路（缺省相对 CWD 的 `drivers/`，建议显式绝对路径）：
+   ```yaml
+   plugins:
+     oj-db-jdbc:
+       drivers_dir: /opt/oj/jdbc-drivers
+   ```
+3. DSN 用 JSON 信封形态（凭据不进 URL、可整串 `ENC[...]` 密封）：
+   ```yaml
+   db:
+     sf: 'jdbc:{"url":"jdbc:snowflake://acct.snowflakecomputing.com/?warehouse=W","user":"oj","password":{"$env":"SF_PW"}}'
+   ```
+4. 老驱动缺 ServiceLoader 条目时加 `"props":{"driver_class":"<驱动类名>"}` 逃生舱；
+   改 jar 后**必须重启 oj 进程**（JVM 一次性装载）。
+
+多实例一致性（REQ-A4 验收第 5 条口径）：config 声明式 DSN 各实例同 config 天然
+一致；运行期 `db.client.register` 登记进进程内 StableState，池内各 runtime 同见
+（v0.1.92 既有行为）。连通性测试（验收第 3 条）：`DB("name").query("select 1")`
+即探针，无专用端点（能力已有，不造重复面）。
+
+
 
 - **SQL 业务全责**：裸 SQL + `?` 绑参是主路径——注入防线照旧（值只走绑参；
   动态标识符在 jdbc 后端没有构造器白名单可用，只能走 schema.yaml 自建白名单 +
   服务端校验，别拼用户输入）。
-- **v1 单部署单厂商**：单 JVM 单 URLClassLoader 装载 drivers 目录全部 jar，
-  DM + 金仓 + Oracle 驱动并存的类冲突/静态状态串扰是 JDBC 生态老问题，v1 接受
-  「每个部署只放一家驱动」。**多厂商配方**：按厂商起多个 oj 进程/容器实例，
-  各配 `plugins.oj-db-jdbc.drivers_dir` + 不同端口。
+- **多厂商共处口径**：单 JVM 单 URLClassLoader 装载 drivers 目录全部 jar。
+  随包三件套（Trino/ClickHouse/Kyuubi，自包含 shaded）已实证可同目录共处
+  （e2e_driver_smoke 真 JVM 三驱动同时注册）；**非自包含驱动**（DM/金仓/Oracle
+  等易冲突厂商）仍建议「每个部署只放一家驱动」——类冲突/静态状态串扰是 JDBC
+  生态老问题。混放多厂商时遵守「一目录一版本」（同 vendor 同名不同版先到先得，
+  装载按文件名排序）。
 - **drop-in 新 jar 需重启 oj 进程**：驱动类静态状态 + URLClassLoader 不可卸载
   （JVM 由 sidecar 持有，宿主无法热替换）。
 - **首 connect 承担 JVM 冷启动**：sidecar 惰性 spawn，第一个 JDBC 请求付 JVM
@@ -241,6 +311,14 @@ oj-db-mysql：
   `socketTimeout` 收窄。
 - **目标机必须有 Java 11+**：oj 的「拷贝即跑」承诺对本插件附加此前提
   （JRE + 厂商 jar）。
+- **DuckDB 全量内存无流式**（v0.1.144 实测）：结果集全量物化，桥的
+  `setFetchSize(500)` 无流式效果——大查询顶 JVM 堆，`db.stream` 对它只是
+  分批搬运不是省内存；cancel 仅批间生效。内存库 `jdbc:duckdb:` 离线可用。
+- **DuckDB 约束冲突不回 SQLState**（v0.1.144 实测）：唯一键冲突 vendor_code 0、
+  无 23 类 SQLState → errmap 落 `internal` 兜底（`retryable:false` + 结构化
+  信封契约仍成立）；依赖 SQLState 分流的调用方对 DuckDB 需按 message 判别。
+- **DDL 受影响行数跨厂不一**：DM/H2 回 0，DuckDB 回 -1（SUCCESS_NO_INFO）——
+  DDL 成败以不抛错为准，勿按计数分支。
 
 ## 升级须知：`.so` 与 jar 版本锁死
 
