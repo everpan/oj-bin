@@ -142,3 +142,42 @@
 - 交互式 consent 流（用户在线授权页）：上游 G2 合规面裁定后另立需求；v1 为部署期静态授权表（grants），文档如实声明。
 - 平台级 fetch 出站白名单（REQ-PREDICT 背景第 2 条的完整闭环）：独立安全需求，另立计划。
 
+
+---
+
+## 执行偏差记录（2026-11-24 收口）
+
+1. **任务重构 5→4**：原 Task 4「宿主网关接线」与 Task 5「审计 + 收编封堵」拆开提交
+   会产生「网关在位但审计/收编缺席」的可提交旁路中间态——合规红线不可分片，两者合并
+   为单提交 9337eb1（Task 计数 5→4）。
+2. **mock 引擎未实现 plan 的 `sleep` op**：plan 设想 mock 引擎带 sleep/timeout 钩子供
+   timeout 腿复验。落地时发现 mock 全同步形态下 sleep 会阻塞网关线程令 tokio 计时器
+   失效（FFI call 必须快速返回——这正是后来写进引擎契约的纪律）。timeout/脱敏/panic/
+   契约违例腿全部改由 **e2e 夹具 mini-predict（异步 spawn_ffi_future + SLEEP/PANIC/
+   FAIL_ECHO/WRONGTICKET/NORESULT 暗号）**承担；生产 mock 保持纯函数形态。plan 的
+   原始设计在此点上被实证纠错。
+3. **Task 3 提交缺口**：9aa4783 提交信息声称「xtask PLUGINS 表（短名 predict）」但该
+   改动未入库（`cargo xtask plugin <name>` 按名直构不读 PLUGINS，当时未暴露）——
+   Task 4 门禁时 `cargo xtask build` 归置缺失 predict → plugins.lock.json 不含 predict →
+   oj 全套 12 用例失败暴露。f627a48 补齐 PLUGINS + xtask 覆盖面契约用例 11→12。
+4. **评审轮超出 plan 的补强**：plan Task 4 Step 5 原定「评审 + must/should 修订」，实际
+   修订含 plan 未列的新测试面（装配期 fail-fast 三腿 / panic 跨界收敛腿 / 契约违例双
+   分支腿 / bad_payload 腿 / 引擎缺席独立站 / 审计 status 字段级断言）与一处网关行为
+   变更（payload 解析失败出口补审计）——由评审 findings 驱动，见下节。
+
+## 评审裁决记录（四方评审，2026-11-24）
+
+| 评审 | 裁决 | must | should | 处置 |
+|---|---|---|---|---|
+| 架构师 | 可合入 | 0 | 2 | mgmt∩predict 重叠 fail-fast（并入 must 修复）；api-manual no_engine 审计形态措辞（已修） |
+| 工程师 | 可发布、值得修 | 0 | 5 | 重叠 fail-fast + 契约违例腿（已修）；两处文档-实现不一致（已修）；空 dataScope 语义成文（已修）；stale 断言两处（已修） |
+| 测试工程师（BDD 对照） | 五条验收 4 covered + 1 partial | 0 | 4 | Focus 4 audit status 字段级断言（已修）；Focus 5 后半引擎缺席腿（已修）；panic 跨界腿（已修）；ticket 契约腿（已修）；nits 登记不阻断 |
+| **合规专项（G2 hard gate）** | **不通过 → 修复后复验通过** | 1 | 3 | must：mgmt.axes ∩ predict.axis 重叠静默旁路 → 装配期 fail-fast（d6bcb2e）；should：bad_payload 审计出口（已修）/ 第二引擎同名冲突无测试钉（已修）/ 引擎契约补「错误消息不得嵌入 PQL」条款（已修） |
+
+修复提交 d6bcb2e 后复验：三闸 + 审计出口矩阵逐条核对全落痕；两道装配 fail-fast 有
+正向 + 反向腿；G2 三个 gate（绕过路径 / 审计完备性 / 泄漏面）全部 PASS。剩余 nit
+（脱敏变形回显的 ≤300 字符残余面已入引擎契约条款兜底；重复 grant id first-wins；
+大小写敏感已文档化）登记为 v0.1.146 低优先尾巴，不阻断收口。
+
+**最终裁决：Phase 4（REQ-PREDICT）收口**——五条验收全 covered（引擎缺席语义、契约
+违例双分支、审计字段级分形由评审轮补钉）；G2 hard gate 通过。
