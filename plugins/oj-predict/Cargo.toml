@@ -1,0 +1,12 @@
+[package]
+name = "oj-predict"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+oj-plugin-ffi = { path = "../../oj-plugin-ffi" }
+serde_json = "1"
+sha2 = "0.10"
